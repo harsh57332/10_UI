@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>G1 Control</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>G1 Control</h1>
+  <div class="pills">
+    <span class="pill" id="pill-conn">offline</span>
+    <span class="pill" id="pill-mode">mode —</span>
+    <span class="pill" id="pill-batt">battery —</span>
+    <span class="pill" id="pill-busy">idle</span>
+  </div>
+</header>
+
+<main>
+<div class="col">
+
+  <section id="s0">
+    <h2><span class="num">0</span>Connection</h2>
+    <div class="row">
+      <button id="btn-discover">Discover robot</button>
+      <button id="btn-terminate" class="ghost">Terminate connection</button>
+    </div>
+    <ul id="found" class="found"></ul>
+  </section>
+
+  <section id="s1">
+    <h2><span class="num">1</span>Modes</h2>
+    <div id="modes" class="modes"></div>
+    <p class="hint">Only the transitions allowed from the current mode are enabled. Damping is always available.</p>
+  </section>
+
+  <section id="s2">
+    <h2><span class="num">2</span>Basic</h2>
+    <div class="grid2">
+      <div>
+        <label>Head light</label>
+        <div class="row">
+          <input type="color" id="hl-color" value="#ffffff">
+          <input id="hl-hex" value="#FFFFFF" maxlength="7" size="8">
+          <button id="btn-hl">Send</button>
+        </div>
+      </div>
+      <div>
+        <label>Volume <span id="vol-val" class="muted">—</span></label>
+        <div class="row">
+          <input type="range" id="vol" min="0" max="100" value="100">
+          <button id="btn-vol">Set</button>
+        </div>
+      </div>
+    </div>
+
+    <label>Text to speech <span class="muted" id="tts-count">0/200</span></label>
+    <div class="row">
+      <textarea id="tts" rows="2" maxlength="200" placeholder="Hello, I am G1."></textarea>
+      <button id="btn-tts">Play</button>
+    </div>
+
+    <label>Audio file <span class="muted">(max <span id="audio-max">10</span> MB)</span></label>
+    <div class="row">
+      <input type="file" id="audio-file" accept="audio/*">
+      <button id="btn-audio">Play</button>
+      <button id="btn-audio-stop" class="ghost">Stop</button>
+    </div>
+
+    <div class="row">
+      <button id="btn-camera" disabled title="Phase 2">Open camera live feed</button>
+    </div>
+
+    <h3>Battery &amp; IMU</h3>
+    <div class="grid2">
+      <table class="kv" id="batt"></table>
+      <table class="kv" id="imu"></table>
+    </div>
+
+    <h3>Joints</h3>
+    <div id="joints" class="joints"></div>
+  </section>
+
+  <section class="todo"><h2><span class="num">3</span>Locomotion</h2><p class="hint">Phase 3</p></section>
+  <section class="todo"><h2><span class="num">4</span>Manipulation</h2><p class="hint">Phase 3</p></section>
+  <section class="todo"><h2><span class="num">5</span>End effectors</h2><p class="hint" id="ee-hint">—</p></section>
+  <section class="todo"><h2><span class="num">6</span>Motion planning</h2><p class="hint">Phase 5</p></section>
+  <section class="todo"><h2><span class="num">7</span>AI control</h2><p class="hint">Phase 7</p></section>
+</div>
+
+<div class="col side">
+  <section>
+    <h2>Image client</h2>
+    <div class="cam-placeholder">Camera — Phase 2</div>
+  </section>
+  <section>
+    <h2>Log</h2>
+    <ol id="log" class="log"></ol>
+  </section>
+</div>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

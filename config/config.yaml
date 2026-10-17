@@ -1,0 +1,99 @@
+# Central config. Every host, port, path, timeout, limit, model and GPU setting
+# lives here. Nothing is hardcoded in the Agent, server, UI or model services.
+# Override the file location with the G1UI_CONFIG environment variable.
+
+robot:
+  host: 192.168.0.120            # WiFi IP (the Agent listens here)
+  ssh_user: unitree
+  dds_interface: eth0            # internal robot network (192.168.123.x)
+  app_dir: /home/unitree/g1ui/app
+  conda_dir: /home/unitree/miniforge3
+  conda_env: g1ui_robot
+  deps_dir: /home/unitree/g1ui/deps
+  urdf: assets/robot/g1_29dof_rev_1_0.urdf   # mode_machine 5, no hands
+  mode_machine: 5
+
+agent:
+  port: 8100
+  service_name: g1ui-agent
+  request_timeout_s: 5.0         # server -> agent HTTP timeout
+  retries: 3                     # server re-sends the same command id on network errors
+  retry_gap_s: 0.5
+  command_history: 500           # finished command ids remembered (no double execution)
+  rpc_timeout_s: 3.0             # SDK RPC timeout (loco / audio)
+  state_max_age_s: 0.05          # reuse a DDS sample this fresh instead of reading again
+
+server:
+  bind: 0.0.0.0
+  port: 8000
+  state_poll_ms: 250             # UI refresh period
+
+discovery:
+  subnet: 192.168.0.0/24
+  timeout_s: 0.6
+
+# FSM ids. "manipulation" is still to be verified on this robot (old robot: 501).
+modes:
+  ids:
+    zero_torque: 0
+    damping: 1
+    squat: 2
+    sit: 3
+    stand_up: 4
+    locomotion: 801
+    manipulation: 501
+  disabled: [squat, sit]         # "currently not in priority"
+  # allowed next modes (any mode -> damping is always allowed)
+  transitions:
+    zero_torque: [damping]
+    damping: [zero_torque, stand_up]
+    stand_up: [locomotion, manipulation]
+    locomotion: [manipulation]
+    manipulation: [locomotion]
+  switch_timeout_s: 6.0          # wait this long for the FSM read-back to match
+  walk_modes: [locomotion, manipulation]
+  arm_modes: [manipulation]
+
+locomotion:
+  speed_max: 0.6                 # m/s (forward/backward/aside)
+  speed_default: 0.4
+  ai_speed: 0.4                  # fixed speed in AI mode
+  turn_speed_max: 0.6            # rad/s
+  turn_speed_default: 0.4
+  duration_max_s: 30.0
+
+arms:
+  rate_hz: 50
+  max_speed_dps: 45              # joint speed used to time set_upperbody moves
+  engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
+  release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
+  # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
+  gains:
+    waist: {kp: 300.0, kd: 3.0, joints: [12, 13, 14]}
+    arm:   {kp: 80.0,  kd: 3.0, joints: [15, 16, 17, 18, 22, 23, 24, 25]}
+    wrist: {kp: 40.0,  kd: 1.5, joints: [19, 20, 21, 26, 27, 28]}
+
+audio:
+  tts_speaker_id: 1              # 0 = Chinese, 1 = English (verify)
+  tts_max_chars: 200
+  file_max_mb: 10
+  sample_rate: 16000
+  chunk_bytes: 96000             # 3 s of 16 kHz mono int16
+  chunk_gap_s: 1.0
+  app_name: g1ui
+
+headlight:
+  default: "#FFFFFF"
+  busy_color: "#FF0000"          # blinks while OWLv2 / cuRobo / LLM are processing
+  blink_period_s: 0.5
+
+end_effector:
+  type: dummy                    # dummy | dex1 | dex3 | inspire
+
+ui:
+  detect_text_max: 15
+  nl_text_max: 500
+
+logging:
+  dir: logs
+  level: INFO
