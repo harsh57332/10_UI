@@ -97,8 +97,8 @@ def _set_mode(params, stop):
     g1.set_fsm(ids[target])
 
     # SetFsmId returns 0 even when the firmware ignores the request, so read the mode back.
-    t_end = time.time() + CFG["modes"]["switch_timeout_s"]
-    while time.time() < t_end:
+    t_end = time.monotonic() + CFG["modes"]["switch_timeout_s"]
+    while time.monotonic() < t_end:
         now = g1.fsm_id()
         if now == ids[target]:
             return {"mode": target, "fsm_id": now, "changed": True}
@@ -123,8 +123,7 @@ def _set_upperbody(params, stop):
         g1.arms.engage()
         delta = max(abs(math.degrees(target[j] - c)) for j, c in zip(joints.UPPER_BODY, g1.arms.q))
         duration = max(0.5, delta / CFG["arms"]["max_speed_dps"])
-    end = g1.arms.move([(float(duration), target)], smooth=True)
-    stop.wait(max(0.0, end - time.time()))
+    stop.wait(g1.arms.move([(float(duration), target)], smooth=True))
     return {"duration": round(float(duration), 2), "interrupted": stop.is_set()}
 
 
@@ -146,8 +145,7 @@ def _play_upperbody(params, stop):
             targets[idx] = _upper_deg_to_rad(idx, deg)
         parsed.append((t, targets))
     _require_mode("arm_modes")
-    end = g1.arms.move(parsed, smooth=params.get("interp", "smooth") == "smooth")
-    stop.wait(max(0.0, end - time.time()))
+    stop.wait(g1.arms.move(parsed, smooth=params.get("interp", "smooth") == "smooth"))
     return {"frames": len(parsed), "interrupted": stop.is_set()}
 
 
@@ -348,7 +346,8 @@ def state():
         "mode_machine": low.mode_machine if low else None,
         **mode,
         "busy": busy,
-        "arms": {"engaged": g1.arms.engaged, "moving": g1.arms.moving()},
+        "arms": {"engaged": g1.arms.engaged, "moving": g1.arms.moving(), "weight": round(g1.arms.weight, 3),
+                 "loop_hz": round(g1.arms.loop_hz, 1), "max_gap_ms": round(g1.arms.max_gap_ms, 1)},
         "joints": g1.joint_states(),
         "imu": g1.imu(),
         "battery": g1.battery(),

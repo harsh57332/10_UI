@@ -37,14 +37,14 @@ class Latest:
 
     def get(self):
         with self.lock:
-            if self.msg is None or time.time() - self.t > self.max_age:
+            if self.msg is None or time.monotonic() - self.t > self.max_age:
                 samples = self.reader.take(N=1)
                 if samples:
-                    self.msg, self.t = samples[0], time.time()
+                    self.msg, self.t = samples[0], time.monotonic()
             return self.msg
 
     def age(self):
-        return time.time() - self.t if self.t else None
+        return time.monotonic() - self.t if self.t else None
 
 
 class Headlight:
@@ -101,9 +101,11 @@ class Arms:
         self.lock = threading.Lock()
         self.weight = 0.0         # arm_sdk blend: 0 = policy owns the arms, 1 = we do
         self.weight_target = 0.0
-        self.weight_step = 0.0
+        self.weight_rate = 1.0    # weight change per second while ramping
         self.q = None             # commanded positions (rad) for UPPER_BODY
-        self.segments = []        # [(t_start, t_end, q_from, q_to, smooth)]
+        self.segments = []        # [(t_start, t_end, q_from, q_to, smooth)], time.monotonic()
+        self.loop_hz = 0.0        # measured publish/loop rate, for /state
+        self.max_gap_ms = 0.0     # worst tick gap in the last second
         threading.Thread(target=self._loop, daemon=True, name="arm_sdk").start()
 
     @property
@@ -122,14 +124,14 @@ class Arms:
             self.q = self.g1.upper_q()
             self.segments = []
             self.weight_target = 1.0
-            self.weight_step = self.dt / self.cfg["engage_s"]
+            self.weight_rate = 1.0 / self.cfg["engage_s"]
         self._wait_weight(1.0)
 
     def release(self, wait=True):
         with self.lock:
             self.segments = []
             self.weight_target = 0.0
-            self.weight_step = self.dt / self.cfg["release_s"]
+            self.weight_rate = 1.0 / self.cfg["release_s"]
         if wait:
             self._wait_weight(0.0)
 
@@ -139,10 +141,11 @@ class Arms:
             self.segments, self.weight_target, self.weight = [], 0.0, 0.0
 
     def move(self, keyframes, smooth=True):
-        """keyframes: [(duration_s, {motor_index: rad})]. Unnamed joints hold their position."""
+        """keyframes: [(duration_s, {motor_index: rad})]. Unnamed joints hold their position.
+        Returns the total duration in seconds."""
         self.engage()
         with self.lock:
-            t = time.time()
+            t = t_begin = time.monotonic()
             q_from = self.q.copy()
             for duration, targets in keyframes:
                 q_to = q_from.copy()
@@ -150,23 +153,35 @@ class Arms:
                     q_to[joints.UPPER_BODY.index(idx)] = rad
                 self.segments.append((t, t + duration, q_from, q_to, smooth))
                 t, q_from = t + duration, q_to
-        return t  # absolute end time
+        return t - t_begin
 
     def _wait_weight(self, target):
         while abs(self.weight - target) > 1e-6:
             time.sleep(self.dt)
 
     def _loop(self):
-        nxt = time.time()
+        # Monotonic clock only: an NTP jump of the wall clock must never speed up or freeze the arms.
+        # A late tick resyncs instead of bursting to catch up; ramps scale with real elapsed time.
+        nxt = last = stat_t = time.monotonic()
+        ticks, max_gap = 0, 0.0
         while True:
             nxt += self.dt
-            time.sleep(max(0.0, nxt - time.time()))
+            delay = nxt - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                nxt = time.monotonic()
+            now = time.monotonic()
+            gap, last = now - last, now
+            ticks, max_gap = ticks + 1, max(max_gap, gap)
+            if now - stat_t >= 1.0:
+                self.loop_hz, self.max_gap_ms = ticks / (now - stat_t), max_gap * 1000
+                ticks, max_gap, stat_t = 0, 0.0, now
             with self.lock:
                 if self.weight == 0.0 and self.weight_target == 0.0:
                     continue
-                step = self.weight_step or self.dt
+                step = self.weight_rate * min(gap, 2 * self.dt)
                 self.weight = float(np.clip(self.weight + np.clip(self.weight_target - self.weight, -step, step), 0, 1))
-                now = time.time()
                 while self.segments and now >= self.segments[0][1]:
                     self.q = self.segments.pop(0)[3].copy()
                 if self.segments:
@@ -205,10 +220,10 @@ class G1:
 
     # ---------- state ----------
     def lowstate(self, wait_s=1.0):
-        t_end = time.time() + wait_s
+        t_end = time.monotonic() + wait_s
         while True:
             m = self.low.get()
-            if m is not None or time.time() > t_end:
+            if m is not None or time.monotonic() > t_end:
                 return m
             time.sleep(0.01)
 

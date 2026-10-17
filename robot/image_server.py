@@ -56,7 +56,7 @@ def main():
             next_t = 0.0
             while True:
                 frames = pipe.wait_for_frames(c["frame_timeout_ms"])
-                now = time.time()
+                now = time.monotonic()               # scheduling only; meta "t" stays wall time
                 if now + half_frame < next_t:        # decimate capture_fps -> fps
                     continue
                 next_t = max(next_t + period, now - period)
@@ -69,7 +69,7 @@ def main():
                 if not (ok1 and ok2):
                     continue
                 seq += 1
-                meta = {"seq": seq, "t": now, "width": c["width"], "height": c["height"],
+                meta = {"seq": seq, "t": time.time(), "width": c["width"], "height": c["height"],
                         "depth_scale": scale, "intrinsics": intr}
                 sock.send_multipart([json.dumps(meta).encode(), jpg.tobytes(), png.tobytes()])
         except Exception as e:
