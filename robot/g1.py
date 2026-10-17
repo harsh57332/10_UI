@@ -14,6 +14,7 @@ from cyclonedds.core import Policy, Qos
 from cyclonedds.sub import DataReader
 from cyclonedds.topic import Topic
 from unitree_sdk2py.core.channel import ChannelFactory, ChannelFactoryInitialize, ChannelPublisher
+from unitree_sdk2py.g1.audio.g1_audio_api import ROBOT_API_ID_AUDIO_TTS
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -268,7 +269,11 @@ class G1:
 
     # ---------- audio ----------
     def speak(self, text):
-        code = self.audio.TtsMaker(text, self.cfg["audio"]["tts_speaker_id"])
+        # Not AudioClient.TtsMaker: its "tts_index += tts_index" keeps the index at 0 forever, so the
+        # voice service can treat every request as a repeat. Send a unique, increasing index instead.
+        self._tts_index = max(getattr(self, "_tts_index", 0) + 1, int(time.time() * 1000) % 2_000_000_000)
+        p = {"index": self._tts_index, "text": text, "speaker_id": self.cfg["audio"]["tts_speaker_id"]}
+        code, _ = self.audio._Call(ROBOT_API_ID_AUDIO_TTS, json.dumps(p))
         if code != 0:
             raise RuntimeError(f"TTS failed (code {code})")
 
