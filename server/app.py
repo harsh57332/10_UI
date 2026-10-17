@@ -9,12 +9,13 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from common import config, joints
 
+from .image_client import ImageClient
 from .robot_link import AgentLink
 
 CFG = config.load()
@@ -24,6 +25,7 @@ FFMPEG = str(Path(sys.executable).parent / "ffmpeg")
 app = FastAPI(title="g1ui-server")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 link = AgentLink()
+camera = ImageClient()
 
 
 class Cmd(BaseModel):
@@ -63,7 +65,9 @@ async def discover():
 @app.post("/api/connect")
 def connect(h: Host):
     try:
-        return {"connected": True, "host": h.host, "health": link.connect(h.host)}
+        health = link.connect(h.host)
+        camera.start(h.host)
+        return {"connected": True, "host": h.host, "health": health}
     except httpx.HTTPError as e:
         raise HTTPException(502, f"no agent at {h.host}: {e}")
 
@@ -71,6 +75,7 @@ def connect(h: Host):
 @app.post("/api/disconnect")
 def disconnect():
     link.disconnect()
+    camera.stop()
     return {"connected": False}
 
 
@@ -79,9 +84,17 @@ def status():
     if not link.host:
         return {"connected": False}
     try:
-        return {"connected": True, "host": link.host, "state": link.state()}
+        return {"connected": True, "host": link.host, "state": link.state(), "camera": camera.status()}
     except (httpx.HTTPError, ValueError) as e:
-        return {"connected": True, "host": link.host, "state": None, "error": str(e)}
+        return {"connected": True, "host": link.host, "state": None, "camera": camera.status(), "error": str(e)}
+
+
+# ---------------------------------------------------------------- camera
+@app.get("/video/{kind}.mjpg")
+def video(kind: str):
+    if kind not in ("rgb", "depth"):
+        raise HTTPException(404)
+    return StreamingResponse(camera.mjpeg(kind), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 # ---------------------------------------------------------------- commands

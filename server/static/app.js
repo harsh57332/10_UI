@@ -145,6 +145,20 @@ function kv(table, rows) {
   table.innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
 }
 
+let camOpen = false;
+function setCamera(open) {
+  camOpen = open;
+  $("cam-on").hidden = !open;
+  $("cam-off").hidden = open;
+  $("btn-camera").textContent = open ? "Close camera live feed" : "Open camera live feed";
+  const t = Date.now();  // fresh URL so the browser reconnects the stream
+  for (const kind of ["rgb", "depth"]) {
+    if (open) $(`cam-${kind}`).src = `/video/${kind}.mjpg?${t}`;
+    else $(`cam-${kind}`).removeAttribute("src");
+  }
+}
+$("btn-camera").onclick = () => setCamera(!camOpen);
+
 // ------------------------------------------------------------------ polling
 function pill(id, text, cls = "") { const p = $(id); p.textContent = text; p.className = `pill ${cls}`; }
 
@@ -162,6 +176,8 @@ async function poll() {
     pill("pill-busy", busy.length ? busy.map((x) => `${x.action} ${x.for_s}s`).join(", ") : "idle", busy.length ? "warn" : "");
     updateModes(state.mode);
     updateJoints(state.joints);
+    const c = s.camera;
+    $("cam-stat").textContent = c && c.online ? `${c.size[0]}×${c.size[1]} · ${c.fps} fps` : "· camera offline";
     if (b) kv($("batt"), [["SOC", `${b.soc} %`], ["Voltage", `${b.voltage_v} V`], ["Current", `${(b.current_ma / 1000).toFixed(2)} A`],
       ["Temp", `${Math.max(...b.temps_c)} °C`], ["Cycles", b.cycle]]);
     const p = state.imu.pelvis_rpy, t = state.imu.torso_rpy, f = (a, i) => (a ? a[i].toFixed(1) : "—");

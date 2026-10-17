@@ -69,7 +69,7 @@
     </div>
 
     <div class="row">
-      <button id="btn-camera" disabled title="Phase 2">Open camera live feed</button>
+      <button id="btn-camera">Open camera live feed</button>
     </div>
 
     <h3>Battery &amp; IMU</h3>
@@ -91,8 +91,14 @@
 
 <div class="col side">
   <section>
-    <h2>Image client</h2>
-    <div class="cam-placeholder">Camera — Phase 2</div>
+    <h2>Image client <span class="muted" id="cam-stat"></span></h2>
+    <div id="cam-off" class="cam-placeholder">Camera closed</div>
+    <div id="cam-on" hidden>
+      <label>Live RGB frame</label>
+      <img id="cam-rgb" class="cam" alt="RGB">
+      <label>Live depth frame</label>
+      <img id="cam-depth" class="cam" alt="Depth">
+    </div>
   </section>
   <section>
     <h2>Log</h2>

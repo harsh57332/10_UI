@@ -90,6 +90,25 @@ headlight:
 end_effector:
   type: dummy                    # dummy | dex1 | dex3 | inspire
 
+# Robot-side image server (D435i): RGB jpeg + aligned raw 16-bit depth (lossless PNG) over ZMQ PUB.
+camera:
+  service_name: g1ui-camera
+  zmq_port: 5555
+  width: 640
+  height: 480
+  fps: 20                        # sent rate (the D435i has no 20 fps mode, so capture runs faster)
+  capture_fps: 30
+  jpeg_quality: 85
+  depth_png_level: 1             # 0..9, lossless either way; 1 = fastest
+  frame_timeout_ms: 2000
+  restart_gap_s: 10              # rapid restarts wedge the D435i
+
+# Server-side image client.
+image_client:
+  stream_quality: 75             # MJPEG quality for the browser
+  depth_view_max_m: 4.0          # depth colour map range (8-bit view only; raw depth stays 16-bit)
+  stale_s: 1.5                   # no frame for this long -> camera shown as offline
+
 ui:
   detect_text_max: 15
   nl_text_max: 500
