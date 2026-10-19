@@ -421,7 +421,13 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
         ok_gap = gap - gap_cmd >= M["drop_gap_m"]
         ok_z = z >= zg + M["test_lift_m"] - M["lift_tolerance_m"]
         if ok_gap and ok_z:
-            return {"extra_squeeze_m": grip["extra"], "palm_gap_m": round(gap, 3)}
+            # self-calibration: the gripping palms are centred on the box, so their midpoint (from joint
+            # angles) minus the camera's box centre is the camera-to-arm offset along the squeeze axis
+            mid = (left + right) / 2
+            axis = np.array([-math.sin(yaw), math.cos(yaw)])
+            err = float(np.dot(mid[:2] - np.array([cx, cy]), axis))
+            ctx.bb["calib"] = {"offset_xy": (axis * err).tolist(), "t": time.time()}
+            return {"extra_squeeze_m": grip["extra"], "palm_gap_m": round(gap, 3), "camera_offset_m": round(err, 3)}
         if grip["extra"] + 0.01 > M["max_extra_squeeze_m"]:
             break
         p = ArmPlan(m)                          # back down, squeeze deeper, retry
@@ -429,6 +435,14 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
         p.to_pose("set back down", _hands(cx, cy, zg, half - squeeze - grip["extra"], yaw, pitch), world)
         m.execute(p.steps[-1]["traj"], holding=True)
     raise SkillError("could not get a secure grip on the box (it slips in the test lift)")
+
+
+def _calibrated(ctx, plan, x, y):
+    """Correct a camera-measured target by the offset found when the palms gripped the held box. In a
+    pre-built plan the offset is only known at run time, so the place steps re-read it live."""
+    plan.state["use_calib"] = True
+    off = ctx.bb.get("calib", {}).get("offset_xy", [0.0, 0.0])
+    return x + off[0], y + off[1]
 
 
 def _check_gap(ctx, gap_cmd, msg):
@@ -462,6 +476,7 @@ def place(ctx, plan, on):
     if on in ctx.bb["objects"]:                       # stack on another object
         t = ctx.bb["objects"][on]
         x, y, z_s = t["center"][0], t["center"][1], t["top_z"]
+        x, y = _calibrated(ctx, plan, x, y)
         target_yaw = t.get("yaw", 0.0)                # square the box to the one below it
         world = [cuboid(on, t["center"], t["dims"], target_yaw),
                  _table(ctx, t["support_z"], t.get("support_front_x", t["front_x"] - 0.10), y)]
@@ -497,13 +512,20 @@ def place(ctx, plan, on):
     yaw = target_yaw if aligned else plan.waist[0]
     keep = not aligned
     live_half = lambda: float(np.linalg.norm(np.subtract(*ctx.motion.palms(ctx.motion.q_now())))) / 2
-    plan.steps[-1]["goals_fn"] = lambda: _hands(x, y, above, live_half(), yaw, h.get("pitch", 0), keep=keep)
+    tx, ty = x, y
+    if plan.state.get("use_calib") and on in ctx.bb["objects"]:
+        raw = ctx.bb["objects"][on]["center"]
+        live_xy = lambda: _calibrated(ctx, plan, raw[0], raw[1])
+    else:
+        live_xy = lambda: (tx, ty)
+    plan.steps[-1]["goals_fn"] = lambda: _hands(*live_xy(), above, live_half(), yaw, h.get("pitch", 0), keep=keep)
     plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_of"]() if h.get("gap_of") else h["gap_cmd"],
                                                                f"'{h['object']}' slipped while moving"))
     plan.detach()                               # the box now meets its support: stop treating it as an obstacle
     plan.to_pose("lower", _hands(x, y, z, half, yaw, h.get("pitch", 0), keep=keep), world,
-                 goals_fn=lambda: _hands(x, y, z, live_half(), yaw, h.get("pitch", 0), keep=keep))
-    plan.to_pose("open hands", _hands(x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep), world)
+                 goals_fn=lambda: _hands(*live_xy(), z, live_half(), yaw, h.get("pitch", 0), keep=keep))
+    plan.to_pose("open hands", _hands(x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep), world,
+                 goals_fn=lambda: _hands(*live_xy(), z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep))
     plan.state["holding"] = None
     placed = {"center": [x, y, z_s + h["dims"][2] / 2], "dims": h["dims"], "top_z": z_s + h["dims"][2],
               "support_z": z_s, "front_x": x - h["dims"][0] / 2, "distance_m": math.hypot(x, y)}
