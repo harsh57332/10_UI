@@ -4,6 +4,9 @@ The camera is fixed on the torso (constant transform from the URDF). The torso m
 so measurements are converted to the pelvis frame (x forward, y left, z up), which stays put while
 the robot stands; the planner later converts them back with the current waist angles.
 """
+import math
+
+import cv2
 import numpy as np
 
 from common import config
@@ -82,16 +85,34 @@ class Geometry:
         if top.shape[0] < 30:
             return None
         bias = self.cfg["perception"]["box_edge_bias_m"]     # dark edges lose depth -> extents read small
-        x0, x1 = np.percentile(top[:, 0], [2, 98]) + np.array([-bias, bias]) / 2
-        y0, y1 = np.percentile(top[:, 1], [2, 98]) + np.array([-bias, bias]) / 2
-        dims = [float(x1 - x0), float(y1 - y0), float(top_z - support)]
-        center = [float((x0 + x1) / 2), float((y0 + y1) / 2), float((top_z + support) / 2)]
+        # oriented box from the top face: minimum-area rectangle of its points (in mm for precision)
+        xy = top[:, :2]
+        lo, hi = np.percentile(xy, 1, axis=0), np.percentile(xy, 99, axis=0)
+        xy = xy[np.all((xy >= lo) & (xy <= hi), axis=1)]                 # drop stray edge pixels
+        (mx, my), (a, b_), ang = cv2.minAreaRect((xy * 1000).astype(np.float32))
+        yaw = math.radians(ang)
+        # name the axes so "y" (the squeeze axis) is the one closest to the robot's left-right
+        ex = np.array([math.cos(yaw), math.sin(yaw)])
+        if abs(ex[1]) > abs(ex[0]):                     # box x-axis points sideways: swap the axes
+            yaw += math.pi / 2
+            a, b_ = b_, a
+        yaw = (yaw + math.pi / 2) % math.pi - math.pi / 2
+        if yaw > math.pi / 4:
+            yaw -= math.pi / 2
+            a, b_ = b_, a
+        elif yaw < -math.pi / 4:
+            yaw += math.pi / 2
+            a, b_ = b_, a
+        dx, dy = a / 1000 + bias, b_ / 1000 + bias
+        x0 = mx / 1000 - (abs(math.cos(yaw)) * dx + abs(math.sin(yaw)) * dy) / 2     # nearest extent along x
+        dims = [float(dx), float(dy), float(top_z - support)]
+        center = [float(mx / 1000), float(my / 1000), float((top_z + support) / 2)]
         # front edge of the supporting surface next to the box (for the table obstacle)
         sup = around[(np.abs(around[:, 2] - support) < 0.012) & (np.abs(around[:, 1] - center[1]) < 0.2)] \
             if around.size else np.zeros((0, 3))
         support_front = float(np.percentile(sup[:, 0], 2)) if sup.shape[0] > 30 else float(x0) - 0.10
-        return {"center": center, "dims": dims, "top_z": top_z, "support_z": support, "front_x": float(x0),
-                "support_front_x": min(support_front, float(x0))}
+        return {"center": center, "dims": dims, "yaw": float(yaw), "top_z": top_z, "support_z": support,
+                "front_x": float(x0), "support_front_x": min(support_front, float(x0))}
 
     def fit_surface(self, frame, rect, T=None):
         """Table-like surface inside rect: top height, front edge distance and extent."""

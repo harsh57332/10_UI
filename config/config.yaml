@@ -68,6 +68,7 @@ arms:
   rate_hz: 50
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
   playback_slowdown: 2.0         # planned trajectories play this many times slower (1.0 = as planned)
+  playback_slowdown_holding: 3.0 # ...and this much slower while holding a box (gentle accelerations)
   waist_speed_dps: 20            # waist turns while manipulating
   waist_speed_holding_dps: 10    # ...and while holding a box (it fell during a 20 deg/s turn)
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
@@ -219,6 +220,11 @@ manipulation:
   drop_gap_m: 0.012              # hands within this of their squeeze targets -> the box slipped
   lift_tolerance_m: 0.03         # measured hand height must reach the lift target within this
   lift_sag_comp_m: 0.03          # command the lift this much higher: the arms sag under a held box
+  test_lift_m: 0.02              # grip test: raise this much and hold
+  test_hold_s: 0.6
+  grip_retries: 2                # squeeze 1 cm deeper per retry
+  max_extra_squeeze_m: 0.02
+  palm_align: [1.0, 0.5, 0.0]    # palm angle: 1 = flat on the measured box faces, 0 = along the torso
   face_fractions: [1.0, 0.5, 0.0]   # waist turn toward a target, as fractions of its angle (tried in order);
                                     # palms squeeze along the turned torso, the box turns to meet them
 

@@ -28,8 +28,9 @@ def pitch_quat(deg):
     return (math.cos(a), 0.0, math.sin(a), 0.0)
 
 
-def cuboid(name, center, dims):
-    return {"name": name, "dims": [float(max(d, 0.005)) for d in dims], "pose": [*map(float, center), 1, 0, 0, 0]}
+def cuboid(name, center, dims, yaw=0.0):
+    q = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
+    return {"name": name, "dims": [float(max(d, 0.005)) for d in dims], "pose": [*map(float, center), *q]}
 
 
 class ArmMotion:
@@ -112,8 +113,9 @@ class ArmMotion:
         q.update({self.idx[n]: v for n, v in zip(traj["joint_names"], traj["positions"][-1])})
         return q
 
-    def execute(self, traj):
-        dt = traj["dt"] * self.cfg["arms"]["playback_slowdown"]
+    def execute(self, traj, holding=False):
+        a = self.cfg["arms"]
+        dt = traj["dt"] * (a["playback_slowdown_holding"] if holding else a["playback_slowdown"])
         kf = [{"t": dt, "q": {str(self.idx[n]): round(math.degrees(v), 3)
                                       for n, v in zip(traj["joint_names"], row)}}
               for row in traj["positions"][1:]]
@@ -174,13 +176,15 @@ class ArmPlan:
                 out[k] = self.m.to_torso(v, w)
         return out, [self.m.cuboid_to_torso(c, w) for c in world]
 
-    def to_pose(self, label, goals, world):
+    def to_pose(self, label, goals, world, goals_fn=None):
+        """goals_fn (optional) recomputes the goals at run time from live state (e.g. a corrected grip)."""
         g, wld = self._torso(goals, world)
         try:
             traj = self.m.plan_pose(self.q, g, wld, self.attached)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
-        self.steps.append({"kind": "traj", "label": label, "traj": traj})
+        self.steps.append({"kind": "traj", "label": label, "traj": traj, "goals": goals, "goals_fn": goals_fn,
+                           "world": world, "attached": self.attached, "holding": bool(self.state.get("holding"))})
         self.q = self.m.end_q(self.q, traj)
 
     def to_joint(self, label, goal, world):
@@ -189,7 +193,8 @@ class ArmPlan:
             traj = self.m.plan_joint(self.q, goal, wld, self.attached)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
-        self.steps.append({"kind": "traj", "label": label, "traj": traj})
+        self.steps.append({"kind": "traj", "label": label, "traj": traj, "goal_q": goal, "world": world,
+                           "attached": self.attached, "holding": bool(self.state.get("holding"))})
         self.q = self.m.end_q(self.q, traj)
 
     def waist_to(self, label, waist):
@@ -216,12 +221,29 @@ class ArmPlan:
         return [{"label": s["label"], "kind": s["kind"], "duration": dur[s["kind"]](s) if s["kind"] in dur else None}
                 for s in self.steps]
 
+    def replan_live(self, s):
+        """Re-plan a step from the robot's live commanded pose (reality drifts from the plan: sag,
+        a box that turned in the hands, grip corrections). The build-time plan proved it feasible."""
+        live = ArmPlan(self.m)
+        live.attached = s["attached"]
+        live.state = {"holding": s["holding"]}
+        try:
+            if "goals" in s:
+                live.to_pose(s["label"], s["goals_fn"]() if s.get("goals_fn") else s["goals"], s["world"])
+            else:
+                goal = dict(live.q)
+                goal.update({k: v for k, v in s["goal_q"].items() if 15 <= k <= 28})
+                live.to_joint(s["label"], goal, s["world"])
+        except SkillError as e:
+            raise SkillError(f"re-planning from the live pose failed: {e}")
+        return live.steps[-1]["traj"]
+
     def run(self, on_step=None):
         for i, s in enumerate(self.steps):
             if on_step:
                 on_step(i, s["label"])
             if s["kind"] == "traj":
-                self.m.execute(s["traj"])
+                self.m.execute(self.replan_live(s), holding=s["holding"])
             elif s["kind"] == "waist":
                 self.m.move_waist(s["waist"], s["seconds"])
             else:
