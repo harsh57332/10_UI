@@ -109,7 +109,19 @@ def plan_pose(start, goals, world):
     pos = _t([[goals[f]["position"]] for f in frames]).view(1, 1, len(frames), 1, 3)
     quat = _t([[goals[f]["quaternion"]] for f in frames]).view(1, 1, len(frames), 1, 4)
     _world(world)
-    return _trajectory(_planner.plan_pose(GoalToolPose(tool_frames=frames, position=pos, quaternion=quat), _state(start)))
+    # the IK solution nearest the start, then a joint-space plan to it: cuRobo's own pose planning takes
+    # any collision-free solution, sometimes with the arms wound over the shoulders
+    goal = GoalToolPose(tool_frames=frames, position=pos, quaternion=quat)
+    ik = _planner.ik_solver.solve_pose(goal, current_state=_state(start), return_seeds=P["ik_solutions"])
+    sol = ik.solution.reshape(-1, len(start))[ik.success.reshape(-1)]
+    if len(sol) == 0:
+        raise RuntimeError("no collision-free plan found (no IK solution)")
+    for i in (sol - _t(start)).abs().sum(-1).argsort()[:P["ik_tries"]]:
+        try:
+            return _trajectory(_planner.plan_cspace(_state(sol[i].tolist()), _state(start)))
+        except RuntimeError:
+            continue
+    raise RuntimeError("no collision-free plan found")
 
 
 def plan_joint(start, goal, world):

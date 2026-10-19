@@ -30,3 +30,11 @@ def mode_name(fsm_id: int) -> str:
         if i == fsm_id:
             return name
     return f"unknown_{fsm_id}"
+
+
+def tcp_frames() -> dict:
+    """Palm contact frames {name: {parent, xyz}} on the glove surface (bare-hand TCP + glove contact offset)."""
+    pm = load()["planner_model"]
+    off = pm.get("glove", {}).get("contact_m", 0.0)
+    return {n: {"parent": t["parent"], "xyz": [x + off * k for x, k in zip(t["xyz"], t["normal"])]}
+            for n, t in pm["tcp"].items()}

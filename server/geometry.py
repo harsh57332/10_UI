@@ -23,7 +23,8 @@ class Geometry:
         self.fk = FK(config.path(cfg["robot"]["urdf"]))
         T_link = self.fk.pose(cfg["camera_mount"]["link"])
         self.R = T_link[:3, :3] @ R_LINK_OPTICAL
-        self.t = T_link[:3, 3] + T_link[:3, :3] @ np.array(cfg["camera_mount"]["rgb_offset_m"])
+        self.t = (T_link[:3, 3] + T_link[:3, :3] @ np.array(cfg["camera_mount"]["rgb_offset_m"])
+                  + np.array(cfg["camera_mount"].get("calib_offset_m", [0.0, 0.0, 0.0])))
 
     def torso_in_pelvis(self, waist):
         """4x4 pose of the torso in the pelvis frame for waist angles [yaw, roll, pitch] (rad)."""

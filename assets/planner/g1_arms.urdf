@@ -527,4 +527,4 @@
       <material name="white" />
     </visual>
   </link>
-<link name="left_tcp" /><joint name="left_tcp_joint" type="fixed"><parent link="left_rubber_hand" /><child link="left_tcp" /><origin xyz="0.075 -0.03 0.01" rpy="0 0 0" /></joint><link name="right_tcp" /><joint name="right_tcp_joint" type="fixed"><parent link="right_rubber_hand" /><child link="right_tcp" /><origin xyz="0.075 0.03 0.01" rpy="0 0 0" /></joint></robot>
+<link name="left_tcp" /><joint name="left_tcp_joint" type="fixed"><parent link="left_rubber_hand" /><child link="left_tcp" /><origin xyz="0.075 -0.034999999999999996 0.01" rpy="0 0 0" /></joint><link name="right_tcp" /><joint name="right_tcp_joint" type="fixed"><parent link="right_rubber_hand" /><child link="right_tcp" /><origin xyz="0.075 0.034999999999999996 0.01" rpy="0 0 0" /></joint></robot>

@@ -69,10 +69,16 @@ arms:
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
   playback_slowdown: 2.0         # planned trajectories play this many times slower (1.0 = as planned)
   playback_slowdown_holding: 3.0 # ...and this much slower while holding a box (gentle accelerations)
+  max_arm_turn_deg: 300          # refuse a planned move whose joints of one arm turn more than this in
+                                 # total: cuRobo accepts any collision-free IK, incl. arms wrapped over the
+                                 # shoulders (that one was ~500-600; standing -> ready is ~180)
   waist_speed_dps: 20            # waist turns while manipulating
   waist_speed_holding_dps: 10    # ...and while holding a box (it fell during a 20 deg/s turn)
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
   release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
+  max_motor_temp_c: 90           # any upper-body motor hotter than this while engaged -> arms released
+                                 # (the left wrist yaw reached 113 C holding a reach)
+  resume_motor_temp_c: 75        # after that, engaging is refused until all are below this
   # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
   gains:
     waist: {kp: 300.0, kd: 3.0, joints: [12, 13, 14]}
@@ -118,6 +124,8 @@ image_client:
   stream_quality: 75             # MJPEG quality for the browser
   depth_view_max_m: 4.0          # depth colour map range (8-bit view only; raw depth stays 16-bit)
   stale_s: 1.5                   # no frame for this long -> camera shown as offline
+  reconnect_s: 3.0               # no frame for this long -> subscribe again (after a robot reboot the old
+                                 # connection is dead and ZMQ never notices)
 
 ui:
   detect_text_max: 15
@@ -147,6 +155,8 @@ services:
     tool_frames: [left_tcp, right_tcp]
     max_cuboids: 12
     interpolation_dt: 0.02                       # s between trajectory points sent to the robot
+    ik_solutions: 32                             # IK solutions per pose goal; the nearest to the start is used
+    ik_tries: 3                                  # ...or the next nearest if no path to it is found
     timeout_s: 60
 
   llm:
@@ -173,9 +183,17 @@ planner_model:
   source_urdf: assets/robot/g1_29dof_rev_1_0.urdf
   source_meshes: third_party/unitree_ros/robots/g1_description/meshes
   # palm contact point in each rubber-hand frame (x along fingers, palms face each other at zero pose)
+  # (bare rubber hand; `normal` points out of the palm toward the other hand)
   tcp:
-    left_tcp:  {parent: left_rubber_hand,  xyz: [0.075, -0.030, 0.010]}
-    right_tcp: {parent: right_rubber_hand, xyz: [0.075, 0.030, 0.010]}
+    left_tcp:  {parent: left_rubber_hand,  xyz: [0.075, -0.030, 0.010], normal: [0, -1, 0]}
+    right_tcp: {parent: right_rubber_hand, xyz: [0.075, 0.030, 0.010], normal: [0, 1, 0]}
+  # padded work gloves over the rubber hands: the contact point moves out to the glove surface along
+  # the palm normal, the hand collision spheres grow by the padding and the fingertips reach further
+  glove:
+    contact_m: 0.005             # glove contact surface beyond the bare TCP (3.5 cm from the hand axis): from
+                                 # two photo-checked reaches (right/left gloves 9/3 cm short of the box faces)
+    pad_m: 0.025                 # padding thickness all round (grows the hand collision spheres; estimate)
+    finger_extra_m: 0.02         # glove fingertips beyond the rubber fingertips (estimate)
   # extra self-collision ignores: the fitted upper-arm spheres overlap the torso by 1-2 cm even in the
   # robot's normal standing pose, which made every start state "in collision" (joint limits keep them apart)
   # and the two rubber hands: when squeezing, the box sits between them (soft rubber, slow squeeze)
@@ -193,16 +211,22 @@ camera_mount:
   link: d435_link                # in the URDF, child of torso_link
   # optical frame (z forward, x right, y down) relative to the link (x forward, y left, z up)
   rgb_offset_m: [0.0, -0.015, 0.0]
+  # torso-frame correction of measured points so they match the arms: the photo-checked reach found the
+  # box 3 cm further left than the camera put it
+  calib_offset_m: [0.0, 0.03, 0.0]
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:
   # motor 15..28: hands at chest height, 24 cm to each side: clear of tables/boxes AND out of the
   # camera view (hands in front of the boxes spoiled their depth measurement)
-  ready_deg: [0, 35, 30, -45, 0, 0, 0, 0, -35, -30, -45, 0, 0, 0]
+  # left wrist yaw 4 deg: the gloved wrist rests there and cannot reach 0 (commanded 0 it pushed
+  # constantly and heated to 113 C)
+  ready_deg: [0, 35, 30, -45, 0, 0, 4, 0, -35, -30, -45, 0, 0, 0]
   grasp_pitch_deg: [0, 20, 40, 60, 75]   # fingers tilted down by these angles until a plan is found
   waist_deg: [0, 0, 0]
   max_face_deg: 45               # waist yaw limit when turning toward a target
-  approach_clear_m: [0.08, 0.05, 0.03]   # palms start this far outside the box faces (wide boxes: smaller)
+  approach_clear_m: [0.02, 0.03, 0.05]   # gloves stop this far outside the object's faces before the squeeze
+                                         # (closest first; 1 cm is inside the planner's collision margin)
   squeeze_m: 0.02                # palms are commanded this far inside each face -> grip force (deeper
                                  # squeezes saturated the arm motors, so the lift only reached 4-6 cm)
   min_squeeze_gap_m: 0.02        # ...but never closer than this to each other
@@ -215,7 +239,8 @@ manipulation:
   max_object_size_m: 0.70        # detections bigger than this (any side) are surfaces, not objects
   min_box_width_m: 0.04
   max_box_width_m: 0.50
-  grasp_min_above_support_m: 0.085   # palm point height above the table (hand reaches ~5 cm below; rim 1.5 cm)
+  grasp_min_above_support_m: 0.115   # palm point height above the support: the gloved hand reaches ~8 cm
+                                     # below it (photo-checked); objects are grasped at their centre if higher
   table_block_m: 0.10            # table slab thickness below its top (arms may hang below the table edge)
   drop_gap_m: 0.012              # hands within this of their squeeze targets -> the box slipped
   lift_tolerance_m: 0.03         # measured hand height must reach the lift target within this
@@ -229,7 +254,8 @@ manipulation:
   test_hold_s: 0.6
   grip_retries: 2                # squeeze 1 cm deeper per retry
   max_extra_squeeze_m: 0.02
-  palm_align: [0.0, 0.5, 1.0]    # palm angle: 0 = along the torso (held in runs 5/7) ... 1 = flat on measured faces
+  palm_align: [1.0, 0.5, 0.0]    # palm angle: 1 = flat on the measured faces (centred on them) ... 0 = along the
+                                 # turned torso (a 22 deg waist turn put the palms 4.6 cm behind the box centre)
   max_trusted_box_yaw_deg: 15    # larger box-angle estimates are treated as mis-fits (run 8 gripped the length)
   face_fractions: [1.0, 0.5, 0.0]   # waist turn toward a target, as fractions of its angle (tried in order);
                                     # palms squeeze along the turned torso, the box turns to meet them

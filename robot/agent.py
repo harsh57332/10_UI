@@ -135,6 +135,15 @@ def _upper_deg_to_rad(index, deg):
     return math.radians(joints.clamp_deg(index, float(deg)))
 
 
+def _wait_move(stop, duration):
+    """Wait for an arm move; fail at once if the arms were released for over-temperature."""
+    t_end = time.monotonic() + duration
+    while not stop.is_set() and time.monotonic() < t_end:
+        if g1.arms.fault:
+            raise RuntimeError(g1.arms.fault)
+        stop.wait(min(0.1, max(0.0, t_end - time.monotonic())))
+
+
 def _set_upperbody(params, stop):
     q = params.get("q")
     if not isinstance(q, list) or len(q) != 17:
@@ -146,7 +155,7 @@ def _set_upperbody(params, stop):
         g1.arms.engage()
         delta = max(abs(math.degrees(target[j] - c)) for j, c in zip(joints.UPPER_BODY, g1.arms.q))
         duration = max(0.5, delta / CFG["arms"]["max_speed_dps"])
-    stop.wait(g1.arms.move([(float(duration), target)], smooth=True))
+    _wait_move(stop, g1.arms.move([(float(duration), target)], smooth=True))
     return {"duration": round(float(duration), 2), "interrupted": stop.is_set()}
 
 
@@ -168,7 +177,7 @@ def _play_upperbody(params, stop):
             targets[idx] = _upper_deg_to_rad(idx, deg)
         parsed.append((t, targets))
     _require_mode("arm_modes")
-    stop.wait(g1.arms.move(parsed, smooth=params.get("interp", "smooth") == "smooth"))
+    _wait_move(stop, g1.arms.move(parsed, smooth=params.get("interp", "smooth") == "smooth"))
     return {"frames": len(parsed), "interrupted": stop.is_set()}
 
 
@@ -372,7 +381,7 @@ def state():
         "busy": busy,
         "arms": {"engaged": g1.arms.engaged, "moving": g1.arms.moving(), "weight": round(g1.arms.weight, 3),
                  "loop_hz": round(g1.arms.loop_hz, 1), "max_gap_ms": round(g1.arms.max_gap_ms, 1),
-                 "q_cmd_deg": g1.arms.q_cmd_deg()},
+                 "q_cmd_deg": g1.arms.q_cmd_deg(), "fault": g1.arms.fault},
         "joints": g1.joint_states(),
         "imu": g1.imu(),
         "battery": g1.battery(),

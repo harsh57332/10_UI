@@ -106,6 +106,7 @@ class Arms:
         self.segments = []        # [(t_start, t_end, q_from, q_to, smooth)], time.monotonic()
         self.loop_hz = 0.0        # measured publish/loop rate, for /state
         self.max_gap_ms = 0.0     # worst tick gap in the last second
+        self.fault = None         # over-temperature release reason, until it cools and is engaged again
         threading.Thread(target=self._loop, daemon=True, name="arm_sdk").start()
 
     @property
@@ -122,7 +123,14 @@ class Arms:
             return [round(math.degrees(v), 3) for v in self.q] if self.engaged and self.q is not None else None
 
     def engage(self):
-        """Take over the arms at their current measured pose (no jump)."""
+        """Take over the arms at their current measured pose (no jump). After an over-temperature release
+        this is refused until every upper-body motor has cooled below resume_motor_temp_c."""
+        if self.fault:
+            hot = self._hot(self.cfg["resume_motor_temp_c"])
+            if hot:
+                raise RuntimeError(f"{self.fault}; still too hot to engage ({self._describe(hot)}, "
+                                   f"wait until below {self.cfg['resume_motor_temp_c']} C)")
+            self.fault = None
         with self.lock:
             if self.weight_target == 1.0:
                 return
@@ -160,8 +168,34 @@ class Arms:
                 t, q_from = t + duration, q_to
         return t - t_begin
 
+    def _hot(self, limit):
+        """{motor index: temperature C} of the upper-body motors hotter than limit."""
+        m = self.g1.low.get()
+        if m is None:
+            return {}
+        temps = {j: max(m.motor_state[j].temperature) for j in joints.UPPER_BODY}
+        return {j: t for j, t in temps.items() if t > limit}
+
+    @staticmethod
+    def _describe(hot):
+        return ", ".join(f"{joints.NAMES[j]} {t} C" for j, t in hot.items())
+
+    def _overheat_check(self):
+        """Once a second while engaged: release the arms if a motor runs too hot."""
+        if not self.engaged or self.fault:
+            return
+        hot = self._hot(self.cfg["max_motor_temp_c"])
+        if hot:
+            self.fault = f"arms released for over-temperature: {self._describe(hot)}"
+            log.error(self.fault)
+            with self.lock:
+                self.segments, self.weight_target = [], 0.0
+                self.weight_rate = 1.0 / self.cfg["release_s"]
+
     def _wait_weight(self, target):
         while abs(self.weight - target) > 1e-6:
+            if target > 0 and self.fault:           # released for over-temperature during the engage ramp
+                raise RuntimeError(self.fault)
             time.sleep(self.dt)
 
     def _loop(self):
@@ -182,6 +216,7 @@ class Arms:
             if now - stat_t >= 1.0:
                 self.loop_hz, self.max_gap_ms = ticks / (now - stat_t), max_gap * 1000
                 ticks, max_gap, stat_t = 0, 0.0, now
+                self._overheat_check()
             with self.lock:
                 if self.weight == 0.0 and self.weight_target == 0.0:
                     continue

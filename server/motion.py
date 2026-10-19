@@ -38,7 +38,7 @@ class ArmMotion:
         self.cfg = config.load()
         self.link, self.planner, self.processing = link, planner, processing
         self.fk = FK(config.path(self.cfg["robot"]["urdf"]))
-        self.tcp = self.cfg["planner_model"]["tcp"]
+        self.tcp = config.tcp_frames()
         self.idx = {n + "_joint": i for i, n in enumerate(joints.NAMES)}
         self._names = None
 
@@ -113,7 +113,19 @@ class ArmMotion:
         q.update({self.idx[n]: v for n, v in zip(traj["joint_names"], traj["positions"][-1])})
         return q
 
+    def check_swing(self, traj, label="move"):
+        """Refuse a contorted solution: the joints of one arm turning more than arms.max_arm_turn_deg in
+        total during one move (cuRobo returns any collision-free IK, e.g. arms wrapped over the shoulders)."""
+        lim = self.cfg["arms"]["max_arm_turn_deg"]
+        swing = np.degrees(np.abs(np.array(traj["positions"]) - traj["positions"][0]).max(axis=0))
+        for side in ("left", "right"):
+            turn = sum(s for n, s in zip(traj["joint_names"], swing) if n.startswith(side))
+            if turn > lim:
+                raise SkillError(f"{label}: refused, the {side} arm joints would turn {turn:.0f} deg in total "
+                                 f"(limit {lim}): a contorted arm pose")
+
     def execute(self, traj, holding=False):
+        self.check_swing(traj)
         a = self.cfg["arms"]
         dt = traj["dt"] * (a["playback_slowdown_holding"] if holding else a["playback_slowdown"])
         kf = [{"t": dt, "q": {str(self.idx[n]): round(math.degrees(v), 3)
@@ -183,6 +195,7 @@ class ArmPlan:
             traj = self.m.plan_pose(self.q, g, wld, self.attached)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
+        self.m.check_swing(traj, label)
         self.steps.append({"kind": "traj", "label": label, "traj": traj, "goals": goals, "goals_fn": goals_fn,
                            "world": world, "attached": self.attached, "holding": bool(self.state.get("holding"))})
         self.q = self.m.end_q(self.q, traj)
@@ -193,6 +206,7 @@ class ArmPlan:
             traj = self.m.plan_joint(self.q, goal, wld, self.attached)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
+        self.m.check_swing(traj, label)
         self.steps.append({"kind": "traj", "label": label, "traj": traj, "goal_q": goal, "world": world,
                            "attached": self.attached, "holding": bool(self.state.get("holding"))})
         self.q = self.m.end_q(self.q, traj)

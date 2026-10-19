@@ -66,30 +66,44 @@ class ImageClient:
                 "size": [f.rgb.shape[1], f.rgb.shape[0]] if f else None,
                 "intrinsics": f.intrinsics if f else None}
 
-    def _run(self, host, stop):
+    def _subscribe(self, host):
         sock = zmq.Context.instance().socket(zmq.SUB)
         sock.setsockopt(zmq.SUBSCRIBE, b"")
         sock.setsockopt(zmq.RCVHWM, 2)
         sock.setsockopt(zmq.LINGER, 0)
         sock.connect(f"tcp://{host}:{self.cfg['camera']['zmq_port']}")
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
+        return sock
+
+    def _run(self, host, stop):
+        sock, poller, got = None, zmq.Poller(), 0.0
         last = None
         while not stop.is_set():
+            if sock is None or time.monotonic() - got > self.cfg["image_client"]["reconnect_s"]:
+                if sock is not None:
+                    poller.unregister(sock)
+                    sock.close()
+                    self.preset = None          # a restarted image server is back on its default preset
+                sock, got = self._subscribe(host), time.monotonic()
+                poller.register(sock, zmq.POLLIN)
             if not poller.poll(200):
                 continue
-            meta, jpg, png = sock.recv_multipart()
-            rgb = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-            depth = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+            try:
+                meta, jpg, png = sock.recv_multipart()
+                rgb = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                depth = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+            except (ValueError, cv2.error):     # a malformed message must not end the thread
+                continue
             if rgb is None or depth is None:
                 continue
+            got = time.monotonic()
             now = time.time()
             if last:
                 self.fps = 0.9 * self.fps + 0.1 / max(now - last, 1e-3)
             last = now
             self.frame, self.recv_t = Frame(json.loads(meta), rgb, depth), now
             self.recent.append(self.frame)
-        sock.close()
+        if sock is not None:
+            sock.close()
 
     # ---------------------------------------------------------------- precision modes
     def set_preset(self, mode):

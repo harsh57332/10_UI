@@ -2,16 +2,22 @@
 
 1. Cut the G1 URDF down to the torso subtree (torso, head, both arms with rubber hands), so the
    planner works in the torso frame with the waist fixed.
-2. Add the palm contact frames (left_tcp / right_tcp) from config.planner_model.tcp.
+2. Add the palm contact frames (left_tcp / right_tcp) on the glove surface (planner_model.tcp + glove).
 3. Copy the meshes it needs, fit collision spheres and the self-collision matrix with cuRobo's
-   RobotBuilder, and save the robot yml.
+   RobotBuilder (saved as <robot_yml>_fit.yml), then grow the hand spheres to the padded gloves, add
+   the held-box link and the extra ignores, and save the robot yml.
 
-Run (once, or after changing the TCP offsets):
-  ~/miniconda3/envs/g1ui_curobo/bin/python -m scripts.build_planner_robot
+The sphere fit is random (GPU) even with a seed, so it runs only with --refit (or when the fit file is
+missing); changing the TCP, the glove sizes or the ignores keeps the arm model that was tested.
+Run (after changing the TCP offsets or the glove sizes; --refit after changing the URDF):
+  ~/miniconda3/envs/g1ui_curobo/bin/python -m scripts.build_planner_robot [--refit]
 """
 import shutil
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import numpy as np
 
 from common import config
 
@@ -47,32 +53,57 @@ def cut_urdf(src, dst, tcp):
     return sorted(keep), sorted(meshes)
 
 
+def glove(spheres, tcp, normals, g):
+    """Padded gloves: every hand sphere grows by the padding, the fingertip spheres (outer third of the hand
+    along x, the finger direction) get copies shifted out by the extra glove finger length, and nothing
+    reaches past the glove's flat palm surface (the contact frame) toward the box: the rubber fingertips
+    curl in further than the gloved palm, so those spheres are pushed back to it."""
+    pad, extra = g.get("pad_m", 0.0), g.get("finger_extra_m", 0.0)
+    for name, t in tcp.items():
+        link, n = t["parent"], np.array(normals[name], float)
+        plane = float(np.dot(t["xyz"], n))
+        sp = spheres[link]
+        xs = [c["center"][0] for c in sp]
+        tip = max(xs) - (max(xs) - min(xs)) / 3
+        tips = [{"center": [c["center"][0] + extra, *c["center"][1:]], "radius": c["radius"]}
+                for c in sp if c["center"][0] >= tip] if extra > 0 else []
+        out = []
+        for c in sp + tips:
+            ctr, r = np.array(c["center"], float), c["radius"] + pad
+            ctr -= max(0.0, ctr @ n + r - plane) * n
+            out.append({"center": [round(float(v), 5) for v in ctr], "radius": r})
+        spheres[link] = out
+
+
 def main():
     cfg = config.load()
     pm, pl = cfg["planner_model"], cfg["services"]["planner"]
     out_urdf = config.path(pl["urdf"])
     out_dir = out_urdf.parent
     (out_dir / "meshes").mkdir(parents=True, exist_ok=True)
-    links, meshes = cut_urdf(config.path(pm["source_urdf"]), out_urdf, pm["tcp"])
+    tcp = config.tcp_frames()
+    links, meshes = cut_urdf(config.path(pm["source_urdf"]), out_urdf, tcp)
     for m in meshes:
         shutil.copy(config.path(pm["source_meshes"]) / Path(m).name, out_dir / "meshes" / Path(m).name)
     print(f"URDF: {out_urdf} ({len(links)} links, {len(meshes)} meshes)")
 
-    import numpy as np
-    import torch
-    from curobo.robot_builder import RobotBuilder
-    np.random.seed(pm["fit_seed"])
-    torch.manual_seed(pm["fit_seed"])
-    builder = RobotBuilder(urdf_path=str(out_urdf), asset_path=str(out_dir), tool_frames=list(pm["tcp"]))
-    builder.fit_collision_spheres(sphere_density=1.0)
-    builder.compute_collision_matrix(prune_collisions=True, num_samples=1000)
-    robot_cfg = builder.build()
     yml = config.path(pl["robot_yml"])
-    builder.save(robot_cfg, str(yml))
+    fit = yml.with_name(yml.stem + "_fit.yml")
+    if "--refit" in sys.argv or not fit.exists():
+        import torch
+        from curobo.robot_builder import RobotBuilder
+        np.random.seed(pm["fit_seed"])
+        torch.manual_seed(pm["fit_seed"])
+        builder = RobotBuilder(urdf_path=str(out_urdf), asset_path=str(out_dir), tool_frames=list(tcp))
+        builder.fit_collision_spheres(sphere_density=1.0)
+        builder.compute_collision_matrix(prune_collisions=True, num_samples=1000)
+        builder.save(builder.build(), str(fit))
+        print(f"sphere fit: {fit}")
     import yaml
-    data = yaml.safe_load(open(yml))
-    # a link for a held box (cuRobo fits spheres to it when attached), riding on the left palm frame
+    data = yaml.safe_load(open(fit))
     k = data["kinematics"]
+    glove(k["collision_spheres"], tcp, {n: t["normal"] for n, t in pm["tcp"].items()}, pm.get("glove", {}))
+    # a link for a held box (cuRobo fits spheres to it when attached), riding on the left palm frame
     for key in ("extra_links", "extra_collision_spheres", "self_collision_buffer"):
         k[key] = k.get(key) or {}
     k["extra_links"]["attached_object"] = {
@@ -88,7 +119,8 @@ def main():
         ign[link] = sorted(set(ign.get(link, [])) | set(others))
     data["kinematics"]["self_collision_ignore"] = ign
     yaml.safe_dump(data, open(yml, "w"), sort_keys=False)
-    print(f"robot yml: {yml} ({builder.num_spheres} spheres, {len(builder.collision_matrix)} ignore pairs)")
+    n = sum(len(v) for v in k["collision_spheres"].values())
+    print(f"robot yml: {yml} ({n} spheres, {sum(len(v) for v in ign.values())} ignore pairs)")
     from scripts.check_self_collision import main as check
     if check():
         raise SystemExit("the model self-collides in a key pose: add the pair to planner_model.self_collision_ignore")
