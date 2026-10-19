@@ -333,6 +333,8 @@ def pick_box(ctx, plan, object):
     _ensure_ready(ctx, plan)
     table = _table(ctx, b["support_z"], b.get("support_front_x", b["front_x"] - 0.10), cy)
     byaw = b.get("yaw", 0.0)                    # palms close flat on the real faces, not on corners
+    if abs(byaw) > math.radians(M["max_trusted_box_yaw_deg"]):
+        byaw = 0.0                              # a large estimated angle is more likely a mis-fit than real
     box = cuboid(object, b["center"], b["dims"], byaw)
     others = [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items() if k != object]
     squeeze = min(M["squeeze_m"], max(0.0, (dy - M["min_squeeze_gap_m"]) / 2))
@@ -524,6 +526,8 @@ def place(ctx, plan, on):
         x, y, z_s = t["center"][0], t["center"][1], t["top_z"]
         x, y = _calibrated(ctx, plan, x, y)
         target_yaw = t.get("yaw", 0.0)                # square the box to the one below it
+        if abs(target_yaw) > math.radians(M["max_trusted_box_yaw_deg"]):
+            target_yaw = 0.0
         world = [cuboid(on, t["center"], t["dims"], target_yaw),
                  _table(ctx, t["support_z"], t.get("support_front_x", t["front_x"] - 0.10), y)]
     else:

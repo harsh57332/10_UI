@@ -229,7 +229,8 @@ manipulation:
   test_hold_s: 0.6
   grip_retries: 2                # squeeze 1 cm deeper per retry
   max_extra_squeeze_m: 0.02
-  palm_align: [1.0, 0.5, 0.0]    # palm angle: 1 = flat on the measured box faces, 0 = along the torso
+  palm_align: [0.0, 0.5, 1.0]    # palm angle: 0 = along the torso (held in runs 5/7) ... 1 = flat on measured faces
+  max_trusted_box_yaw_deg: 15    # larger box-angle estimates are treated as mis-fits (run 8 gripped the length)
   face_fractions: [1.0, 0.5, 0.0]   # waist turn toward a target, as fractions of its angle (tried in order);
                                     # palms squeeze along the turned torso, the box turns to meet them
 
