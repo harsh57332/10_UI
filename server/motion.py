@@ -186,7 +186,9 @@ class ArmPlan:
         delta = max(abs(math.degrees(a - b)) for a, b in zip(waist, self.waist))
         if delta < 1.0:
             return
-        seconds = max(1.0, delta / self.m.cfg["arms"]["waist_speed_dps"])
+        a = self.m.cfg["arms"]
+        speed = a["waist_speed_holding_dps"] if self.state.get("holding") else a["waist_speed_dps"]
+        seconds = max(1.0, delta / speed)
         self.steps.append({"kind": "waist", "label": label, "waist": list(waist), "seconds": seconds})
         self.q = dict(self.q)
         self.q.update({12 + k: v for k, v in enumerate(waist)})

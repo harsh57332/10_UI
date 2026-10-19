@@ -12,7 +12,7 @@ import time
 import cv2
 import numpy as np
 
-from common import config
+from common import config, joints
 
 from common.fk import mat_to_quat
 
@@ -93,7 +93,28 @@ def _parse(label):
     return base, quals
 
 
-def _detect_all(ctx, base):
+def _hand_rects(ctx, frame, q, T):
+    """Image rectangles covered by the robot's own hands (so they are not taken for objects)."""
+    rects = []
+    k = frame.intrinsics
+    Tinv = np.linalg.inv(T)
+    qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
+    for side in ("left", "right"):
+        pts = []
+        Th = ctx.motion.fk.pose(f"{side}_rubber_hand", qn, base="pelvis")
+        for xyz in ([0.0, 0.0, 0.0], [0.07, 0.0, 0.0], [0.13, 0.0, 0.0]):     # wrist, palm, fingertips
+            p = Tinv[:3, :3] @ (Th[:3, 3] + Th[:3, :3] @ np.array(xyz)) + Tinv[:3, 3]     # torso frame
+            c = ctx.geometry.R.T @ (p - ctx.geometry.t)                                    # camera optical frame
+            if c[2] > 0.05:
+                pts.append((k["fx"] * c[0] / c[2] + k["ppx"], k["fy"] * c[1] / c[2] + k["ppy"]))
+        if pts:
+            us, vs = zip(*pts)
+            m = 40
+            rects.append((min(us) - m, min(vs) - m, max(us) - min(us) + 2 * m, max(vs) - min(vs) + 2 * m))
+    return rects
+
+
+def _detect_all(ctx, base, hands=()):
     frame = ctx.camera.latest()
     if frame is None:
         raise SkillError("camera is offline")
@@ -104,6 +125,9 @@ def _detect_all(ctx, base):
     for d in dets:                                   # drop near-duplicate boxes (keep the higher score)
         x1, y1, x2, y2 = d["box"]
         r = (x1, y1, x2 - x1, y2 - y1)
+        cxy = (x1 + x2) / 2, (y1 + y2) / 2
+        if any(hx <= cxy[0] <= hx + hw and hy <= cxy[1] <= hy + hh for hx, hy, hw, hh in hands):
+            continue                                 # that's the robot's own hand
         if all(_iou(r, k) < 0.5 for k in rects):
             rects.append(r)
             kept.append((r, d["score"]))
@@ -119,7 +143,8 @@ def _look(ctx, base):
     for _ in range(P["look_max_tries"] + 1):
         q = ctx.motion.q_now()
         T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q))
-        frame, dets = _detect_all(ctx, base)
+        frame = ctx.camera.latest()
+        frame, dets = _detect_all(ctx, base, _hand_rects(ctx, frame, q, T) if frame is not None else ())
         (x, y, w, h), _ = dets[0]
         H = frame.rgb.shape[0]
         step = 0.0
@@ -341,6 +366,7 @@ def pick_box(ctx, plan, object):
     tallest = max([v["top_z"] for k, v in ctx.bb["objects"].items() if k != object], default=b["support_z"])
     lift = max(M["lift_m"], tallest - b["support_z"] + M["carry_clear_m"])
     plan.to_pose("lift", hands(-squeeze, zg + lift, pitch=pitch), [table] + others)
+    plan.call("check grip after lift", lambda: _check_gap(ctx, gap_cmd, "the box slipped during the lift"))
     held = {"object": object, "width": dy, "dims": b["dims"], "grasp_above_bottom": zg - b["support_z"],
             "gap_cmd": gap_cmd, "pitch": pitch, "clear": clear}
     plan.state["holding"] = held
@@ -406,6 +432,7 @@ def place(ctx, plan, on):
     else:
         plan.restore(base)
         raise SkillError(f"cannot bring the box above '{on}': {last}")
+    plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_cmd"], f"'{h['object']}' slipped while moving"))
     plan.to_pose("lower", hands(half, z), world)
     plan.to_pose("open hands", hands(h["width"] / 2 + h["clear"], z), world)
     plan.state["holding"] = None

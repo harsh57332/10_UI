@@ -69,6 +69,7 @@ arms:
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
   playback_slowdown: 2.0         # planned trajectories play this many times slower (1.0 = as planned)
   waist_speed_dps: 20            # waist turns while manipulating
+  waist_speed_holding_dps: 10    # ...and while holding a box (it fell during a 20 deg/s turn)
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
   release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
   # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
@@ -192,8 +193,8 @@ manipulation:
   waist_deg: [0, 0, 0]
   max_face_deg: 45               # waist yaw limit when turning toward a target
   approach_clear_m: [0.08, 0.05, 0.03]   # palms start this far outside the box faces (wide boxes: smaller)
-  squeeze_m: 0.03                # palms are commanded this far inside each face -> grip force
-  min_squeeze_gap_m: 0.06        # ...but never closer than this (the curled rubber fingers would collide)
+  squeeze_m: 0.045               # palms are commanded this far inside each face -> grip force
+  min_squeeze_gap_m: 0.02        # ...but never closer than this to each other
   lift_m: 0.10
   carry_clear_m: 0.04            # held box bottom at least this far above every other object
   place_clear_m: 0.01            # box bottom this far above the surface when released
