@@ -5,6 +5,7 @@ Other modules (OWLv2, cuRobo) read frames with latest(). Overlays (detections, t
 by callables registered in `overlays`, only on the browser stream.
 """
 import asyncio
+import collections
 import json
 import threading
 import time
@@ -36,6 +37,8 @@ class ImageClient:
         self.recv_t = 0.0
         self.fps = 0.0
         self.overlays = []          # callables(bgr_image) -> None, drawn on the RGB stream
+        self.recent = collections.deque(maxlen=self.cfg["perception"]["fine_frames"] * 2)
+        self.preset = "coarse"
         self._stop = threading.Event()
         self._thread = None
 
@@ -85,7 +88,58 @@ class ImageClient:
                 self.fps = 0.9 * self.fps + 0.1 / max(now - last, 1e-3)
             last = now
             self.frame, self.recv_t = Frame(json.loads(meta), rgb, depth), now
+            self.recent.append(self.frame)
         sock.close()
+
+    # ---------------------------------------------------------------- precision modes
+    def set_preset(self, mode):
+        """Switch the camera depth preset: 'fine' (manipulation) or 'coarse' (walking)."""
+        if mode == self.preset or not self.host:
+            return
+        sock = zmq.Context.instance().socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.setsockopt(zmq.RCVTIMEO, 3000)
+        sock.connect(f"tcp://{self.host}:{self.cfg['camera']['control_port']}")
+        try:
+            sock.send_json({"preset": mode})
+            sock.recv_json()
+            self.preset = mode
+        except zmq.Again:
+            raise RuntimeError("camera did not answer the precision switch")
+        finally:
+            sock.close()
+
+    def fine(self, n=None):
+        """Manipulation precision: High Accuracy preset + per-pixel median depth over n new frames."""
+        P = self.cfg["perception"]
+        n = n or P["fine_frames"]
+        if self.preset != "fine":
+            self.set_preset("fine")
+            time.sleep(P["fine_settle_s"])
+        start = self.frame.seq if self.frame else 0
+        t_end = time.time() + n / self.cfg["camera"]["fps"] * 3 + 2
+        while time.time() < t_end:
+            frames = [f for f in list(self.recent) if f.seq > start]
+            if len(frames) >= n:
+                break
+            time.sleep(0.05)
+        frames = [f for f in list(self.recent) if f.seq > start][-n:]
+        if not frames:
+            raise RuntimeError("camera is offline")
+        stack = np.stack([f.depth for f in frames]).astype(np.float32)
+        stack[stack == 0] = np.nan
+        valid = np.sum(~np.isnan(stack), axis=0) >= max(3, len(frames) // 3)   # seen in enough frames
+        med = np.nanmedian(np.where(valid[None], stack, 0), axis=0)
+        depth = np.where(valid, np.nan_to_num(med), 0).astype(np.uint16)
+        last = frames[-1]
+        meta = {"seq": last.seq, "t": last.t, "depth_scale": last.depth_scale, "intrinsics": last.intrinsics}
+        return Frame(meta, last.rgb, depth)
+
+    def coarse(self):
+        """Walking precision: default preset, latest single frame."""
+        if self.preset != "coarse":
+            self.set_preset("coarse")
+        return self.latest()
 
     # ---------------------------------------------------------------- browser streams
     def _jpeg(self, kind):

@@ -4,6 +4,7 @@ actions
   fk          {q: [14 rad]}                       -> {joint_names, poses: {left_tcp: {position, quaternion}, ...}}
   plan_pose   {start: [14], goals: {left_tcp: {position, quaternion(wxyz)}, right_tcp: ...}, world: [cuboid]}
   plan_joint  {start: [14], goal: [14], world: [cuboid]}
+  (both take optional "attached": {"cuboid": cuboid, "q": [14]} = a held box moving with the hands)
      -> {joint_names, dt, positions: [[14], ...], duration}
 cuboid: {"name", "dims": [x, y, z], "pose": [x, y, z, qw, qx, qy, qz]}  (torso frame, metres)
 Run: scripts/svc.sh start planner
@@ -24,6 +25,7 @@ P = CFG["services"]["planner"]
 log = logging.getLogger("planner")
 app = FastAPI(title="g1ui-planner")
 _planner = None
+_attached = None            # json of the currently attached held box, or None
 _lock = threading.Lock()
 _FAR = {"far": {"dims": [0.01, 0.01, 0.01], "pose": [10.0, 10.0, 10.0, 1, 0, 0, 0]}}
 
@@ -60,6 +62,23 @@ def _world(cuboids):
     for c in cuboids or []:
         cub[c["name"]] = {"dims": list(map(float, c["dims"])), "pose": list(map(float, c["pose"]))}
     _planner.update_world(Scene.create({"cuboid": cub}))
+
+
+def _attach(attached):
+    """Keep cuRobo's attached object in sync with the request: {"cuboid": {...torso frame}, "q": [14]} or None."""
+    global _attached
+    key = None if attached is None else repr(attached)
+    if key == _attached:
+        return
+    am = _planner.attachment_manager
+    if attached is None:
+        am.detach("attached_object")
+    else:
+        from curobo.scene import Cuboid
+        c = attached["cuboid"]
+        am.attach(_state(attached["q"]), [Cuboid(name="held", dims=c["dims"], pose=c["pose"])],
+                  link_name="attached_object", num_spheres=CFG["planner_model"]["held_object_spheres"])
+    _attached = key
 
 
 def _trajectory(result):
@@ -106,6 +125,8 @@ def infer(req: Request):
         with _lock:
             if req.action == "fk":
                 return envelope.done(req.id, fk(p["q"]), t0)
+            if req.action in ("plan_pose", "plan_joint"):
+                _attach(p.get("attached"))
             if req.action == "plan_pose":
                 return envelope.done(req.id, plan_pose(p["start"], p["goals"], p.get("world")), t0)
             if req.action == "plan_joint":

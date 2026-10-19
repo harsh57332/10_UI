@@ -52,12 +52,13 @@ class ArmMotion:
 
     # ---------------------------------------------------------------- robot state and frames
     def q_now(self, commanded=True):
-        """{motor index: rad} for all 29 joints; upper body from the commanded angles if engaged."""
+        """{motor index: rad} for all 29 joints; arms and waist yaw from the commanded angles if engaged.
+        Waist roll/pitch are measured (they track commands only approximately; the camera pose uses them)."""
         s = self.link.state()
         q = {j["index"]: math.radians(j["deg"]) for j in s["joints"]}
         cmd = s["arms"].get("q_cmd_deg")
         if commanded and cmd:
-            q.update({12 + k: math.radians(v) for k, v in enumerate(cmd)})
+            q.update({12 + k: math.radians(v) for k, v in enumerate(cmd) if 12 + k not in (13, 14)})
         return q
 
     @staticmethod
@@ -95,15 +96,16 @@ class ArmMotion:
         return out
 
     # ---------------------------------------------------------------- planning (torso frame)
-    def plan_pose(self, start, goals, world):
+    def plan_pose(self, start, goals, world, attached=None):
         with self.processing("curobo"):
             return self.planner.call("plan_pose", {"start": [start[self.idx[n]] for n in self.names],
-                                                   "goals": goals, "world": world})
+                                                   "goals": goals, "world": world, "attached": attached})
 
-    def plan_joint(self, start, goal, world):
+    def plan_joint(self, start, goal, world, attached=None):
         with self.processing("curobo"):
             return self.planner.call("plan_joint", {"start": [start[self.idx[n]] for n in self.names],
-                                                    "goal": [goal[self.idx[n]] for n in self.names], "world": world})
+                                                    "goal": [goal[self.idx[n]] for n in self.names], "world": world,
+                                                    "attached": attached})
 
     def end_q(self, start, traj):
         q = dict(start)
@@ -138,18 +140,27 @@ class ArmPlan:
         self.q = start if start is not None else motion.q_now()
         self.steps = []
         self.state = {"holding": None}
+        self.attached = None                    # held box (torso frame) + arm joints when grabbed
 
     @property
     def waist(self):
         return ArmMotion.waist_of(self.q)
 
     def mark(self):
-        return len(self.steps), dict(self.q), dict(self.state)
+        return len(self.steps), dict(self.q), dict(self.state), self.attached
 
     def restore(self, mark):
-        n, q, state = mark
+        n, q, state, attached = mark
         del self.steps[n:]
-        self.q, self.state = q, state
+        self.q, self.state, self.attached = q, state, attached
+
+    def attach(self, cuboid_pelvis):
+        """From now on plan with this box held in the hands (it moves with them)."""
+        c = self.m.cuboid_to_torso(cuboid_pelvis, self.waist)
+        self.attached = {"cuboid": c, "q": [self.q[self.m.idx[n]] for n in self.m.names]}
+
+    def detach(self):
+        self.attached = None
 
     def _torso(self, goals, world):
         """Pelvis -> torso frame. A goal with quaternion None keeps the hand's current torso-relative orientation."""
@@ -166,7 +177,7 @@ class ArmPlan:
     def to_pose(self, label, goals, world):
         g, wld = self._torso(goals, world)
         try:
-            traj = self.m.plan_pose(self.q, g, wld)
+            traj = self.m.plan_pose(self.q, g, wld, self.attached)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.steps.append({"kind": "traj", "label": label, "traj": traj})
@@ -175,7 +186,7 @@ class ArmPlan:
     def to_joint(self, label, goal, world):
         _, wld = self._torso({}, world)
         try:
-            traj = self.m.plan_joint(self.q, goal, wld)
+            traj = self.m.plan_joint(self.q, goal, wld, self.attached)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.steps.append({"kind": "traj", "label": label, "traj": traj})

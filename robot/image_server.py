@@ -36,9 +36,18 @@ def hardware_reset():
         d.hardware_reset()
 
 
+def set_preset(profile, value):
+    sensor = profile.get_device().first_depth_sensor()
+    if sensor.supports(rs.option.visual_preset):
+        sensor.set_option(rs.option.visual_preset, float(value))
+
+
 def main():
     cfg = config.load()
     c = cfg["camera"]
+    ctl = zmq.Context.instance().socket(zmq.REP)
+    ctl.bind(f"tcp://*:{c['control_port']}")
+    mode = "coarse"
     logging.basicConfig(level=cfg["logging"]["level"], format="%(asctime)s %(name)s %(levelname)s %(message)s")
     sock = zmq.Context().socket(zmq.PUB)
     sock.setsockopt(zmq.SNDHWM, 2)
@@ -52,10 +61,20 @@ def main():
         pipe = None
         try:
             pipe, align, intr, scale = open_camera(c)
+            profile = pipe.get_active_profile()
+            set_preset(profile, c["presets"][mode])
             log.info("streaming %dx%d @ %d fps on :%d", c["width"], c["height"], c["fps"], c["zmq_port"])
             next_t = 0.0
             while True:
                 frames = pipe.wait_for_frames(c["frame_timeout_ms"])
+                try:                                 # precision switch from the server (non-blocking)
+                    req = ctl.recv_json(flags=zmq.NOBLOCK)
+                    if req.get("preset") in c["presets"]:
+                        mode = req["preset"]
+                        set_preset(profile, c["presets"][mode])
+                    ctl.send_json({"preset": mode})
+                except zmq.Again:
+                    pass
                 now = time.monotonic()               # scheduling only; meta "t" stays wall time
                 if now + half_frame < next_t:        # decimate capture_fps -> fps
                     continue
@@ -69,7 +88,7 @@ def main():
                 if not (ok1 and ok2):
                     continue
                 seq += 1
-                meta = {"seq": seq, "t": time.time(), "width": c["width"], "height": c["height"],
+                meta = {"seq": seq, "t": time.time(), "width": c["width"], "height": c["height"], "preset": mode,
                         "depth_scale": scale, "intrinsics": intr}
                 sock.send_multipart([json.dumps(meta).encode(), jpg.tobytes(), png.tobytes()])
         except Exception as e:

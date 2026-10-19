@@ -75,8 +75,8 @@ arms:
   # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
   gains:
     waist: {kp: 300.0, kd: 3.0, joints: [12, 13, 14]}
-    arm:   {kp: 80.0,  kd: 3.0, joints: [15, 16, 17, 18, 22, 23, 24, 25]}
-    wrist: {kp: 40.0,  kd: 1.5, joints: [19, 20, 21, 26, 27, 28]}
+    arm:   {kp: 150.0, kd: 4.0, joints: [15, 16, 17, 18, 22, 23, 24, 25]}   # 80 sagged 8 cm holding a box
+    wrist: {kp: 60.0,  kd: 2.0, joints: [19, 20, 21, 26, 27, 28]}
 
 audio:
   tts_speaker_id: 1              # 0 = Chinese, 1 = English (verify)
@@ -99,6 +99,10 @@ end_effector:
 camera:
   service_name: g1ui-camera
   zmq_port: 5555
+  control_port: 5556             # REQ/REP: {"preset": "fine" | "coarse"}
+  presets:                       # D400 visual_preset per precision mode
+    fine: 3                      # High Accuracy (manipulation)
+    coarse: 1                    # Default (walking)
   width: 640
   height: 480
   fps: 20                        # sent rate (the D435i has no 20 fps mode, so capture runs faster)
@@ -178,6 +182,10 @@ planner_model:
                           left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link],
                           left_rubber_hand: [right_rubber_hand], right_rubber_hand: [left_rubber_hand]}
   fit_seed: 7                    # sphere fitting is random; a fixed seed keeps rebuilds identical
+  held_object_spheres: 40        # sphere slots for a held box (planner avoids collisions with it)
+  held_object_ignore: [left_rubber_hand, right_rubber_hand, left_wrist_yaw_link, right_wrist_yaw_link,
+                       left_wrist_pitch_link, right_wrist_pitch_link, left_wrist_roll_link, right_wrist_roll_link,
+                       left_elbow_link, right_elbow_link]
 
 # Head camera mount. Depth is aligned to the RGB camera; points come out in its optical frame.
 camera_mount:
@@ -187,23 +195,32 @@ camera_mount:
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:
-  # motor 15..28: forearms raised 40 deg, palms facing, hands at chest height (clear of tables/boxes)
-  ready_deg: [0, 12, 0, -40, 0, 0, 0, 0, -12, 0, -40, 0, 0, 0]
+  # motor 15..28: hands at chest height, 24 cm to each side: clear of tables/boxes AND out of the
+  # camera view (hands in front of the boxes spoiled their depth measurement)
+  ready_deg: [0, 35, 30, -45, 0, 0, 0, 0, -35, -30, -45, 0, 0, 0]
   grasp_pitch_deg: [0, 20, 40, 60, 75]   # fingers tilted down by these angles until a plan is found
   waist_deg: [0, 0, 0]
   max_face_deg: 45               # waist yaw limit when turning toward a target
   approach_clear_m: [0.08, 0.05, 0.03]   # palms start this far outside the box faces (wide boxes: smaller)
-  squeeze_m: 0.045               # palms are commanded this far inside each face -> grip force
+  squeeze_m: 0.02                # palms are commanded this far inside each face -> grip force (deeper
+                                 # squeezes saturated the arm motors, so the lift only reached 4-6 cm)
   min_squeeze_gap_m: 0.02        # ...but never closer than this to each other
   lift_m: 0.10
-  carry_clear_m: 0.04            # held box bottom at least this far above every other object
+  carry_clear_m: 0.025           # held box bottom at least this far above every other object
+  place_above_m: 0.04            # approach the place pose from this far above
+  pull_in_m: 0.08                # after lifting, draw the box this far toward the chest (less arm sag)
+  min_carry_x_m: 0.30
   place_clear_m: 0.01            # box bottom this far above the surface when released
   max_object_size_m: 0.70        # detections bigger than this (any side) are surfaces, not objects
   min_box_width_m: 0.04
   max_box_width_m: 0.50
-  grasp_min_above_support_m: 0.065   # palm point height above the table (the hand reaches ~5 cm below it)
+  grasp_min_above_support_m: 0.085   # palm point height above the table (hand reaches ~5 cm below; rim 1.5 cm)
   table_block_m: 0.10            # table slab thickness below its top (arms may hang below the table edge)
   drop_gap_m: 0.012              # hands within this of their squeeze targets -> the box slipped
+  lift_tolerance_m: 0.03         # measured hand height must reach the lift target within this
+  lift_sag_comp_m: 0.03          # command the lift this much higher: the arms sag under a held box
+  face_fractions: [1.0, 0.5, 0.0]   # waist turn toward a target, as fractions of its angle (tried in order);
+                                    # palms squeeze along the turned torso, the box turns to meet them
 
 # AI control and skills.
 ai:
@@ -218,7 +235,11 @@ ai:
 
 # Depth-based measurement (calibrated on the Dex1-1 boxes: real 19 x 14 x 8 cm).
 perception:
+  fine_frames: 15                # manipulation: per-pixel median depth over this many frames
+  fine_settle_s: 0.6             # wait after switching the camera preset
   box_edge_bias_m: 0.015         # added to box width/depth: dark box edges lose depth
+  table_rim_m: 0.015             # raised rim/rails on a table or case top
+  floor_below_m: -0.6            # points lower than this (pelvis frame) are floor, never a support
   look_edge_px: 6                # a detection this close to the top/bottom edge is cut off
   look_step_deg: 8               # waist pitch change per look adjustment
   look_max_pitch_deg: 20

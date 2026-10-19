@@ -71,7 +71,19 @@ def main():
     builder.save(robot_cfg, str(yml))
     import yaml
     data = yaml.safe_load(open(yml))
+    # a link for a held box (cuRobo fits spheres to it when attached), riding on the left palm frame
+    k = data["kinematics"]
+    for key in ("extra_links", "extra_collision_spheres", "self_collision_buffer"):
+        k[key] = k.get(key) or {}
+    k["extra_links"]["attached_object"] = {
+        "fixed_transform": [0, 0, 0, 1, 0, 0, 0], "joint_name": "attach_joint", "joint_type": "FIXED",
+        "link_name": "attached_object", "parent_link_name": "left_tcp"}
+    k["extra_collision_spheres"]["attached_object"] = pm["held_object_spheres"]
+    if "attached_object" not in k["collision_link_names"]:
+        k["collision_link_names"].append("attached_object")
+    k["self_collision_buffer"]["attached_object"] = 0.0
     ign = data["kinematics"].get("self_collision_ignore") or {}
+    ign["attached_object"] = sorted(set(ign.get("attached_object", [])) | set(pm["held_object_ignore"]))
     for link, others in pm.get("self_collision_ignore", {}).items():
         ign[link] = sorted(set(ign.get(link, [])) | set(others))
     data["kinematics"]["self_collision_ignore"] = ign

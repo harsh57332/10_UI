@@ -70,6 +70,8 @@ class Geometry:
         if obj.shape[0] < 50:
             return None
         top_z = float(np.percentile(obj[:, 2], 97))
+        if around.size:                       # the floor (~0.8 m below the pelvis) is never the support
+            around = around[around[:, 2] > self.cfg["perception"]["floor_below_m"]]
         support = self.plane_height(around[around[:, 2] < top_z - 0.02, 2]) if around.size else None
         if support is None:
             support = float(np.percentile(obj[:, 2], 3))
@@ -84,7 +86,12 @@ class Geometry:
         y0, y1 = np.percentile(top[:, 1], [2, 98]) + np.array([-bias, bias]) / 2
         dims = [float(x1 - x0), float(y1 - y0), float(top_z - support)]
         center = [float((x0 + x1) / 2), float((y0 + y1) / 2), float((top_z + support) / 2)]
-        return {"center": center, "dims": dims, "top_z": top_z, "support_z": support, "front_x": float(x0)}
+        # front edge of the supporting surface next to the box (for the table obstacle)
+        sup = around[(np.abs(around[:, 2] - support) < 0.012) & (np.abs(around[:, 1] - center[1]) < 0.2)] \
+            if around.size else np.zeros((0, 3))
+        support_front = float(np.percentile(sup[:, 0], 2)) if sup.shape[0] > 30 else float(x0) - 0.10
+        return {"center": center, "dims": dims, "top_z": top_z, "support_z": support, "front_x": float(x0),
+                "support_front_x": min(support_front, float(x0))}
 
     def fit_surface(self, frame, rect, T=None):
         """Table-like surface inside rect: top height, front edge distance and extent."""
