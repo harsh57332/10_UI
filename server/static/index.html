@@ -114,8 +114,34 @@
     <h2><span class="num">5</span>End effectors</h2>
     <p class="hint" id="ee-hint">—</p>
   </section>
-  <section class="todo"><h2><span class="num">6</span>Motion planning</h2><p class="hint">Phase 5</p></section>
-  <section class="todo"><h2><span class="num">7</span>AI control</h2><p class="hint">Phase 7</p></section>
+  <section id="s6" class="gated">
+    <h2><span class="num">6</span>Motion planning <span class="gate" id="s6-gate"></span></h2>
+    <label>Instruction for the arms <span class="muted" id="p6-count">0/500</span></label>
+    <textarea id="p6-text" rows="3" maxlength="500" placeholder="pick up the black box with both hands and stack it on top of the right box"></textarea>
+    <div class="row">
+      <button id="btn-p6-gen">Generate motion</button>
+      <button id="btn-p6-play">Send &amp; play</button>
+      <span class="muted" id="p6-state"></span>
+    </div>
+    <ol id="p6-plan" class="steps"></ol>
+    <p class="hint">cuRobo plans the 14 arm joints (7 per arm); the waist stays fixed.</p>
+  </section>
+
+  <section id="s7" class="gated">
+    <h2><span class="num">7</span>AI control <span class="gate" id="s7-gate"></span></h2>
+    <label>Task <span class="muted" id="ai-count">0/500</span></label>
+    <textarea id="ai-text" rows="3" maxlength="500" placeholder="lift the box from the table with both hands, turn 90 degrees left, walk to the table and place the box on it"></textarea>
+    <div class="row">
+      <label class="inline"><input type="radio" name="ai-mode" value="step" checked> Step</label>
+      <label class="inline"><input type="radio" name="ai-mode" value="auto"> Automatic</label>
+      <button id="btn-ai-start">Plan &amp; execute</button>
+      <button id="btn-ai-next">Next step</button>
+      <button id="btn-ai-abort" class="ghost">Abort</button>
+      <span class="muted" id="ai-state"></span>
+    </div>
+    <ol id="ai-nodes" class="steps"></ol>
+    <ol id="ai-log" class="log small"></ol>
+  </section>
 </div>
 
 <div class="col side">
@@ -123,6 +149,12 @@
     <h2>Image client <span class="muted" id="cam-stat"></span></h2>
     <div id="cam-off" class="cam-placeholder">Camera closed</div>
     <div id="cam-on" hidden>
+      <label>Objects to detect <span class="muted">(comma separated, max <span id="det-max">15</span> chars; empty clears)</span></label>
+      <div class="row">
+        <input id="det-text" maxlength="15" placeholder="box, bottle" style="flex:1">
+        <button id="btn-detect">Detect &amp; track</button>
+      </div>
+      <ul id="tracked" class="tracked"></ul>
       <label>Live RGB frame</label>
       <img id="cam-rgb" class="cam" alt="RGB">
       <label>Live depth frame</label>

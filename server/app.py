@@ -15,8 +15,15 @@ from pydantic import BaseModel
 
 from common import config, joints
 
+from .ai import AIControl, MotionPlanning
+from .geometry import Geometry
 from .image_client import ImageClient
+from .llm import LLM
+from .motion import ArmMotion, SkillError
 from .robot_link import AgentLink
+from .services import Service, ServiceError
+from .skills import Ctx
+from .tracking import Tracking
 
 CFG = config.load()
 STATIC = Path(__file__).parent / "static"
@@ -26,6 +33,13 @@ app = FastAPI(title="g1ui-server")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 link = AgentLink()
 camera = ImageClient()
+vision = Service("vision")
+tracking = Tracking(camera, link, vision)
+llm = LLM()
+motion = ArmMotion(link, Service("planner"), tracking.processing)
+ctx = Ctx(link, camera, vision, Geometry(), motion, tracking.processing)
+plan6 = MotionPlanning(ctx, llm)
+ai = AIControl(ctx, llm)
 
 
 class Cmd(BaseModel):
@@ -36,6 +50,15 @@ class Cmd(BaseModel):
 
 class Host(BaseModel):
     host: str
+
+
+class Text(BaseModel):
+    text: str = ""
+
+
+class Task(BaseModel):
+    text: str
+    mode: str = "step"
 
 
 @app.get("/")
@@ -86,9 +109,11 @@ def status():
     if not link.host:
         return {"connected": False}
     try:
-        return {"connected": True, "host": link.host, "state": link.state(), "camera": camera.status()}
+        return {"connected": True, "host": link.host, "state": link.state(), "camera": camera.status(),
+                "tracking": tracking.status(), "plan6": plan6.status(), "ai": ai.status()}
     except (httpx.HTTPError, ValueError) as e:
-        return {"connected": True, "host": link.host, "state": None, "camera": camera.status(), "error": str(e)}
+        return {"connected": True, "host": link.host, "state": None, "camera": camera.status(),
+                "tracking": tracking.status(), "error": str(e)}
 
 
 # ---------------------------------------------------------------- camera
@@ -97,6 +122,17 @@ def video(kind: str):
     if kind not in ("rgb", "depth"):
         raise HTTPException(404)
     return StreamingResponse(camera.mjpeg(kind), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.post("/api/detect")
+def detect(t: Text):
+    """Comma-separated object names (max ui.detect_text_max chars). Empty text clears tracking."""
+    if len(t.text) > CFG["ui"]["detect_text_max"]:
+        raise HTTPException(400, f"text is over {CFG['ui']['detect_text_max']} characters")
+    try:
+        return tracking.detect(t.text)
+    except (ServiceError, RuntimeError) as e:
+        raise HTTPException(503, str(e))
 
 
 # ---------------------------------------------------------------- commands
@@ -118,3 +154,61 @@ async def audio(file: UploadFile = File(...)):
     if p.returncode != 0 or not p.stdout:
         raise HTTPException(400, f"could not decode audio: {p.stderr.decode()[:300]}")
     return link.send("play_audio", {"pcm_b64": base64.b64encode(p.stdout).decode()})
+
+
+# ---------------------------------------------------------------- section 6: motion planning
+def _nl(text):
+    if not text.strip() or len(text) > CFG["ui"]["nl_text_max"]:
+        raise HTTPException(400, f"text must be 1..{CFG['ui']['nl_text_max']} characters")
+
+
+@app.post("/api/plan6/generate")
+def plan6_generate(t: Text):
+    _nl(t.text)
+    try:
+        return plan6.generate(t.text)
+    except (SkillError, ServiceError) as e:
+        raise HTTPException(409, str(e))
+
+
+@app.post("/api/plan6/play")
+def plan6_play():
+    try:
+        return plan6.play()
+    except SkillError as e:
+        raise HTTPException(409, str(e))
+
+
+# ---------------------------------------------------------------- section 7: AI control
+@app.post("/api/ai/start")
+def ai_start(t: Task):
+    _nl(t.text)
+    if t.mode not in ("step", "auto"):
+        raise HTTPException(400, "mode must be step or auto")
+    try:
+        return ai.start(t.text, t.mode)
+    except SkillError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.post("/api/ai/next")
+def ai_next():
+    ai.next()
+    return ai.status()
+
+
+@app.post("/api/ai/abort")
+def ai_abort():
+    ai.abort()
+    return ai.status()
+
+
+@app.post("/api/ai/mode")
+def ai_mode(t: Task):
+    ai.set_mode(t.mode if t.mode in ("step", "auto") else "step")
+    return ai.status()
+
+
+@app.get("/api/services")
+def services_health():
+    return {"vision": vision.health(), "planner": motion.planner.health(), "llm": llm.health() is not None}

@@ -77,6 +77,29 @@ def _walk(params, stop, vx=0.0, vy=0.0, wz=0.0, turn=False):
     return {"velocity": v, "duration": d, "interrupted": stop.is_set()}
 
 
+def _turn_by(params, stop):
+    """Turn in place by angle_deg (+ = left) using pelvis IMU yaw as feedback."""
+    loc = CFG["locomotion"]
+    angle = math.radians(_num(params, "angle_deg", -180.0, 180.0))
+    v = _num(params, "velocity", 0.05, loc["turn_speed_max"], loc["turn_speed_default"])
+    _require_mode("walk_modes")
+    yaw0 = g1.yaw()
+    lead = v * loc["turn_stop_lead_s"]          # stop early by what the robot turns while stopping
+    t_end = time.monotonic() + abs(angle) / v * 2.0 + 2.0
+    g1.velocity(0.0, 0.0, math.copysign(v, angle), abs(angle) / v * 2.0 + 2.0)
+    turned = 0.0
+    while time.monotonic() < t_end and not stop.is_set():
+        turned = math.remainder(g1.yaw() - yaw0, math.tau)
+        if abs(turned) >= abs(angle) - lead:
+            break
+        time.sleep(0.02)
+    g1.stop_move()
+    stop.wait(loc["turn_settle_s"])
+    turned = math.remainder(g1.yaw() - yaw0, math.tau)
+    return {"target_deg": round(math.degrees(angle), 1), "turned_deg": round(math.degrees(turned), 1),
+            "interrupted": stop.is_set()}
+
+
 def _set_mode(params, stop):
     target = params.get("mode")
     ids = CFG["modes"]["ids"]
@@ -231,6 +254,7 @@ ACTIONS = {
     "right_aside":  (lambda p, s: _walk(p, s, vy=-1), "motion"),
     "turn_left":    (lambda p, s: _walk(p, s, wz=+1, turn=True), "motion"),
     "turn_right":   (lambda p, s: _walk(p, s, wz=-1, turn=True), "motion"),
+    "turn_by":      (_turn_by, "motion"),
     "stand2squat":  (_not_priority, "motion"),
     "squat2stand":  (_not_priority, "motion"),
     "set_mode":     (_set_mode, "motion"),
@@ -347,7 +371,8 @@ def state():
         **mode,
         "busy": busy,
         "arms": {"engaged": g1.arms.engaged, "moving": g1.arms.moving(), "weight": round(g1.arms.weight, 3),
-                 "loop_hz": round(g1.arms.loop_hz, 1), "max_gap_ms": round(g1.arms.max_gap_ms, 1)},
+                 "loop_hz": round(g1.arms.loop_hz, 1), "max_gap_ms": round(g1.arms.max_gap_ms, 1),
+                 "q_cmd_deg": g1.arms.q_cmd_deg()},
         "joints": g1.joint_states(),
         "imu": g1.imu(),
         "battery": g1.battery(),

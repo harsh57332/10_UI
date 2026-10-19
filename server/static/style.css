@@ -76,3 +76,15 @@ section.gated.off { opacity: .6; }
 .manip input { width: 50px; padding: 3px 5px; }
 .manip button { padding: 3px 8px; font-size: 12px; }
 .manip td { white-space: nowrap; }
+.tracked { list-style: none; padding: 0; margin: 8px 0 0; font-size: 12px; }
+.tracked li { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid var(--line); }
+.steps { margin: 10px 0 0; padding-left: 22px; font-size: 13px; }
+.steps li { padding: 3px 0; }
+.steps .st { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--chip); margin-left: 6px; }
+.steps .st.done, .steps .st.skipped { color: var(--ok); } .steps .st.failed { color: var(--bad); }
+.steps .st.running, .steps .st.waiting, .steps .st.reviewing, .steps .st.checking { color: var(--warn); }
+.steps .why, .steps .err { display: block; font-size: 12px; color: var(--muted); }
+.steps .err { color: var(--bad); }
+.log.small { max-height: 180px; margin-top: 8px; }
+textarea { width: 100%; }
+label.inline input[type=radio] { width: auto; }

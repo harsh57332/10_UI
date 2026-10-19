@@ -159,6 +159,24 @@ function setCamera(open) {
 }
 $("btn-camera").onclick = () => setCamera(!camOpen);
 
+$("btn-detect").onclick = async () => {
+  const text = $("det-text").value.trim();
+  $("btn-detect").disabled = true;
+  log(text ? `→ detect "${text}"` : "→ clear tracking", "run");
+  try {
+    const r = await api("/api/detect", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) });
+    const found = r.items.filter((i) => i.found).map((i) => i.label);
+    const missing = r.items.filter((i) => !i.found).map((i) => i.label);
+    log(r.cleared ? "✓ tracking cleared" : `✓ tracking: ${found.join(", ") || "none"}${missing.length ? ` · not found: ${missing.join(", ")}` : ""}`, "ok");
+  } catch (e) { log(`✗ detect: ${e.message}`, "bad"); }
+  $("btn-detect").disabled = false;
+};
+
+function updateTracked(items) {
+  $("tracked").innerHTML = (items || []).map((i) => !i.found ? `<li><span>${i.label}</span><span class="muted">not found</span></li>`
+    : `<li><span>${i.label} <span class="muted">(${i.score})</span></span><span>${!i.ok ? "lost" : i.dist_cm ? `${i.dist_cm.toFixed(0)} cm` : "-- cm"}</span></li>`).join("");
+}
+
 // ------------------------------------------------------------------ 3 locomotion
 function setupLoco() {
   const L = UI.locomotion;
@@ -227,6 +245,66 @@ function gate(id, on, why) {
   $(`${id}-gate`).textContent = on ? "" : why;
 }
 
+// ------------------------------------------------------------------ 6 motion planning, 7 AI control
+async function post(path, body) {
+  return api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+}
+const esc = (x) => String(x).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+const short = (o) => (o && Object.keys(o).length ? esc(JSON.stringify(o)) : "");
+
+function setupPlanning() {
+  for (const [ta, cnt] of [["p6-text", "p6-count"], ["ai-text", "ai-count"]]) {
+    $(ta).maxLength = UI.ui.nl_text_max;
+    $(ta).oninput = () => ($(cnt).textContent = `${$(ta).value.length}/${UI.ui.nl_text_max}`);
+    $(cnt).textContent = `0/${UI.ui.nl_text_max}`;
+  }
+  $("btn-p6-gen").onclick = async () => {
+    const text = $("p6-text").value.trim();
+    if (!text) return;
+    $("p6-state").textContent = "asking the LLM and planning…";
+    log(`→ motion planning: ${text}`, "run");
+    try {
+      const r = await post("/api/plan6/generate", { text });
+      log(`✓ motion ready: ${r.steps.length} steps, ${r.duration_s} s`, "ok");
+    } catch (e) { log(`✗ motion planning: ${e.message}`, "bad"); }
+  };
+  $("btn-p6-play").onclick = async () => {
+    if (!confirm("Play the planned arm motion on the robot?")) return;
+    try { await post("/api/plan6/play"); log("→ playing motion", "run"); } catch (e) { log(`✗ play: ${e.message}`, "bad"); }
+  };
+  $("btn-ai-start").onclick = async () => {
+    const text = $("ai-text").value.trim();
+    if (!text) return;
+    const mode = document.querySelector("input[name=ai-mode]:checked").value;
+    if (mode === "auto" && !confirm("Run the whole task automatically?")) return;
+    try { await post("/api/ai/start", { text, mode }); log(`→ AI task (${mode}): ${text}`, "run"); } catch (e) { log(`✗ AI: ${e.message}`, "bad"); }
+  };
+  $("btn-ai-next").onclick = () => post("/api/ai/next");
+  $("btn-ai-abort").onclick = () => post("/api/ai/abort").then(() => log("AI abort requested", "bad"));
+  document.querySelectorAll("input[name=ai-mode]").forEach((r) => (r.onchange = () => post("/api/ai/mode", { text: "-", mode: r.value })));
+}
+
+function renderPlan6(p) {
+  if (!p) return;
+  $("p6-state").textContent = p.state === "idle" ? "" : `${p.state}${p.current ? ` · ${p.current}` : ""}${p.duration_s ? ` · ${p.duration_s} s` : ""}`;
+  $("btn-p6-play").disabled = p.state !== "ready" || $("s6").classList.contains("off");
+  const steps = p.steps || [];
+  $("p6-plan").innerHTML = p.llm_plan.map((n) => `<li><b>${esc(n.skill)}</b> ${short(n.params)}<span class="why">${esc(n.why || "")}</span></li>`).join("")
+    + (steps.length ? `<li class="muted">${steps.length} arm steps: ${steps.map((x) => esc(x.label)).join(" → ")}</li>` : "")
+    + (p.error ? `<li><span class="err">${esc(p.error)}</span></li>` : "");
+}
+
+function renderAI(a) {
+  if (!a) return;
+  $("ai-state").textContent = a.state === "idle" ? "" : `${a.state} · ${a.mode}`;
+  $("btn-ai-next").disabled = a.state !== "waiting";
+  $("btn-ai-abort").disabled = !["planning", "running", "waiting"].includes(a.state);
+  $("ai-nodes").innerHTML = a.nodes.map((n) => `<li><b>${esc(n.skill)}</b> ${short(n.params)}<span class="st ${n.status}">${n.status}</span>
+    <span class="why">${esc(n.why || "")}${n.review ? ` · review: ${esc(n.review.decision)} (${esc(n.review.reason)})` : ""}</span>
+    ${n.error ? `<span class="err">${esc(n.error)}</span>` : ""}</li>`).join("") + (a.error ? `<li><span class="err">${esc(a.error)}</span></li>` : "");
+  $("ai-log").innerHTML = a.log.slice().reverse().map((l) => `<li>${esc(l)}</li>`).join("");
+}
+
 // ------------------------------------------------------------------ polling
 function pill(id, text, cls = "") { const p = $(id); p.textContent = text; p.className = `pill ${cls}`; }
 
@@ -237,8 +315,7 @@ async function poll() {
       state = null;
       pill("pill-conn", s.connected ? `${s.host} · no response` : "offline", "bad");
       updateModes(null);
-      gate("s3", false, "· not connected");
-      gate("s4", false, "· not connected");
+      for (const id of ["s3", "s4", "s6", "s7"]) gate(id, false, "· not connected");
       return;
     }
     state = s.state;
@@ -253,8 +330,13 @@ async function poll() {
     updateManip(state.joints);
     gate("s3", state.mode === "locomotion", "· active only in Locomotion mode");
     gate("s4", state.mode === "manipulation", "· active only in Manipulation mode");
+    gate("s6", state.mode === "manipulation", "· active only in Manipulation mode");
+    gate("s7", state.mode === "manipulation", "· active only in Manipulation mode");
+    renderPlan6(s.plan6);
+    renderAI(s.ai);
     const a = state.arms;
     $("arms-stat").textContent = `arms ${a.engaged ? "held by us" : "with policy"}${a.moving ? " · moving" : ""} · ${a.loop_hz} Hz`;
+    updateTracked(s.tracking);
     const c = s.camera;
     $("cam-stat").textContent = c && c.online ? `${c.size[0]}×${c.size[1]} · ${c.fps} fps` : "· camera offline";
     if (b) kv($("batt"), [["SOC", `${b.soc} %`], ["Voltage", `${b.voltage_v} V`], ["Current", `${(b.current_ma / 1000).toFixed(2)} A`],
@@ -275,11 +357,14 @@ async function poll() {
   $("tts").maxLength = UI.audio.tts_max_chars;
   $("tts-count").textContent = `0/${UI.audio.tts_max_chars}`;
   $("audio-max").textContent = UI.audio.file_max_mb;
+  $("det-text").maxLength = UI.ui.detect_text_max;
+  $("det-max").textContent = UI.ui.detect_text_max;
   $("ee-hint").textContent = UI.end_effector.type === "dummy"
     ? "No end effector detected (dummy hands). This section activates when one is fitted." : "";
   buildModes();
   buildJoints();
   setupLoco();
   buildManip();
+  setupPlanning();
   poll();
 })();

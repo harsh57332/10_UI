@@ -116,6 +116,11 @@ class Arms:
         with self.lock:
             return bool(self.segments)
 
+    def q_cmd_deg(self):
+        """Commanded upper-body angles (deg, motor index 12..28) while engaged, else None."""
+        with self.lock:
+            return [round(math.degrees(v), 3) for v in self.q] if self.engaged and self.q is not None else None
+
     def engage(self):
         """Take over the arms at their current measured pose (no jump)."""
         with self.lock:
@@ -232,6 +237,12 @@ class G1:
         if m is None:
             raise RuntimeError("no rt/lowstate from the robot")
         return np.array([m.motor_state[j].q for j in joints.UPPER_BODY], dtype=float)
+
+    def yaw(self):
+        m = self.lowstate()
+        if m is None:
+            raise RuntimeError("no rt/lowstate from the robot")
+        return float(m.imu_state.rpy[2])
 
     def fsm_id(self):
         code, data = self.loco.GetFsmId()

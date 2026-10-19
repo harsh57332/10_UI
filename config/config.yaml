@@ -61,6 +61,8 @@ locomotion:
   turn_speed_max: 0.6            # rad/s
   turn_speed_default: 0.4
   duration_max_s: 30.0
+  turn_stop_lead_s: 0.25         # turn_by stops this early (x velocity) to absorb the stopping lag
+  turn_settle_s: 0.6
 
 arms:
   rate_hz: 50
@@ -112,6 +114,102 @@ image_client:
 ui:
   detect_text_max: 15
   nl_text_max: 500
+
+# Server-side model services. Each speaks the same envelope on POST /infer (see common/envelope.py).
+services:
+  vision:
+    host: 127.0.0.1
+    port: 8030
+    conda_env: g1ui_vision
+    module: services.vision.app
+    model: google/owlv2-large-patch14-ensemble
+    device: cuda:0
+    dtype: float32
+    prompt: "a photo of a {}"     # OWLv2 text query template
+    threshold: 0.15
+    timeout_s: 30
+
+  planner:
+    host: 127.0.0.1
+    port: 8040
+    conda_env: g1ui_curobo
+    module: services.planner.app
+    robot_yml: assets/planner/g1_arms.yml        # built by scripts/build_planner_robot.py
+    urdf: assets/planner/g1_arms.urdf
+    tool_frames: [left_tcp, right_tcp]
+    max_cuboids: 12
+    interpolation_dt: 0.02                       # s between trajectory points sent to the robot
+    timeout_s: 60
+
+  llm:
+    host: 127.0.0.1
+    port: 8025
+    conda_env: g1ui_llm
+    module: services.llm.serve                   # execs `vllm serve` with the flags below
+    model: nvidia/Cosmos3-Nano
+    served_name: cosmos3-nano
+    hf_overrides: {architectures: [Cosmos3ReasonerForConditionalGeneration]}
+    tensor_parallel_size: 1
+    max_num_seqs: 256
+    kv_cache_dtype: auto
+    gpu_memory_utilization: 0.65                 # one GPU shared with OWLv2 and cuRobo
+    max_model_len: 32768
+    max_tokens: 4096
+    temperature: 0.2
+    timeout_s: 300
+    env:                                         # FlashInfer's sampler JIT fails on sm_120 with the system nvcc
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+
+# Arms-only planning model: torso-rooted, waist fixed at 0, palm contact frames on the rubber hands.
+planner_model:
+  source_urdf: assets/robot/g1_29dof_rev_1_0.urdf
+  source_meshes: third_party/unitree_ros/robots/g1_description/meshes
+  # palm contact point in each rubber-hand frame (x along fingers, palms face each other at zero pose)
+  tcp:
+    left_tcp:  {parent: left_rubber_hand,  xyz: [0.075, -0.030, 0.010]}
+    right_tcp: {parent: right_rubber_hand, xyz: [0.075, 0.030, 0.010]}
+  # extra self-collision ignores: the fitted upper-arm spheres overlap the torso by 1-2 cm even in the
+  # robot's normal standing pose, which made every start state "in collision" (joint limits keep them apart)
+  self_collision_ignore: {left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link]}
+
+# Head camera mount. Depth is aligned to the RGB camera; points come out in its optical frame.
+camera_mount:
+  link: d435_link                # in the URDF, child of torso_link
+  # optical frame (z forward, x right, y down) relative to the link (x forward, y left, z up)
+  rgb_offset_m: [0.0, -0.015, 0.0]
+
+# Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
+manipulation:
+  # motor 15..28: forearms raised 40 deg, palms facing, hands at chest height (clear of tables/boxes)
+  ready_deg: [0, 12, 0, -40, 0, 0, 0, 0, -12, 0, -40, 0, 0, 0]
+  grasp_pitch_deg: [0, 20, 40, 60, 75]   # fingers tilted down by these angles until a plan is found
+  waist_deg: [0, 0, 0]
+  approach_clear_m: [0.08, 0.05, 0.03]   # palms start this far outside the box faces (wide boxes: smaller)
+  squeeze_m: 0.03                # palms are commanded this far inside each face -> grip force
+  min_squeeze_gap_m: 0.04        # ...but never closer than this to each other (narrow boxes)
+  lift_m: 0.10
+  place_clear_m: 0.01            # box bottom this far above the surface when released
+  min_box_width_m: 0.04
+  max_box_width_m: 0.50
+  grasp_min_above_support_m: 0.045   # palm height above the table, so hands don't hit it
+  table_block_m: 0.5             # table cuboid reaches this far below its top (no reaching under)
+  drop_gap_m: 0.012              # hands within this of their squeeze targets -> the box slipped
+
+# AI control and skills.
+ai:
+  speed: 0.4                     # fixed walking speed (m/s); walk time = distance / speed
+  table_standoff_m: 0.22         # torso origin to table front edge when ready to manipulate
+  box_reach_x_m: 0.32            # box centre this far in front of the torso for a pick
+  approach_tolerance_m: 0.05
+  approach_max_leg_m: 1.5        # walk at most this far before looking again
+  lateral_tolerance_m: 0.06
+  max_replans: 2
+  min_battery_pct: 20
+
+# Detect & track in the image client (server side).
+tracking:
+  depth_roi: 0.5                 # central fraction of a box used to measure its distance
+  min_depth_px: 30               # fewer valid depth pixels than this -> distance unknown
 
 logging:
   dir: logs
