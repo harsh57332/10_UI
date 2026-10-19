@@ -58,7 +58,11 @@ def main():
         shutil.copy(config.path(pm["source_meshes"]) / Path(m).name, out_dir / "meshes" / Path(m).name)
     print(f"URDF: {out_urdf} ({len(links)} links, {len(meshes)} meshes)")
 
+    import numpy as np
+    import torch
     from curobo.robot_builder import RobotBuilder
+    np.random.seed(pm["fit_seed"])
+    torch.manual_seed(pm["fit_seed"])
     builder = RobotBuilder(urdf_path=str(out_urdf), asset_path=str(out_dir), tool_frames=list(pm["tcp"]))
     builder.fit_collision_spheres(sphere_density=1.0)
     builder.compute_collision_matrix(prune_collisions=True, num_samples=1000)
@@ -73,6 +77,9 @@ def main():
     data["kinematics"]["self_collision_ignore"] = ign
     yaml.safe_dump(data, open(yml, "w"), sort_keys=False)
     print(f"robot yml: {yml} ({builder.num_spheres} spheres, {len(builder.collision_matrix)} ignore pairs)")
+    from scripts.check_self_collision import main as check
+    if check():
+        raise SystemExit("the model self-collides in a key pose: add the pair to planner_model.self_collision_ignore")
 
 
 if __name__ == "__main__":

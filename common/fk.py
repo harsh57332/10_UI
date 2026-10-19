@@ -46,3 +46,29 @@ class FK:
             T = M @ T
             link = j["parent"]
         return T
+
+
+def quat_to_mat(q):
+    w, x, y, z = q
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def mat_to_quat(R):
+    """wxyz, w >= 0."""
+    t = np.trace(R)
+    if t > 0:
+        s = np.sqrt(t + 1.0) * 2
+        q = [0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s]
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = np.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2
+        q = [0.0] * 4
+        q[0] = (R[k, j] - R[j, k]) / s
+        q[1 + i] = 0.25 * s
+        q[1 + j] = (R[j, i] + R[i, j]) / s
+        q[1 + k] = (R[k, i] + R[i, k]) / s
+    q = np.array(q)
+    return (q if q[0] >= 0 else -q) / np.linalg.norm(q)

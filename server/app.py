@@ -212,3 +212,25 @@ def ai_mode(t: Task):
 @app.get("/api/services")
 def services_health():
     return {"vision": vision.health(), "planner": motion.planner.health(), "llm": llm.health() is not None}
+
+
+class SkillCall(BaseModel):
+    skill: str
+    params: dict = {}
+
+
+@app.post("/api/skill")
+def skill_call(c: SkillCall):
+    """Run one skill now (testing / manual use). Shares the busy lock with sections 6 and 7."""
+    from .ai import Busy
+    from .skills import run_skill
+    if not Busy.lock.acquire(blocking=False):
+        raise HTTPException(409, f"robot is busy ({Busy.owner})")
+    Busy.owner = f"skill {c.skill}"
+    try:
+        return {"ok": True, "result": run_skill(ctx, c.skill, c.params), "known": ctx.summary()}
+    except (SkillError, ServiceError, TypeError) as e:
+        return {"ok": False, "error": str(e), "known": ctx.summary()}
+    finally:
+        Busy.owner = None
+        Busy.lock.release()

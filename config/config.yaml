@@ -67,6 +67,8 @@ locomotion:
 arms:
   rate_hz: 50
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
+  playback_slowdown: 2.0         # planned trajectories play this many times slower (1.0 = as planned)
+  waist_speed_dps: 20            # waist turns while manipulating
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
   release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
   # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
@@ -170,7 +172,11 @@ planner_model:
     right_tcp: {parent: right_rubber_hand, xyz: [0.075, 0.030, 0.010]}
   # extra self-collision ignores: the fitted upper-arm spheres overlap the torso by 1-2 cm even in the
   # robot's normal standing pose, which made every start state "in collision" (joint limits keep them apart)
-  self_collision_ignore: {left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link]}
+  # and the two rubber hands: when squeezing, the box sits between them (soft rubber, slow squeeze)
+  self_collision_ignore: {left_shoulder_roll_link: [torso_link], right_shoulder_roll_link: [torso_link],
+                          left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link],
+                          left_rubber_hand: [right_rubber_hand], right_rubber_hand: [left_rubber_hand]}
+  fit_seed: 7                    # sphere fitting is random; a fixed seed keeps rebuilds identical
 
 # Head camera mount. Depth is aligned to the RGB camera; points come out in its optical frame.
 camera_mount:
@@ -184,15 +190,18 @@ manipulation:
   ready_deg: [0, 12, 0, -40, 0, 0, 0, 0, -12, 0, -40, 0, 0, 0]
   grasp_pitch_deg: [0, 20, 40, 60, 75]   # fingers tilted down by these angles until a plan is found
   waist_deg: [0, 0, 0]
+  max_face_deg: 45               # waist yaw limit when turning toward a target
   approach_clear_m: [0.08, 0.05, 0.03]   # palms start this far outside the box faces (wide boxes: smaller)
   squeeze_m: 0.03                # palms are commanded this far inside each face -> grip force
-  min_squeeze_gap_m: 0.04        # ...but never closer than this to each other (narrow boxes)
+  min_squeeze_gap_m: 0.06        # ...but never closer than this (the curled rubber fingers would collide)
   lift_m: 0.10
+  carry_clear_m: 0.04            # held box bottom at least this far above every other object
   place_clear_m: 0.01            # box bottom this far above the surface when released
+  max_object_size_m: 0.70        # detections bigger than this (any side) are surfaces, not objects
   min_box_width_m: 0.04
   max_box_width_m: 0.50
-  grasp_min_above_support_m: 0.045   # palm height above the table, so hands don't hit it
-  table_block_m: 0.5             # table cuboid reaches this far below its top (no reaching under)
+  grasp_min_above_support_m: 0.065   # palm point height above the table (the hand reaches ~5 cm below it)
+  table_block_m: 0.10            # table slab thickness below its top (arms may hang below the table edge)
   drop_gap_m: 0.012              # hands within this of their squeeze targets -> the box slipped
 
 # AI control and skills.
@@ -205,6 +214,14 @@ ai:
   lateral_tolerance_m: 0.06
   max_replans: 2
   min_battery_pct: 20
+
+# Depth-based measurement (calibrated on the Dex1-1 boxes: real 19 x 14 x 8 cm).
+perception:
+  box_edge_bias_m: 0.015         # added to box width/depth: dark box edges lose depth
+  look_edge_px: 6                # a detection this close to the top/bottom edge is cut off
+  look_step_deg: 8               # waist pitch change per look adjustment
+  look_max_pitch_deg: 20
+  look_max_tries: 2
 
 # Detect & track in the image client (server side).
 tracking:

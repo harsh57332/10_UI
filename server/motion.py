@@ -1,16 +1,17 @@
 """Dual-arm motion: cuRobo plans the 14 arm joints in the torso frame, the Agent plays the result.
 
-An ArmPlan is a list of steps (trajectories and checks) built from a start configuration. Section 6
-builds a whole plan first and plays it later; AI control builds and runs one skill at a time.
-While a box is squeezed the measured arm angles lag the commanded ones, so planning always starts
-from the Agent's commanded angles when the arms are engaged.
+Objects, surfaces and hand goals are kept in the pelvis frame (it stays put while the robot stands);
+an ArmPlan converts them to the torso frame with the waist angles it tracks, so the waist can turn
+toward a target between steps. Section 6 builds a whole plan first and plays it later; AI control
+builds and runs one skill at a time. While a box is squeezed the measured arm angles lag the
+commanded ones, so planning starts from the Agent's commanded angles when the arms are engaged.
 """
 import math
 
 import numpy as np
 
 from common import config, joints
-from common.fk import FK
+from common.fk import FK, mat_to_quat, quat_to_mat
 
 
 class SkillError(RuntimeError):
@@ -22,7 +23,7 @@ def pose(xyz, quat=(1.0, 0.0, 0.0, 0.0)):
 
 
 def pitch_quat(deg):
-    """Palms keep facing each other (±y); fingers tilt down by `deg` (rotation about torso y), wxyz."""
+    """Palms keep facing each other (±y); fingers tilt down by `deg` (rotation about y), wxyz."""
     a = math.radians(deg) / 2
     return (math.cos(a), 0.0, math.sin(a), 0.0)
 
@@ -49,7 +50,7 @@ class ArmMotion:
             self._names = h["joint_names"]
         return self._names
 
-    # ---------------------------------------------------------------- robot state
+    # ---------------------------------------------------------------- robot state and frames
     def q_now(self, commanded=True):
         """{motor index: rad} for all 29 joints; upper body from the commanded angles if engaged."""
         s = self.link.state()
@@ -59,17 +60,41 @@ class ArmMotion:
             q.update({12 + k: math.radians(v) for k, v in enumerate(cmd)})
         return q
 
+    @staticmethod
+    def waist_of(q):
+        return [q[12], q[13], q[14]]
+
+    def torso_in_pelvis(self, waist):
+        return self.fk.pose("torso_link", {"waist_yaw_joint": waist[0], "waist_roll_joint": waist[1],
+                                           "waist_pitch_joint": waist[2]}, base="pelvis")
+
+    def to_torso(self, p, waist):
+        """Pelvis-frame pose dict -> torso-frame pose dict."""
+        Tinv = np.linalg.inv(self.torso_in_pelvis(waist))
+        pos = Tinv[:3, :3] @ np.array(p["position"]) + Tinv[:3, 3]
+        rot = Tinv[:3, :3] @ quat_to_mat(p["quaternion"])
+        return pose(pos, mat_to_quat(rot))
+
+    def cuboid_to_torso(self, c, waist):
+        t = self.to_torso({"position": c["pose"][:3], "quaternion": c["pose"][3:]}, waist)
+        return {"name": c["name"], "dims": c["dims"], "pose": t["position"] + t["quaternion"]}
+
+    def tool_quat_torso(self, q, name):
+        """Current orientation (wxyz) of a palm frame relative to the torso."""
+        qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
+        return mat_to_quat(self.fk.pose(self.tcp[name]["parent"], qn)[:3, :3])
+
     def palms(self, q):
-        """Torso-frame palm contact points (left, right) for {motor index: rad}."""
+        """Pelvis-frame palm contact points (left, right) for {motor index: rad} (waist included)."""
         qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
         out = []
         for name in ("left_tcp", "right_tcp"):
             t = self.tcp[name]
-            T = self.fk.pose(t["parent"], qn)
+            T = self.fk.pose(t["parent"], qn, base="pelvis")
             out.append(T[:3, 3] + T[:3, :3] @ np.array(t["xyz"]))
         return out
 
-    # ---------------------------------------------------------------- planning
+    # ---------------------------------------------------------------- planning (torso frame)
     def plan_pose(self, start, goals, world):
         with self.processing("curobo"):
             return self.planner.call("plan_pose", {"start": [start[self.idx[n]] for n in self.names],
@@ -86,40 +111,85 @@ class ArmMotion:
         return q
 
     def execute(self, traj):
-        kf = [{"t": traj["dt"], "q": {str(self.idx[n]): round(math.degrees(v), 3)
+        dt = traj["dt"] * self.cfg["arms"]["playback_slowdown"]
+        kf = [{"t": dt, "q": {str(self.idx[n]): round(math.degrees(v), 3)
                                       for n, v in zip(traj["joint_names"], row)}}
               for row in traj["positions"][1:]]
         if not kf:
             return
         r = self.link.send("play_upperbody", {"keyframes": kf, "interp": "linear"},
-                           wait=True, wait_timeout_s=traj["duration"] + 20)
+                           wait=True, wait_timeout_s=dt * len(kf) + 20)
         if not r.get("ok"):
             raise SkillError(f"arm motion failed: {r.get('error')}")
 
+    def move_waist(self, waist, seconds):
+        q = {str(12 + k): round(math.degrees(v), 3) for k, v in enumerate(waist)}
+        r = self.link.send("play_upperbody", {"keyframes": [{"t": seconds, "q": q}]}, wait=True, wait_timeout_s=seconds + 15)
+        if not r.get("ok"):
+            raise SkillError(f"waist motion failed: {r.get('error')}")
+
 
 class ArmPlan:
-    """Steps built from a start configuration; `run()` executes them on the robot."""
+    """Steps built from a start configuration (all 29 joints incl. waist); `run()` executes them.
+    Goals and world cuboids are given in the pelvis frame."""
 
     def __init__(self, motion, start=None):
         self.m = motion
         self.q = start if start is not None else motion.q_now()
         self.steps = []
+        self.state = {"holding": None}
+
+    @property
+    def waist(self):
+        return ArmMotion.waist_of(self.q)
+
+    def mark(self):
+        return len(self.steps), dict(self.q), dict(self.state)
+
+    def restore(self, mark):
+        n, q, state = mark
+        del self.steps[n:]
+        self.q, self.state = q, state
+
+    def _torso(self, goals, world):
+        """Pelvis -> torso frame. A goal with quaternion None keeps the hand's current torso-relative orientation."""
+        w = self.waist
+        out = {}
+        for k, v in goals.items():
+            if v.get("quaternion") is None:
+                t = self.m.to_torso({"position": v["position"], "quaternion": (1, 0, 0, 0)}, w)
+                out[k] = pose(t["position"], self.m.tool_quat_torso(self.q, k))
+            else:
+                out[k] = self.m.to_torso(v, w)
+        return out, [self.m.cuboid_to_torso(c, w) for c in world]
 
     def to_pose(self, label, goals, world):
+        g, wld = self._torso(goals, world)
         try:
-            traj = self.m.plan_pose(self.q, goals, world)
+            traj = self.m.plan_pose(self.q, g, wld)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.steps.append({"kind": "traj", "label": label, "traj": traj})
         self.q = self.m.end_q(self.q, traj)
 
     def to_joint(self, label, goal, world):
+        _, wld = self._torso({}, world)
         try:
-            traj = self.m.plan_joint(self.q, goal, world)
+            traj = self.m.plan_joint(self.q, goal, wld)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.steps.append({"kind": "traj", "label": label, "traj": traj})
         self.q = self.m.end_q(self.q, traj)
+
+    def waist_to(self, label, waist):
+        """Turn/tilt the torso (arms keep their pose relative to it)."""
+        delta = max(abs(math.degrees(a - b)) for a, b in zip(waist, self.waist))
+        if delta < 1.0:
+            return
+        seconds = max(1.0, delta / self.m.cfg["arms"]["waist_speed_dps"])
+        self.steps.append({"kind": "waist", "label": label, "waist": list(waist), "seconds": seconds})
+        self.q = dict(self.q)
+        self.q.update({12 + k: v for k, v in enumerate(waist)})
 
     def call(self, label, fn):
         """A non-motion step evaluated at run time (contact check, blackboard update...)."""
@@ -129,8 +199,9 @@ class ArmPlan:
         return self.m.palms(self.q)
 
     def summary(self):
-        return [{"label": s["label"], "kind": s["kind"],
-                 "duration": s["traj"]["duration"] if s["kind"] == "traj" else None} for s in self.steps]
+        dur = {"traj": lambda s: s["traj"]["duration"], "waist": lambda s: round(s["seconds"], 2)}
+        return [{"label": s["label"], "kind": s["kind"], "duration": dur[s["kind"]](s) if s["kind"] in dur else None}
+                for s in self.steps]
 
     def run(self, on_step=None):
         for i, s in enumerate(self.steps):
@@ -138,5 +209,7 @@ class ArmPlan:
                 on_step(i, s["label"])
             if s["kind"] == "traj":
                 self.m.execute(s["traj"])
+            elif s["kind"] == "waist":
+                self.m.move_waist(s["waist"], s["seconds"])
             else:
                 s["fn"]()

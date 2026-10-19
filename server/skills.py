@@ -2,17 +2,21 @@
 
 The LLM only chooses skills and their parameters; the poses come from OWLv2 + depth + cuRobo.
 Arm skills append steps to an ArmPlan (so section 6 can plan everything first and play later);
-the other skills run immediately. All positions are in the torso frame (x forward, y left, z up).
+the other skills run immediately. Positions are in the pelvis frame (x forward, y left, z up), which
+does not move when the waist turns, so measurements stay valid until the robot walks or turns.
 """
 import base64
 import math
 import time
 
 import cv2
+import numpy as np
 
 from common import config
 
-from .motion import ArmPlan, SkillError, cuboid, pitch_quat, pose
+from common.fk import mat_to_quat
+
+from .motion import ArmPlan, SkillError, cuboid, pose
 
 SURFACE_WORDS = ("table", "desk", "shelf", "counter", "bench", "stand", "cabinet")
 SKILLS = {}
@@ -69,46 +73,121 @@ def run_skill(ctx, name, params, plan=None):
     params = dict(params or {})
     if s["kind"] != "arm":
         return s["fn"](ctx, **params)
-    plan = plan or ArmPlan(ctx.motion)
-    plan.state = getattr(plan, "state", {"holding": ctx.bb["holding"]})
+    if plan is None:
+        plan = ArmPlan(ctx.motion)
+        plan.state["holding"] = ctx.bb["holding"]
     result = s["fn"](ctx, plan, **params)
     plan.run()
     return result or {"steps": plan.summary()}
 
 
 # ==================================================================== perception
-def _detect(ctx, label):
+QUALIFIERS = {"left", "right", "nearest", "closest", "farthest", "middle", "center", "centre"}
+
+
+def _parse(label):
+    """'right black box' -> ('black box', ['right']): OWLv2 sees the noun, code applies the position."""
+    words = label.lower().split()
+    quals = [w for w in words if w in QUALIFIERS]
+    base = " ".join(w for w in words if w not in QUALIFIERS) or label
+    return base, quals
+
+
+def _detect_all(ctx, base):
     frame = ctx.camera.latest()
     if frame is None:
         raise SkillError("camera is offline")
     ok, jpg = cv2.imencode(".jpg", frame.rgb, [cv2.IMWRITE_JPEG_QUALITY, 95])
     with ctx.processing("owl"):
-        dets = ctx.vision.call("detect", {"labels": [label], "image_b64": base64.b64encode(jpg).decode()})["detections"]
-    if not dets:
-        raise SkillError(f"'{label}' not visible")
-    x1, y1, x2, y2 = dets[0]["box"]
-    return frame, (x1, y1, x2 - x1, y2 - y1), dets[0]["score"]
+        dets = ctx.vision.call("detect", {"labels": [base], "image_b64": base64.b64encode(jpg).decode()})["detections"]
+    rects, kept = [], []
+    for d in dets:                                   # drop near-duplicate boxes (keep the higher score)
+        x1, y1, x2, y2 = d["box"]
+        r = (x1, y1, x2 - x1, y2 - y1)
+        if all(_iou(r, k) < 0.5 for k in rects):
+            rects.append(r)
+            kept.append((r, d["score"]))
+    if not kept:
+        raise SkillError(f"'{base}' not visible")
+    return frame, kept
 
 
-@skill("find", {"object": "name of the object or surface, e.g. 'black box', 'table'"},
-       "Look with the camera and measure the object's position, size and distance. Needed before approach, "
-       "pick_box or place. Positions are forgotten after walking or turning, so find again afterwards.",
+def _look(ctx, base):
+    """Detect, and if the best match is cut off at the top/bottom of the image, tilt the waist
+    (pitch) to bring it into view and detect again. Returns (frame, detections, torso-in-pelvis)."""
+    P = ctx.cfg["perception"]
+    for _ in range(P["look_max_tries"] + 1):
+        q = ctx.motion.q_now()
+        T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q))
+        frame, dets = _detect_all(ctx, base)
+        (x, y, w, h), _ = dets[0]
+        H = frame.rgb.shape[0]
+        step = 0.0
+        if y < P["look_edge_px"] and y + h < H - P["look_edge_px"]:
+            step = -P["look_step_deg"]           # cut off at the top: lean back (look up)
+        elif y + h > H - P["look_edge_px"] and y > P["look_edge_px"]:
+            step = P["look_step_deg"]            # cut off at the bottom: lean forward (look down)
+        pitch = math.degrees(q[14]) + step
+        if not step or abs(pitch) > P["look_max_pitch_deg"]:
+            return frame, dets, T
+        ctx.motion.move_waist([q[12], q[13], math.radians(pitch)], 1.0)
+        time.sleep(0.4)                          # let the image settle
+    return frame, dets, T
+
+
+def _iou(a, b):
+    ax2, ay2, bx2, by2 = a[0] + a[2], a[1] + a[3], b[0] + b[2], b[1] + b[3]
+    iw, ih = max(0, min(ax2, bx2) - max(a[0], b[0])), max(0, min(ay2, by2) - max(a[1], b[1]))
+    inter = iw * ih
+    return inter / (a[2] * a[3] + b[2] * b[3] - inter + 1e-6)
+
+
+def _choose(cands, quals):
+    """cands: [(fit, score)], torso frame (y left). Pick by position words, else the best score."""
+    if "left" in quals:
+        return max(cands, key=lambda c: c[0]["center"][1])
+    if "right" in quals:
+        return min(cands, key=lambda c: c[0]["center"][1])
+    if quals and quals[0] in ("nearest", "closest"):
+        return min(cands, key=lambda c: c[0]["distance_m"])
+    if "farthest" in quals:
+        return max(cands, key=lambda c: c[0]["distance_m"])
+    if quals and quals[0] in ("middle", "center", "centre"):
+        return min(cands, key=lambda c: abs(c[0]["center"][1]))
+    return max(cands, key=lambda c: c[1])
+
+
+@skill("find", {"object": "what to look for, e.g. 'box', 'left box', 'right black box', 'table'"},
+       "Look with the camera and measure the object's position, size and distance. Words left/right/nearest/"
+       "farthest pick among several matches. Needed before approach, pick_box or place. Positions are forgotten "
+       "after walking or turning, so find again afterwards.",
        "perceive")
 def find(ctx, object):
-    frame, rect, score = _detect(ctx, object)
-    if any(w in object.lower() for w in SURFACE_WORDS):
-        s = ctx.geometry.fit_surface(frame, rect)
-        if s is None:
+    base, quals = _parse(object)
+    frame, dets, T = _look(ctx, base)
+    if any(w in base for w in SURFACE_WORDS):
+        fits = [(ctx.geometry.fit_surface(frame, r, T), sc) for r, sc in dets]
+        fits = [(f, sc) for f, sc in fits if f is not None]
+        if not fits:
             raise SkillError(f"saw '{object}' but could not measure its top surface")
-        ctx.bb["surfaces"][object] = {**s, "rect": rect, "t": time.time()}
+        s, _ = max(fits, key=lambda c: c[1])
+        ctx.bb["surfaces"][object] = {**s, "t": time.time()}
         return {"surface": object, "front_edge_m": round(s["front_x"], 3), "height_m": round(s["top_z"], 3)}
-    b = ctx.geometry.fit_box(frame, rect)
-    if b is None:
-        raise SkillError(f"saw '{object}' but depth was not good enough to measure it")
-    b["distance_m"] = math.hypot(b["center"][0], b["center"][1])
-    ctx.bb["objects"][object] = {**b, "rect": rect, "t": time.time()}
-    return {"object": object, "center_m": [round(v, 3) for v in b["center"]],
-            "size_m": [round(v, 3) for v in b["dims"]], "distance_m": round(b["distance_m"], 3), "score": score}
+    M = ctx.cfg["manipulation"]
+    cands = []
+    for r, sc in dets:
+        b = ctx.geometry.fit_box(frame, r, T)
+        if b is None or max(b["dims"]) > M["max_object_size_m"]:      # e.g. the table/case itself
+            continue
+        b["distance_m"] = math.hypot(b["center"][0], b["center"][1])
+        b["rect"] = r
+        cands.append((b, sc))
+    if not cands:
+        raise SkillError(f"saw '{base}' but nothing of graspable size with good depth")
+    b, score = _choose(cands, quals)
+    ctx.bb["objects"][object] = {**b, "t": time.time()}
+    return {"object": object, "center_m": [round(v, 3) for v in b["center"]], "size_m": [round(v, 3) for v in b["dims"]],
+            "distance_m": round(b["distance_m"], 3), "score": score, "candidates": len(cands)}
 
 
 # ==================================================================== locomotion (fixed AI speed)
@@ -168,6 +247,32 @@ def approach(ctx, target, standoff_m=None):
 
 
 # ==================================================================== arms (dual-arm squeeze, dummy hands)
+def _rz(a):
+    c, s_ = math.cos(a), math.sin(a)
+    return np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _ry(a):
+    c, s_ = math.cos(a), math.sin(a)
+    return np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]])
+
+
+def _ensure_ready(ctx, plan):
+    """Plans start far more reliably from the ready pose than from the arms hanging down."""
+    ready = [math.radians(v) for v in ctx.cfg["manipulation"]["ready_deg"]]
+    if max(abs(plan.q[15 + k] - r) for k, r in enumerate(ready)) > math.radians(10):
+        goal = dict(plan.q)
+        goal.update({15 + k: r for k, r in enumerate(ready)})
+        plan.to_joint("arms to ready pose", goal, [])
+
+
+def _face(ctx, plan, x, y, what, frac=1.0):
+    """Turn the waist (a fraction of the way) so (x, y) comes in front of the arms."""
+    lim = math.radians(ctx.cfg["manipulation"]["max_face_deg"])
+    yaw = max(-lim, min(lim, math.atan2(y, x) * frac))
+    plan.waist_to(f"turn waist toward {what}", [yaw, 0.0, 0.0])
+
+
 def _table(ctx, support_z, front_x, y=0.0):
     M = ctx.cfg["manipulation"]
     return cuboid("table", (front_x + 0.6, y, support_z - M["table_block_m"] / 2 - 0.005), (1.2, 1.6, M["table_block_m"]))
@@ -194,32 +299,48 @@ def pick_box(ctx, plan, object):
     if zg > b["top_z"] - 0.01:
         raise SkillError("box is too short to squeeze without the hands hitting the table")
     half = dy / 2
+    _ensure_ready(ctx, plan)
     table = _table(ctx, b["support_z"], _table_front(ctx, b["front_x"] - 0.10), cy)
     box = cuboid(object, b["center"], b["dims"])
+    others = [cuboid(k, v["center"], v["dims"]) for k, v in ctx.bb["objects"].items() if k != object]
 
-    def hands(off, z=zg, q=(1, 0, 0, 0)):
-        return {"left_tcp": pose((cx, cy + half + off, z), q), "right_tcp": pose((cx, cy - half - off, z), q)}
+    def hands(off, z=zg, pitch=0.0):
+        """Palms squeeze along the (turned) torso y axis; a light box rotates to meet them."""
+        yaw = plan.waist[0]
+        q = mat_to_quat(_rz(yaw) @ _ry(math.radians(pitch)))
+        ux, uy = -math.sin(yaw), math.cos(yaw)
+        r = half + off
+        return {"left_tcp": pose((cx + ux * r, cy + uy * r, z), q), "right_tcp": pose((cx - ux * r, cy - uy * r, z), q)}
 
     squeeze = min(M["squeeze_m"], max(0.0, (dy - M["min_squeeze_gap_m"]) / 2))
-    last, chosen = None, None
-    for clear in M["approach_clear_m"]:         # wide boxes: less room outside the faces
-        for pitch in M["grasp_pitch_deg"]:      # low boxes: fingers tilted down
-            quat = pitch_quat(pitch)
-            try:
-                plan.to_pose("move palms beside the box", hands(clear, q=quat), [table, box])
-                chosen = (clear, pitch)
+    last, chosen, start = None, None, plan.mark()
+    for yaw_frac in (1.0, 0.5, 0.0):            # face the box: the hands can't cross far past the midline
+        for clear in M["approach_clear_m"]:     # wide boxes: less room outside the faces
+            for pitch in M["grasp_pitch_deg"]:  # low boxes: fingers tilted down
+                plan.restore(start)
+                if yaw_frac:
+                    _face(ctx, plan, cx, cy, object, yaw_frac)
+                try:
+                    plan.to_pose("move palms beside the box", hands(clear, pitch=pitch), [table, box] + others)
+                    chosen = (clear, pitch)
+                    break
+                except SkillError as e:
+                    last = e
+            if chosen:
                 break
-            except SkillError as e:
-                last = e
         if chosen:
             break
     if not chosen:
+        plan.restore(start)
         raise SkillError(f"cannot reach the sides of '{object}': {last}")
     clear, pitch = chosen
-    plan.to_pose("squeeze", hands(-squeeze, q=quat), [table])
+    plan.to_pose("squeeze", hands(-squeeze, pitch=pitch), [table] + others)
     gap_cmd = dy - 2 * squeeze
     plan.call("check contact", lambda: _check_gap(ctx, gap_cmd, "the hands closed without touching the box"))
-    plan.to_pose("lift", hands(-squeeze, zg + M["lift_m"], q=quat), [table])
+    # lift so the box bottom clears every other object: later waist turns swing it sideways unchecked
+    tallest = max([v["top_z"] for k, v in ctx.bb["objects"].items() if k != object], default=b["support_z"])
+    lift = max(M["lift_m"], tallest - b["support_z"] + M["carry_clear_m"])
+    plan.to_pose("lift", hands(-squeeze, zg + lift, pitch=pitch), [table] + others)
     held = {"object": object, "width": dy, "dims": b["dims"], "grasp_above_bottom": zg - b["support_z"],
             "gap_cmd": gap_cmd, "pitch": pitch, "clear": clear}
     plan.state["holding"] = held
@@ -234,7 +355,7 @@ def pick_box(ctx, plan, object):
 def _check_gap(ctx, gap_cmd, msg):
     time.sleep(0.3)
     left, right = ctx.motion.palms(ctx.motion.q_now(commanded=False))
-    gap = float(left[1] - right[1])
+    gap = float(np.linalg.norm(left - right))
     if gap - gap_cmd < ctx.cfg["manipulation"]["drop_gap_m"]:
         raise SkillError(f"{msg} (palm gap {gap:.3f} m, commanded {gap_cmd:.3f} m)")
     return gap
@@ -247,8 +368,9 @@ def place(ctx, plan, on):
     h = plan.state.get("holding")
     if not h:
         raise SkillError("not holding anything")
+    base = plan.mark()
     left, right = plan.palms()
-    half = float(left[1] - right[1]) / 2
+    half = float(np.linalg.norm(left - right)) / 2
     world = []
     if on in ctx.bb["objects"]:                       # stack on another object
         t = ctx.bb["objects"][on]
@@ -262,13 +384,28 @@ def place(ctx, plan, on):
         x = max(float(left[0] + right[0]) / 2, s["front_x"] + h["dims"][0] / 2 + 0.03)
         world = [_table(ctx, z_s, s["front_x"], y)]
     z = z_s + h["grasp_above_bottom"] + M["place_clear_m"]
-
-    quat = pitch_quat(h.get("pitch", 0))
+    plan.restore(base)
 
     def hands(hw, zz, xx=x):
-        return {"left_tcp": pose((xx, y + hw, zz), quat), "right_tcp": pose((xx, y - hw, zz), quat)}
+        """Palms keep their grip orientation, so they sit apart along the (turned) torso y axis."""
+        yaw = plan.waist[0]
+        ux, uy = -math.sin(yaw), math.cos(yaw)
+        return {"left_tcp": {"position": [xx + ux * hw, y + uy * hw, zz], "quaternion": None},
+                "right_tcp": {"position": [xx - ux * hw, y - uy * hw, zz], "quaternion": None}}
 
-    plan.to_pose("move above the target", hands(half, z + 0.05), world)
+    last = None
+    for frac in (1.0, 0.5, 0.0):                # turn toward the target; hands keep their grip orientation
+        plan.restore(base)
+        if frac:
+            _face(ctx, plan, x, y, on, frac)
+        try:
+            plan.to_pose("move above the target", hands(half, z + 0.05), world)
+            break
+        except SkillError as e:
+            last = e
+    else:
+        plan.restore(base)
+        raise SkillError(f"cannot bring the box above '{on}': {last}")
     plan.to_pose("lower", hands(half, z), world)
     plan.to_pose("open hands", hands(h["width"] / 2 + h["clear"], z), world)
     plan.state["holding"] = None
@@ -292,9 +429,8 @@ def ready(ctx, plan):
     M = ctx.cfg["manipulation"]
     goal = dict(plan.q)
     goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
-    plan.call("waist straight", lambda: ctx.agent("play_upperbody", {"keyframes": [{"t": 1.0, "q": {
-        str(12 + k): v for k, v in enumerate(M["waist_deg"])}}]}))
     plan.to_joint("ready pose", goal, [])
+    plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
     return {"ready": True}
 
 

@@ -1,7 +1,8 @@
-"""Camera -> torso transform and simple shape fitting from aligned depth.
+"""Camera -> torso -> pelvis transforms and simple shape fitting from aligned depth.
 
-Everything is expressed in the torso frame (x forward, y left, z up), which is also the planner's
-base frame. The camera is fixed on the torso, so the transform is constant (from the URDF).
+The camera is fixed on the torso (constant transform from the URDF). The torso moves with the waist,
+so measurements are converted to the pelvis frame (x forward, y left, z up), which stays put while
+the robot stands; the planner later converts them back with the current waist angles.
 """
 import numpy as np
 
@@ -16,13 +17,20 @@ class Geometry:
     def __init__(self):
         cfg = config.load()
         self.cfg = cfg
-        T_link = FK(config.path(cfg["robot"]["urdf"])).pose(cfg["camera_mount"]["link"])
+        self.fk = FK(config.path(cfg["robot"]["urdf"]))
+        T_link = self.fk.pose(cfg["camera_mount"]["link"])
         self.R = T_link[:3, :3] @ R_LINK_OPTICAL
         self.t = T_link[:3, 3] + T_link[:3, :3] @ np.array(cfg["camera_mount"]["rgb_offset_m"])
 
+    def torso_in_pelvis(self, waist):
+        """4x4 pose of the torso in the pelvis frame for waist angles [yaw, roll, pitch] (rad)."""
+        q = {"waist_yaw_joint": waist[0], "waist_roll_joint": waist[1], "waist_pitch_joint": waist[2]}
+        return self.fk.pose("torso_link", q, base="pelvis")
+
     # ---------------------------------------------------------------- points
-    def points(self, frame, rect=None, step=2, exclude=None):
-        """Torso-frame points (N,3) for depth pixels inside rect (x, y, w, h); optionally minus `exclude` rect."""
+    def points(self, frame, rect=None, step=2, exclude=None, T=None):
+        """Points (N,3) for depth pixels inside rect (x, y, w, h), optionally minus `exclude` rect.
+        Torso frame, or pelvis frame when T (torso in pelvis, 4x4) is given."""
         h, w = frame.depth.shape
         x0, y0, x1, y1 = (0, 0, w, h) if rect is None else (
             max(0, int(rect[0])), max(0, int(rect[1])), min(w, int(rect[0] + rect[2])), min(h, int(rect[1] + rect[3])))
@@ -35,7 +43,8 @@ class Geometry:
         us, vs, z = us[keep], vs[keep], z[keep]
         k = frame.intrinsics
         cam = np.stack([(us - k["ppx"]) * z / k["fx"], (vs - k["ppy"]) * z / k["fy"], z], axis=1)
-        return cam @ self.R.T + self.t
+        p = cam @ self.R.T + self.t
+        return p if T is None else p @ T[:3, :3].T + T[:3, 3]
 
     @staticmethod
     def plane_height(z, bin_m=0.01):
@@ -50,33 +59,37 @@ class Geometry:
         return float(np.median(sel))
 
     # ---------------------------------------------------------------- shapes
-    def fit_box(self, frame, rect):
+    def fit_box(self, frame, rect, T=None):
         """Cuboid of an object standing on a surface: OWLv2 rect + depth.
         Returns {center, dims, top_z, support_z, front_x} in metres (torso frame) or None."""
         x, y, w, h = rect
         ring = (x - 0.4 * w, y - 0.4 * h, 1.8 * w, 1.8 * h)
         inner = (x + 0.08 * w, y + 0.08 * h, 0.84 * w, 0.84 * h)
-        obj = self.points(frame, inner)
-        around = self.points(frame, ring, exclude=rect)
+        obj = self.points(frame, inner, T=T)
+        around = self.points(frame, ring, exclude=rect, T=T)
         if obj.shape[0] < 50:
             return None
         top_z = float(np.percentile(obj[:, 2], 97))
         support = self.plane_height(around[around[:, 2] < top_z - 0.02, 2]) if around.size else None
         if support is None:
             support = float(np.percentile(obj[:, 2], 3))
-        body = obj[obj[:, 2] > support + 0.01]
-        if body.shape[0] < 30:
+        if top_z - support < 0.02:
             return None
-        x0, x1 = np.percentile(body[:, 0], [2, 98])
-        y0, y1 = np.percentile(body[:, 1], [2, 98])
+        # width/depth from the flat top face only: rails or edges at other heights drop out
+        top = obj[obj[:, 2] > top_z - 0.02]
+        if top.shape[0] < 30:
+            return None
+        bias = self.cfg["perception"]["box_edge_bias_m"]     # dark edges lose depth -> extents read small
+        x0, x1 = np.percentile(top[:, 0], [2, 98]) + np.array([-bias, bias]) / 2
+        y0, y1 = np.percentile(top[:, 1], [2, 98]) + np.array([-bias, bias]) / 2
         dims = [float(x1 - x0), float(y1 - y0), float(top_z - support)]
         center = [float((x0 + x1) / 2), float((y0 + y1) / 2), float((top_z + support) / 2)]
         return {"center": center, "dims": dims, "top_z": top_z, "support_z": support, "front_x": float(x0)}
 
-    def fit_surface(self, frame, rect):
-        """Table-like surface inside rect: top height, front edge distance and extent (torso frame)."""
-        pts = self.points(frame, rect)
-        pts = pts[pts[:, 2] > -0.6]          # drop the floor (torso is ~0.8 m above it)
+    def fit_surface(self, frame, rect, T=None):
+        """Table-like surface inside rect: top height, front edge distance and extent."""
+        pts = self.points(frame, rect, T=T)
+        pts = pts[pts[:, 2] > -0.6]          # drop the floor (pelvis/torso are ~0.8 m above it)
         top = self.plane_height(pts[:, 2]) if pts.size else None
         if top is None:
             return None
