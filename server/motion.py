@@ -242,6 +242,8 @@ class ArmPlan:
         for i, s in enumerate(self.steps):
             if on_step:
                 on_step(i, s["label"])
+            if s.get("dry"):
+                continue
             if s["kind"] == "traj":
                 self.m.execute(self.replan_live(s), holding=s["holding"])
             elif s["kind"] == "waist":

@@ -440,9 +440,55 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
 def _calibrated(ctx, plan, x, y):
     """Correct a camera-measured target by the offset found when the palms gripped the held box. In a
     pre-built plan the offset is only known at run time, so the place steps re-read it live."""
+    if not ctx.cfg["manipulation"]["use_grasp_calibration"]:
+        return x, y
     plan.state["use_calib"] = True
     off = ctx.bb.get("calib", {}).get("offset_xy", [0.0, 0.0])
     return x + off[0], y + off[1]
+
+
+def _palm_mids(ctx):
+    m = ctx.motion
+    lc, rc = m.palms(m.q_now(commanded=True))
+    lm, rm = m.palms(m.q_now(commanded=False))
+    return (lc + rc) / 2, (lm + rm) / 2, float(np.linalg.norm(lc - rc)) / 2
+
+
+def _align_over(ctx, live_xy, z, yaw, h, keep, world, corr):
+    """Closed loop: move until the MEASURED palm midpoint (= box centre) is over the target centre."""
+    M = ctx.cfg["manipulation"]
+    for _ in range(M["align_iters"]):
+        time.sleep(0.4)
+        cmd, meas, half = _palm_mids(ctx)
+        err = np.array(live_xy()) - meas[:2]
+        corr["xy"] = cmd[:2] - meas[:2]
+        if np.linalg.norm(err) < M["align_tol_m"]:
+            break
+        p = ArmPlan(ctx.motion)
+        p.attached = None
+        p.to_pose("line up", _hands(*(cmd[:2] + err), z, half, yaw, h.get("pitch", 0), keep=keep), world)
+        ctx.motion.execute(p.steps[-1]["traj"], holding=True)
+    _, meas, _ = _palm_mids(ctx)
+    return {"error_m": round(float(np.linalg.norm(np.array(live_xy()) - meas[:2])), 4),
+            "correction_m": [round(float(v), 4) for v in corr["xy"]]}
+
+
+def _gentle_release(ctx, yaw, h, keep, world, corr):
+    """Stop pressing down, open the palms a little and slowly, lift away, then open fully."""
+    M = ctx.cfg["manipulation"]
+    m = ctx.motion
+    pitch = h.get("pitch", 0)
+    time.sleep(0.3)
+    cmd, meas, half = _palm_mids(ctx)
+    xy, zc = cmd[:2], float(meas[2]) + 0.003          # command at the contact height: no downward press
+    for label, hw, zz in (("ease off", half, zc),
+                          ("open a little", h["width"] / 2 + M["release_open_m"], zc),
+                          ("lift hands", h["width"] / 2 + M["release_open_m"], zc + M["release_lift_m"]),
+                          ("open fully", h["width"] / 2 + h["clear"], zc + M["release_lift_m"])):
+        p = ArmPlan(m)
+        p.to_pose(label, _hands(*xy, zz, hw, yaw, pitch, keep=keep), world)
+        m.execute(p.steps[-1]["traj"], holding=True)    # slow playback
+    return {"released_at_z": round(zc, 3)}
 
 
 def _check_gap(ctx, gap_cmd, msg):
@@ -521,11 +567,14 @@ def place(ctx, plan, on):
     plan.steps[-1]["goals_fn"] = lambda: _hands(*live_xy(), above, live_half(), yaw, h.get("pitch", 0), keep=keep)
     plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_of"]() if h.get("gap_of") else h["gap_cmd"],
                                                                f"'{h['object']}' slipped while moving"))
-    plan.detach()                               # the box now meets its support: stop treating it as an obstacle
-    plan.to_pose("lower", _hands(x, y, z, half, yaw, h.get("pitch", 0), keep=keep), world,
-                 goals_fn=lambda: _hands(*live_xy(), z, live_half(), yaw, h.get("pitch", 0), keep=keep))
-    plan.to_pose("open hands", _hands(x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep), world,
-                 goals_fn=lambda: _hands(*live_xy(), z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep))
+    corr = {"xy": np.zeros(2)}                  # commanded - measured palm midpoint (tracking error under load)
+    plan.call("line up over the target", lambda: _align_over(ctx, live_xy, above, yaw, h, keep, world, corr))
+    lower_goal = lambda: _hands(*(np.array(live_xy()) + corr["xy"]), z, live_half(), yaw, h.get("pitch", 0), keep=keep)
+    plan.to_pose("lower", _hands(x, y, z, half, yaw, h.get("pitch", 0), keep=keep), world, goals_fn=lower_goal)
+    plan.call("release gently", lambda: _gentle_release(ctx, yaw, h, keep, world, corr))
+    # planned for feasibility/continuity only; the gentle release above does the real opening
+    plan.to_pose("open hands (check only)", _hands(x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep), world)
+    plan.steps[-1]["dry"] = True
     plan.state["holding"] = None
     placed = {"center": [x, y, z_s + h["dims"][2] / 2], "dims": h["dims"], "top_z": z_s + h["dims"][2],
               "support_z": z_s, "front_x": x - h["dims"][0] / 2, "distance_m": math.hypot(x, y)}

@@ -221,6 +221,11 @@ manipulation:
   lift_tolerance_m: 0.03         # measured hand height must reach the lift target within this
   lift_sag_comp_m: 0.03          # command the lift this much higher: the arms sag under a held box
   test_lift_m: 0.02              # grip test: raise this much and hold
+  use_grasp_calibration: false   # closed-loop line-up over the target replaces it
+  align_iters: 3                 # line up the measured palm midpoint over the target (place)
+  align_tol_m: 0.005
+  release_open_m: 0.01           # first open the palms to this far outside the box faces, slowly
+  release_lift_m: 0.04           # then lift the hands this much before opening fully
   test_hold_s: 0.6
   grip_retries: 2                # squeeze 1 cm deeper per retry
   max_extra_squeeze_m: 0.02
