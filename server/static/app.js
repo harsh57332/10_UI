@@ -159,14 +159,88 @@ function setCamera(open) {
 }
 $("btn-camera").onclick = () => setCamera(!camOpen);
 
+// ------------------------------------------------------------------ 3 locomotion
+function setupLoco() {
+  const L = UI.locomotion;
+  $("loco-v").value = L.speed_default;
+  $("loco-v").max = Math.max(L.speed_max, L.turn_speed_max);
+  $("loco-d").value = 2;
+  $("loco-d").max = L.duration_max_s;
+  document.querySelectorAll("[data-walk]").forEach((b) => (b.onclick = () => {
+    const action = b.dataset.walk;
+    const vmax = action.startsWith("turn") ? L.turn_speed_max : L.speed_max;
+    const velocity = Math.min(Number($("loco-v").value), vmax);
+    const duration = Math.min(Number($("loco-d").value), L.duration_max_s);
+    if (!(velocity > 0 && duration > 0)) return log("velocity and duration must be > 0", "bad");
+    cmd(action, { velocity, duration });
+  }));
+}
+
+// ------------------------------------------------------------------ 4 manipulation
+function buildManip() {
+  for (const [group, idxs] of Object.entries(UI.arms.groups)) {
+    const div = document.createElement("div");
+    div.innerHTML = `<h4>${group.replace("_", " ")}</h4><table><thead><tr><th>Joint</th><th>Min</th><th>Max</th>
+      <th>Now °</th><th>Set °</th><th>Add ±°</th></tr></thead><tbody>${idxs.map((i) => `<tr id="m${i}">
+      <td></td><td></td><td></td><td></td>
+      <td><input id="mset${i}" type="number" step="1"> <button data-set="${i}">Set</button></td>
+      <td><input id="madd${i}" type="number" step="1" value="5"> <button data-add="${i}">Add</button></td>
+      </tr>`).join("")}</tbody></table>`;
+    $("manip").append(div);
+  }
+  $("manip").querySelectorAll("[data-set]").forEach((b) => (b.onclick = () => {
+    const i = Number(b.dataset.set), v = $(`mset${i}`).value;
+    if (v !== "") moveJoint(i, Number(v));
+  }));
+  $("manip").querySelectorAll("[data-add]").forEach((b) => (b.onclick = () => {
+    const i = Number(b.dataset.add), v = $(`madd${i}`).value;
+    if (v !== "" && state) moveJoint(i, state.joints[i].deg + Number(v));
+  }));
+  $("btn-release").onclick = () => cmd("release_upperbody");
+}
+
+function moveJoint(i, target) {
+  if (!state) return;
+  const j = state.joints[i];
+  target = Math.min(Math.max(target, j.min), j.max);
+  const t = Math.max(0.5, Math.abs(target - j.deg) / UI.arms.max_speed_dps);
+  cmd("play_upperbody", { keyframes: [{ t: Number(t.toFixed(2)), q: { [i]: Number(target.toFixed(2)) } }] });
+}
+
+function updateManip(js) {
+  for (const idxs of Object.values(UI.arms.groups)) {
+    for (const i of idxs) {
+      const j = js[i], tds = $(`m${i}`).children;
+      tds[0].textContent = `${i} ${j.name.replace(/^(left|right)_/, "")}`;
+      tds[1].textContent = j.min;
+      tds[2].textContent = j.max;
+      tds[3].textContent = j.deg == null ? "—" : j.deg.toFixed(1);
+      $(`mset${i}`).placeholder = j.deg == null ? "" : j.deg.toFixed(0);
+    }
+  }
+}
+
+function gate(id, on, why) {
+  const sec = $(id);
+  sec.classList.toggle("off", !on);
+  sec.querySelectorAll("button, input").forEach((el) => (el.disabled = !on || el.hasAttribute("data-never")));
+  $(`${id}-gate`).textContent = on ? "" : why;
+}
+
 // ------------------------------------------------------------------ polling
 function pill(id, text, cls = "") { const p = $(id); p.textContent = text; p.className = `pill ${cls}`; }
 
 async function poll() {
   try {
     const s = await api("/api/status");
-    if (!s.connected) { state = null; pill("pill-conn", "offline", "bad"); updateModes(null); return; }
-    if (!s.state) { state = null; pill("pill-conn", `${s.host} · no response`, "bad"); updateModes(null); return; }
+    if (!s.connected || !s.state) {
+      state = null;
+      pill("pill-conn", s.connected ? `${s.host} · no response` : "offline", "bad");
+      updateModes(null);
+      gate("s3", false, "· not connected");
+      gate("s4", false, "· not connected");
+      return;
+    }
     state = s.state;
     pill("pill-conn", `${s.host}${state.connected_dds ? "" : " · no DDS"}`, state.connected_dds ? "ok" : "warn");
     pill("pill-mode", `${MODE_LABEL[state.mode] || state.mode} (${state.fsm_id})`);
@@ -176,6 +250,11 @@ async function poll() {
     pill("pill-busy", busy.length ? busy.map((x) => `${x.action} ${x.for_s}s`).join(", ") : "idle", busy.length ? "warn" : "");
     updateModes(state.mode);
     updateJoints(state.joints);
+    updateManip(state.joints);
+    gate("s3", state.mode === "locomotion", "· active only in Locomotion mode");
+    gate("s4", state.mode === "manipulation", "· active only in Manipulation mode");
+    const a = state.arms;
+    $("arms-stat").textContent = `arms ${a.engaged ? "held by us" : "with policy"}${a.moving ? " · moving" : ""} · ${a.loop_hz} Hz`;
     const c = s.camera;
     $("cam-stat").textContent = c && c.online ? `${c.size[0]}×${c.size[1]} · ${c.fps} fps` : "· camera offline";
     if (b) kv($("batt"), [["SOC", `${b.soc} %`], ["Voltage", `${b.voltage_v} V`], ["Current", `${(b.current_ma / 1000).toFixed(2)} A`],
@@ -196,8 +275,11 @@ async function poll() {
   $("tts").maxLength = UI.audio.tts_max_chars;
   $("tts-count").textContent = `0/${UI.audio.tts_max_chars}`;
   $("audio-max").textContent = UI.audio.file_max_mb;
-  $("ee-hint").textContent = UI.end_effector.type === "dummy" ? "Dummy hands: no end effector detected." : "";
+  $("ee-hint").textContent = UI.end_effector.type === "dummy"
+    ? "No end effector detected (dummy hands). This section activates when one is fitted." : "";
   buildModes();
   buildJoints();
+  setupLoco();
+  buildManip();
   poll();
 })();

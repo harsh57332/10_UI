@@ -53,6 +53,8 @@ def ui_config():
         "poll_ms": CFG["server"]["state_poll_ms"],
         "joint_groups": joints.GROUPS,
         "end_effector": CFG["end_effector"],
+        "arms": {"max_speed_dps": CFG["arms"]["max_speed_dps"], "groups": {
+            "waist": joints.GROUPS["waist"], "left_arm": joints.GROUPS["left_arm"], "right_arm": joints.GROUPS["right_arm"]}},
     }
 
 
