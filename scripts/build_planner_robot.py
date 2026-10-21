@@ -22,6 +22,7 @@ import numpy as np
 from common import config
 
 BASE = "torso_link"
+MIN_R = 0.008                                       # smallest glove sphere kept
 
 
 def cut_urdf(src, dst, tcp):
@@ -71,8 +72,14 @@ def glove(spheres, tcp, normals, g):
         out = []
         for c in sp + tips:
             ctr, r = np.array(c["center"], float), c["radius"] + pad
-            ctr -= max(0.0, (ctr - p0) @ n + r) * n
-            out.append({"center": [round(float(v), 5) for v in ctr], "radius": r})
+            excess = (ctr - p0) @ n + r             # how far it reaches past the glove's palm surface
+            if excess > 0:                          # trim its palm side to the surface: shrink by half the
+                ctr -= excess / 2 * n               # excess and move back by half, so its back edge (the
+                r -= excess / 2                     # glove's back padding) stays where it was
+                if r < MIN_R:
+                    ctr -= (MIN_R - r) * n
+                    r = MIN_R
+            out.append({"center": [round(float(v), 5) for v in ctr], "radius": round(float(r), 5)})
         spheres[link] = out
 
 

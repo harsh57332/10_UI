@@ -28,6 +28,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from common import config, envelope
+from common.fk import mat_to_quat, quat_to_mat
 from common.envelope import Request
 
 CFG = config.load()
@@ -80,19 +81,27 @@ def _state(q):
     return JointState.from_position(_t(q).view(1, -1), joint_names=_planner.joint_names)
 
 
+def _T(pose7):
+    """[x, y, z, qw, qx, qy, qz] -> 4x4."""
+    import numpy as np
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = quat_to_mat([float(v) for v in pose7[3:7]]), [float(v) for v in pose7[:3]]
+    return T
+
+
 def _world(cuboids, use_map=None, margin=0.0):
     """Load the cuboids (grown by margin) and, if asked, the obstacle map placed at use_map["pose"] (its
     distance field shifted by margin, which grows every mapped surface by that much)."""
     from curobo.scene import Cuboid, Scene, VoxelGrid
-    from curobo.types import Pose
     m = float(margin or 0.0)
     cub = [Cuboid(name=k, dims=v["dims"], pose=v["pose"]) for k, v in _FAR.items()]
     for c in cuboids or []:
         cub.append(Cuboid(name=c["name"], dims=[float(d) + 2 * m for d in c["dims"]], pose=list(map(float, c["pose"]))))
     vox = []
     if use_map and _map is not None:
-        pose = Pose.from_list(list(map(float, use_map["pose"]))).multiply(Pose.from_list(list(_map.pose)))
-        vox.append(VoxelGrid(name="map", pose=pose.tolist(), dims=list(_map.dims), voxel_size=_map.voxel_size,
+        T = _T(use_map["pose"]) @ _T(_map.pose)   # grid pose in the planning torso frame
+        vox.append(VoxelGrid(name="map", pose=[*map(float, T[:3, 3]), *map(float, mat_to_quat(T[:3, :3]))],
+                             dims=list(_map.dims), voxel_size=_map.voxel_size,
                              feature_tensor=_map.feature_tensor - m, feature_dtype=_map.feature_tensor.dtype))
     _planner.update_world(Scene(cuboid=cub, voxel=vox))
 
@@ -140,6 +149,16 @@ def build_map(p):
     return {"pixels": {"depth": n_raw, "robot": n_robot, "used": n_used},
             "voxels_inside": int((f <= 0).sum()), "esdf_range": [float(f.min()), float(f.max())],
             "pose": [round(float(v), 3) for v in _map.pose], "dims": list(_map.dims), "voxel": _map.voxel_size}
+
+
+def map_query(p):
+    """Distance-field values (m, negative inside obstacles) of the map at points given in its frame."""
+    pts = _t(p["points"]).view(-1, 3)
+    f = _map.feature_tensor
+    n = _t(list(f.shape))
+    idx = torch.round((pts - _t(list(_map.pose[:3]))) / _map.voxel_size + (n - 1) / 2).long()
+    idx = torch.minimum(torch.clamp(idx, min=0), (n - 1).long())
+    return {"sdf": f[idx[:, 0], idx[:, 1], idx[:, 2]].float().cpu().tolist(), "shape": list(f.shape)}
 
 
 def map_points(p):
@@ -294,6 +313,8 @@ def infer(req: Request):
                                                        p.get("margin", 0.0)), t0)
             if req.action == "map":
                 return envelope.done(req.id, build_map(p), t0)
+            if req.action == "map_query":
+                return envelope.done(req.id, map_query(p), t0)
             if req.action == "map_points":
                 return envelope.done(req.id, map_points(p), t0)
         return envelope.failed(req.id, f"unknown action '{req.action}'", t0, status="rejected")

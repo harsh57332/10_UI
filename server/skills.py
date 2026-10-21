@@ -451,7 +451,7 @@ def pre_grasp(ctx, plan, object):
     cx, cy, zg, half, sq = g["cx"], g["cy"], g["zg"], g["half"], g["squeeze"]
     plan.waist_to("straighten waist", [plan.waist[0], 0.0, 0.0])
     _ensure_ready(ctx, plan)
-    _map_scene(ctx, [g["box"]])                 # depth obstacle map; the object is cut out (it stays a cuboid)
+    _map_scene(ctx, [g["box"]] + g["others"])   # depth obstacle map of everything else (found objects stay cuboids)
     near = [g["table"], g["box"]] + g["others"]
     free = [g["table"]] + g["others"]           # the object itself is touched from here on
     last, start = None, plan.mark()
@@ -554,20 +554,42 @@ def retreat(ctx, plan):
     plan.attached = None
     opened = half + M["retreat_open_m"]
     plan.line("open the gloves", _hands(mid[0], mid[1], mid[2], opened, yaw, keep=True), world)
-    top = g.get("top_z", mid[2]) + M["carry_clear_m"] + 0.05
-    for z in (top, mid[2] + 0.06, mid[2] + 0.03):   # as high as a straight move allows
+    _back_to_ready(ctx, plan, world, mid[0], mid[1], mid[2], opened, yaw, 0.0, True)
+    _to_state(ctx, plan, "EMPTY", grasp=None, grip=None)
+    return {"retreated": True}
+
+
+def _back_to_ready(ctx, plan, world, x, y, z, half, yaw, pitch, keep):
+    """From open gloves around an object: straight up as far as reachable, straight back toward the chest
+    out of the object's area, then the ready pose planned around everything (the straight moves cannot
+    fail to be tried; only the last free move needs a plan)."""
+    M = ctx.cfg["manipulation"]
+    wy = plan.waist[0]
+    for rise in (0.08, 0.04, 0.02, 0.0):
         mk = plan.mark()
         try:
-            plan.line("raise the gloves", _hands(mid[0], mid[1], z, opened, yaw, keep=True), world)
+            if rise:
+                plan.line("move the hands up", _hands(x, y, z + rise, half, yaw, pitch, keep=keep), world)
+            break
+        except SkillError:
+            plan.restore(mk)
+    else:
+        rise = 0.0
+    for back in (0.12, 0.08, 0.04):
+        mk = plan.mark()
+        try:
+            plan.line("draw the hands back", _hands(x - math.cos(wy) * back, y - math.sin(wy) * back, z + rise, half,
+                                                    yaw, pitch, keep=keep), world)
             break
         except SkillError:
             plan.restore(mk)
     goal = dict(plan.q)
     goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
-    plan.to_joint("ready pose", goal, world, margin=M["near_margin_m"])
+    try:
+        plan.to_joint("ready pose", goal, world, margin=M["near_margin_m"])
+    except SkillError:
+        plan.to_joint("ready pose", goal, world, margin=0.0)
     plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
-    _to_state(ctx, plan, "EMPTY", grasp=None, grip=None)
-    return {"retreated": True}
 
 
 def _come_down_beside(ctx, plan, cx, cy, zg, half, yaw, pitch, world):
@@ -596,7 +618,8 @@ def _come_down_beside(ctx, plan, cx, cy, zg, half, yaw, pitch, world):
 
 def _map_scene(ctx, exclude):
     """Depth obstacle map for this skill from a fresh frame (live robot only; offline checks plan with the
-    fitted cuboids alone). exclude: the objects being handled, cut out of the map."""
+    fitted cuboids alone). exclude: every found object (each is planned around as its fitted cuboid, which
+    is tighter than the map's surfaces); the map covers everything else (the support, its rim, unknowns)."""
     if ctx.camera is None or ctx.geometry is None:
         return None
     return ctx.motion.build_map(ctx.camera.fine(), ctx.geometry, exclude)
@@ -760,7 +783,8 @@ def place(ctx, plan, on):
     above = max(z + M["place_above_m"], float(left[2] + right[2]) / 2)  # never below the carry height before arriving
     mid = (left + right) / 2                    # the held box (between the palms) is cut out of the obstacle map
     _map_scene(ctx, [cuboid(h["object"], (mid[0], mid[1], mid[2] - h["grasp_above_bottom"] + h["dims"][2] / 2),
-                            h["dims"], h["yaw"])])
+                            h["dims"], h["yaw"])]
+               + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()])
     last, base, aligned = None, plan.mark(), False
     for frac in M["face_fractions"]:            # turn toward the target; the lift was verified before this
         for align in (True, False):             # square the box to the target first, else keep the grip angle
@@ -811,11 +835,7 @@ def place(ctx, plan, on):
         ctx.bb["objects"][h["object"]] = {**placed, "t": time.time()}
     plan.call("released", done)
     away = world + [cuboid(h["object"], placed["center"], placed["dims"])]
-    plan.line("move hands away", _hands(x, y, z + 0.08, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep), away)
-    goal = dict(plan.q)
-    goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
-    plan.to_joint("ready pose", goal, away, margin=M["near_margin_m"])
-    plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
+    _back_to_ready(ctx, plan, away, x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep)
     _to_state(ctx, plan, "EMPTY", grasp=None, grip=None, holding=None)
     return {"placed": h["object"], "on": on, "height_m": round(z_s, 3)}
 
