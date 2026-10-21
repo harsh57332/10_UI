@@ -67,13 +67,13 @@ locomotion:
 arms:
   rate_hz: 50
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
-  playback_slowdown: 2.0         # planned trajectories play this many times slower (1.0 = as planned)
+  playback_slowdown: 2.5         # planned trajectories play this many times slower (1.0 = as planned; slower = less body sway)
   playback_slowdown_holding: 3.0 # ...and this much slower while holding a box (gentle accelerations)
   max_arm_turn_deg: 300          # refuse a planned move whose joints of one arm turn more than this in
                                  # total: cuRobo accepts any collision-free IK, incl. arms wrapped over the
                                  # shoulders (that one was ~500-600; standing -> ready is ~180)
-  waist_speed_dps: 20            # waist turns while manipulating
-  waist_speed_holding_dps: 10    # ...and while holding a box (it fell during a 20 deg/s turn)
+  waist_speed_dps: 10            # waist turns while manipulating (20 swung the whole robot)
+  waist_speed_holding_dps: 6     # ...and while holding a box (it fell during a 20 deg/s turn)
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
   release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
   warn_motor_temp_c: 80          # any upper-body motor hotter than this while engaged -> state arms.warning;

@@ -650,7 +650,12 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
     M = ctx.cfg["manipulation"]
     m = ctx.motion
     axis = np.array([-math.sin(yaw), math.cos(yaw)])
-    lm, rm = m.palms(m.q_now(commanded=True))
+    def inward_lag():                           # how far each hand is held back along the squeeze axis
+        lc, rc = m.palms(m.q_now(commanded=True))
+        lm, rm = m.palms(m.q_now(commanded=False))
+        return float(np.dot(lm[:2] - lc[:2], axis)), float(np.dot(rc[:2] - rm[:2], axis)), lm, rm
+    time.sleep(M["close_settle_s"])
+    base_l, base_r, lm, rm = inward_lag()       # sag and tracking offsets before touching anything
     hs = float(np.dot(lm[:2] - rm[:2], axis)) / 2
     while True:
         hs -= M["close_step_m"]
@@ -661,10 +666,9 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
         p.line("close in", _hands(cx, cy, zg, hs, yaw, pitch), world)
         m.execute(p.steps[-1]["traj"], holding=True)
         time.sleep(M["close_settle_s"])
-        lc, rc = m.palms(m.q_now(commanded=True))
-        lm, rm = m.palms(m.q_now(commanded=False))
-        if min(np.linalg.norm(lm - lc), np.linalg.norm(rm - rc)) >= M["contact_lag_m"]:
-            break                               # both gloves are held back: touching the object
+        lag_l, lag_r, lm, rm = inward_lag()
+        if min(lag_l - base_l, lag_r - base_r) >= M["contact_lag_m"]:
+            break                               # both gloves are held back sideways: touching the object
     gap = float(np.dot(lm[:2] - rm[:2], axis))
     mid = (lm[:2] + rm[:2]) / 2
     shift = mid - np.array([cx, cy])
