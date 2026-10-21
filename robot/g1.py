@@ -196,7 +196,7 @@ class Arms:
         # blocked: a joint stuck far from its command for a while is pushing against something (it heats in
         # seconds); stop pushing. A squeeze leaves only a small error (a light preload).
         m = self.g1.low.get()
-        if m is not None and self.q is not None and not self.fault:
+        if m is not None and self.q is not None and not self.fault and self.weight_target == 1.0 and self.weight > 0.999:
             err = np.degrees(np.abs(np.array([m.motor_state[j].q for j in joints.UPPER_BODY]) - self.q))
             k = int(err.argmax())
             self._blocked = self._blocked + 1 if err[k] > self.cfg["max_track_err_deg"] and not self.segments else 0
