@@ -297,11 +297,25 @@ class ArmPlan:
                 for s in self.steps]
 
     def replan_live(self, s):
-        """Re-plan a step from the robot's live commanded pose (reality drifts from the plan: sag,
-        a box that turned in the hands, grip corrections). The build-time plan proved it feasible."""
+        """The trajectory to play for a step. Steps whose goals depend on live measurements (goals_fn: grip
+        corrections, lining up) are re-solved from the live pose. Others play exactly what was planned and
+        checked when the arms are where the plan expects; if not, they go to the planned end angles (a fresh
+        IK solve could pick a different arm configuration from which the next straight move is impossible)."""
         live = ArmPlan(self.m)
         live.attached = s["attached"]
         live.state = {"holding": s["holding"]}
+        traj = s["traj"]
+        if not s.get("goals_fn"):
+            now = np.array([live.q[self.m.idx[n]] for n in traj["joint_names"]])
+            if np.degrees(np.abs(now - np.array(traj["positions"][0]))).max() < 1.0:
+                return traj
+            end = dict(live.q)
+            end.update({self.m.idx[n]: v for n, v in zip(traj["joint_names"], traj["positions"][-1])})
+            try:
+                live.to_joint(s["label"], end, s["world"], margin=s.get("margin"))
+                return live.steps[-1]["traj"]
+            except SkillError:
+                pass                            # fall back to solving the step's goal from the live pose
         try:
             if "goals" in s:
                 move = live.line if s.get("line") else live.to_pose

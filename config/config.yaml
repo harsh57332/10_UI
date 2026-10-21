@@ -79,13 +79,16 @@ arms:
   warn_motor_temp_c: 80          # any upper-body motor hotter than this while engaged -> state arms.warning;
                                  # the server then opens the hands and backs away (a release while gripping
                                  # dropped the arms around the box and knocked it over)
-  max_motor_temp_c: 95           # last resort: arms released (the left wrist yaw reached 113 C holding a reach)
-  resume_motor_temp_c: 75        # after that, engaging is refused until all are below this
+  max_motor_temp_c: 95           # last resort: arms HOLD IN PLACE (stop pushing; never dropped: a drop wrecked the setup)
+  resume_motor_temp_c: 75        # after a hold-in-place, engaging is refused until all are below this
+  max_track_err_deg: 8           # a joint this far from its command (not moving) for max_track_err_s -> hold
+  max_track_err_s: 2             #   in place: it is pushing against something
   # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
   gains:
     waist: {kp: 300.0, kd: 3.0, joints: [12, 13, 14]}
     arm:   {kp: 150.0, kd: 4.0, joints: [15, 16, 17, 18, 22, 23, 24, 25]}   # 80 sagged 8 cm holding a box
-    wrist: {kp: 60.0,  kd: 2.0, joints: [19, 20, 21, 26, 27, 28]}
+    wrist: {kp: 30.0,  kd: 1.5, joints: [19, 20, 21, 26, 27, 28]}   # 60 kept the left wrist yaw pushing against
+                                                                     # the glove cuff a few deg off: 92 C at ready
 
 audio:
   tts_speaker_id: 1              # 0 = Chinese, 1 = English (verify)
@@ -300,8 +303,13 @@ manipulation:
   retreat_open_m: 0.03           # retreat: gloves open straight out this far before moving up and away
   release_lift_m: 0.04           # then lift the hands this much before opening fully
   test_hold_s: 0.6
-  grip_preload_m: 0.02           # settled squeeze: each hand aimed this far past where the object stopped it
-                                 # (sets the grip force; 2.5-3.8 cm overheated the shoulders in 30 s)
+  grip_preload_m: 0.01           # squeeze: each hand pressed this far past where the object stopped it (sets
+                                 # the force: ~1200 N/m hand stiffness -> ~12 N, enough for 1-2 kg; 2-3.5 cm
+                                 # overheated a shoulder to 108 C in seconds). Raise only if the test lift slips
+  close_step_m: 0.005            # squeeze by feel: close this much per step...
+  contact_lag_m: 0.006           # ...until both hands lag their command by this much (touching)
+  close_settle_s: 0.3
+  close_overrun_m: 0.02          # no contact this far past the planned squeeze -> the object is not there
   grip_retries: 2                # test lift failed: squeeze grip_retry_step_m deeper and retry
   grip_retry_step_m: 0.005
   max_extra_squeeze_m: 0.02

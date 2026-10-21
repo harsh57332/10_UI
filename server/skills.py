@@ -487,9 +487,11 @@ def grasp(ctx, plan):
     cx, cy, zg, half, sq, yaw, pitch = (g[k] for k in ("cx", "cy", "zg", "half", "squeeze", "yaw", "pitch"))
     free = [g["table"]] + g["others"]
     grip = {"extra": 0.0, "dx": 0.0, "dy": 0.0}  # squeeze correction and hand-measured centre shift
-    plan.line("squeeze", _hands(cx, cy, zg, half - sq, yaw, pitch), free)
     _to_state(ctx, plan, "GRIPPING", grip=grip)
-    plan.call("settle the grip", lambda: _settle_grip(ctx, cx, cy, zg, half - sq, yaw, pitch, free, grip))
+    plan.call("close until contact", lambda: _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, free, grip))
+    # planned only so later steps (lift) start from a squeeze pose; the call above does the real closing
+    plan.line("squeeze", _hands(cx, cy, zg, half - sq, yaw, pitch), free)
+    plan.steps[-1]["dry"] = True
     return {"object": g["object"], "squeeze_m": round(sq, 3)}
 
 
@@ -590,6 +592,21 @@ def _back_to_ready(ctx, plan, world, x, y, z, half, yaw, pitch, keep):
     except SkillError:
         plan.to_joint("ready pose", goal, world, margin=0.0)
     plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
+    plan.call("relax the wrists", lambda: _relax_wrists(ctx))
+
+
+WRISTS = (19, 20, 21, 26, 27, 28)
+
+
+def _relax_wrists(ctx):
+    """Waiting at ready: command the wrists where they actually are, so they stop pushing (the gloved left
+    wrist yaw rests a few degrees off any command and overheated holding it)."""
+    time.sleep(0.5)
+    s = ctx.link.state()
+    if not s["arms"].get("engaged"):
+        return
+    q = {str(j["index"]): round(j["deg"], 2) for j in s["joints"] if j["index"] in WRISTS}
+    ctx.agent("play_upperbody", {"keyframes": [{"t": 0.5, "q": q}], "interp": "linear"}, timeout=15)
 
 
 def _come_down_beside(ctx, plan, cx, cy, zg, half, yaw, pitch, world):
@@ -623,6 +640,41 @@ def _map_scene(ctx, exclude):
     if ctx.camera is None or ctx.geometry is None:
         return None
     return ctx.motion.build_map(ctx.camera.fine(), ctx.geometry, exclude)
+
+
+def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
+    """Squeeze by feel: close both gloves in small straight steps; contact is when the hands stop following
+    (each lags its command by contact_lag_m); then press grip_preload_m more, centred where the hands found
+    the object. The force is set by the preload, whatever the glove or object model errors; closing far
+    past the measured faces without contact means the object is not there (refused)."""
+    M = ctx.cfg["manipulation"]
+    m = ctx.motion
+    axis = np.array([-math.sin(yaw), math.cos(yaw)])
+    lm, rm = m.palms(m.q_now(commanded=True))
+    hs = float(np.dot(lm[:2] - rm[:2], axis)) / 2
+    while True:
+        hs -= M["close_step_m"]
+        if hs < half - sq - M["close_overrun_m"]:
+            raise SkillError(f"closed {100 * (half - hs):.1f} cm inside the measured faces without touching: "
+                             "the object is not where the camera put it")
+        p = ArmPlan(m)
+        p.line("close in", _hands(cx, cy, zg, hs, yaw, pitch), world)
+        m.execute(p.steps[-1]["traj"], holding=True)
+        time.sleep(M["close_settle_s"])
+        lc, rc = m.palms(m.q_now(commanded=True))
+        lm, rm = m.palms(m.q_now(commanded=False))
+        if min(np.linalg.norm(lm - lc), np.linalg.norm(rm - rc)) >= M["contact_lag_m"]:
+            break                               # both gloves are held back: touching the object
+    gap = float(np.dot(lm[:2] - rm[:2], axis))
+    mid = (lm[:2] + rm[:2]) / 2
+    shift = mid - np.array([cx, cy])
+    grip["dx"], grip["dy"] = float(shift[0]), float(shift[1])
+    hold = max(M["min_squeeze_gap_m"] / 2, gap / 2 - M["grip_preload_m"])
+    grip["extra"] = (half - sq) - hold
+    p = ArmPlan(m)
+    p.line("light squeeze", _hands(mid[0], mid[1], zg, hold, yaw, pitch), world)
+    m.execute(p.steps[-1]["traj"], holding=True)
+    return {"contact_gap_m": round(gap, 3), "hold_gap_m": round(2 * hold, 3), "centre_shift_m": [round(float(v), 3) for v in shift]}
 
 
 def _settle_grip(ctx, cx, cy, zg, half_cmd, yaw, pitch, world, grip):
@@ -850,6 +902,7 @@ def ready(ctx, plan):
     goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
     plan.to_joint("ready pose", goal, [])
     plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
+    plan.call("relax the wrists", lambda: _relax_wrists(ctx))
     return {"ready": True}
 
 

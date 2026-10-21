@@ -17,7 +17,7 @@ from server.image_client import ImageClient
 from server.motion import ArmMotion
 from server.robot_link import AgentLink
 from server.services import Service
-from server.skills import SKILLS, Ctx, _check_heat, check_hands, new_plan, recover, run_skill
+from server.skills import SKILLS, Ctx, _check_heat, check_hands, execute, new_plan, recover, run_skill
 
 ARGS = {"pre_grasp": ["object"], "place": ["on"], "find": ["object"], "approach": ["target"],
         "turn": ["direction", "angle_deg"], "walk": ["direction", "distance_m"], "speak": ["text"]}
@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--hold", type=float, default=20.0)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--plan-only", action="store_true")
+    ap.add_argument("--all-at-once", action="store_true",
+                    help="plan every action first (arms resting), then run them as one continuous sequence")
     a = ap.parse_args()
     cfg = config.load()
     link = AgentLink()
@@ -49,7 +51,7 @@ def main():
     try:
         for name in filter(None, (x.strip() for x in a.find.split(","))):
             print("find:", run_skill(ctx, "find", {"object": name}))
-        if a.plan_only:
+        if a.plan_only or a.all_at_once:
             plan = new_plan(ctx)
             for spec in a.actions.split(","):
                 name, params = parse(spec)
@@ -57,12 +59,17 @@ def main():
                 print(f"{name}: {SKILLS[name]['fn'](ctx, plan, **params)} -> hands {plan.state['hand']}")
             for i, s in enumerate(plan.summary()):
                 print(f"  {i:2d} {s['kind']:5s} {s['label']}  {s['duration'] or ''}")
-            return
-        for spec in a.actions.split(","):
-            name, params = parse(spec)
-            print(f"run {name} {params} ...", flush=True)
-            r = run_skill(ctx, name, params)
-            print(f"   -> {r}  | hands {ctx.bb['hand']}", flush=True)
+            if a.plan_only:
+                return
+            print("executing the whole sequence ...", flush=True)
+            execute(ctx, plan, on_step=lambda i, label: print(f"  > {label}", flush=True))
+            print(f"   -> done | hands {ctx.bb['hand']}", flush=True)
+        else:
+            for spec in a.actions.split(","):
+                name, params = parse(spec)
+                print(f"run {name} {params} ...", flush=True)
+                r = run_skill(ctx, name, params)
+                print(f"   -> {r}  | hands {ctx.bb['hand']}", flush=True)
         print(f"holding for {a.hold:.0f} s (heat-watched)", flush=True)
         t_end = time.monotonic() + a.hold
         while time.monotonic() < t_end:

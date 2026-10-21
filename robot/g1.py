@@ -108,6 +108,7 @@ class Arms:
         self.max_gap_ms = 0.0     # worst tick gap in the last second
         self.fault = None         # over-temperature release reason, until it cools and is engaged again
         self.warning = None       # motors above warn_motor_temp_c while engaged (the server backs off)
+        self._blocked = 0         # consecutive 1 s checks with a joint far from its command
         threading.Thread(target=self._loop, daemon=True, name="arm_sdk").start()
 
     @property
@@ -191,11 +192,25 @@ class Arms:
         self.warning = f"arm motors hot: {self._describe(warm)}" if warm else None
         hot = {j: t for j, t in warm.items() if t > self.cfg["max_motor_temp_c"]}
         if hot and not self.fault:
-            self.fault = f"arms released for over-temperature: {self._describe(hot)}"
-            log.error(self.fault)
-            with self.lock:
-                self.segments, self.weight_target = [], 0.0
-                self.weight_rate = 1.0 / self.cfg["release_s"]
+            self._hold_in_place(f"over-temperature: {self._describe(hot)}")
+        # blocked: a joint stuck far from its command for a while is pushing against something (it heats in
+        # seconds); stop pushing. A squeeze leaves only a small error (a light preload).
+        m = self.g1.low.get()
+        if m is not None and self.q is not None and not self.fault:
+            err = np.degrees(np.abs(np.array([m.motor_state[j].q for j in joints.UPPER_BODY]) - self.q))
+            k = int(err.argmax())
+            self._blocked = self._blocked + 1 if err[k] > self.cfg["max_track_err_deg"] and not self.segments else 0
+            if self._blocked >= self.cfg["max_track_err_s"]:
+                self._hold_in_place(f"blocked: {joints.NAMES[joints.UPPER_BODY[k]]} {err[k]:.0f} deg from its command")
+
+    def _hold_in_place(self, why):
+        """Stop pushing without moving: command the arms where they are (never drop them near objects).
+        Further moves are refused until engage() finds everything cool again."""
+        self.fault = f"arms holding in place: {why}"
+        log.error(self.fault)
+        with self.lock:
+            self.segments = []
+            self.q = self.g1.upper_q()
 
     def _wait_weight(self, target):
         while abs(self.weight - target) > 1e-6:
