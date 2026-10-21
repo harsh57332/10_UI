@@ -46,7 +46,7 @@ def cut_urdf(src, dst, tcp):
         j = ET.SubElement(root, "joint", name=f"{name}_joint", type="fixed")
         ET.SubElement(j, "parent", link=t["parent"])
         ET.SubElement(j, "child", link=name)
-        ET.SubElement(j, "origin", xyz=" ".join(str(v) for v in t["xyz"]), rpy="0 0 0")
+        ET.SubElement(j, "origin", xyz=" ".join(str(v) for v in t["xyz"]), rpy=" ".join(str(v) for v in t["rpy"]))
     root.set("name", "g1_arms")
     tree.write(dst)
     meshes = {m.get("filename") for m in root.iter("mesh")}
@@ -60,8 +60,9 @@ def glove(spheres, tcp, normals, g):
     curl in further than the gloved palm, so those spheres are pushed back to it."""
     pad, extra = g.get("pad_m", 0.0), g.get("finger_extra_m", 0.0)
     for name, t in tcp.items():
-        link, n = t["parent"], np.array(normals[name], float)
-        plane = float(np.dot(t["xyz"], n))
+        a = t["rpy"][2]                         # the palm surface is twisted about z (see config.tcp_frames)
+        rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+        link, n, p0 = t["parent"], rz @ np.array(normals[name], float), np.array(t["xyz"], float)
         sp = spheres[link]
         xs = [c["center"][0] for c in sp]
         tip = max(xs) - (max(xs) - min(xs)) / 3
@@ -70,7 +71,7 @@ def glove(spheres, tcp, normals, g):
         out = []
         for c in sp + tips:
             ctr, r = np.array(c["center"], float), c["radius"] + pad
-            ctr -= max(0.0, ctr @ n + r - plane) * n
+            ctr -= max(0.0, (ctr - p0) @ n + r) * n
             out.append({"center": [round(float(v), 5) for v in ctr], "radius": r})
         spheres[link] = out
 

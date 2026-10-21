@@ -199,113 +199,113 @@ kinematics:
       radius: 0.012211591936647892
     left_rubber_hand:
     - center:
-      - 0.01384
-      - 0.0083
+      - 0.01716
+      - 0.02459
       - -0.00829
       radius: 0.04330107532441616
     - center:
-      - 0.04148
-      - 0.01094
+      - 0.04482
+      - 0.02336
       - -0.01906
       radius: 0.04593550562858582
     - center:
-      - 0.10148
-      - 0.00771
+      - 0.10416
+      - 0.01176
       - -0.00363
       radius: 0.04270635694265366
     - center:
-      - 0.08886
-      - 0.00348
+      - 0.09091
+      - 0.00935
       - 0.02455
       radius: 0.038481110334396364
     - center:
-      - 0.06574
-      - 0.00999
+      - 0.06843
+      - 0.01909
       - 0.0002
       radius: 0.044992830231785776
     - center:
-      - 0.01686
-      - 0.01008
+      - 0.02035
+      - 0.02593
       - 0.00475
       radius: 0.04507638476788998
     - center:
-      - 0.07896
-      - 0.00098
+      - 0.0828
+      - 0.00796
       - 0.05613
       radius: 0.035977286845445634
     - center:
-      - 0.11598
-      - 0.00879
+      - 0.12049
+      - 0.01056
       - 0.02166
       radius: 0.0437902357429266
     - center:
-      - 0.10246
-      - 0.00581
+      - 0.10538
+      - 0.00968
       - -0.03396
       radius: 0.04081360399723053
     - center:
-      - 0.07666
-      - 0.00533
+      - 0.07882
+      - 0.01291
       - -0.02974
       radius: 0.04032538142055273
     - center:
-      - 0.03531
-      - 0.01137
+      - 0.03863
+      - 0.02467
       - 0.02087
       radius: 0.04637216925621033
     - center:
-      - 0.12287
-      - 0.00169
+      - 0.12734
+      - 0.00243
       - -0.01494
       radius: 0.036691398918628694
     - center:
-      - 0.06091
-      - 0.00849
+      - 0.0641
+      - 0.01818
       - 0.03847
       radius: 0.0434909924864769
     - center:
-      - 0.12606
-      - -0.00286
+      - 0.13074
+      - -0.00265
       - 0.00657
       radius: 0.03213732792064548
     - center:
-      - 0.1138
-      - -0.002
+      - 0.1183
+      - -3.0e-05
       - -0.0377
       radius: 0.03300185278058052
     - center:
-      - 0.12148
-      - 0.00771
+      - 0.12377
+      - 0.009
       - -0.00363
       radius: 0.04270635694265366
     - center:
-      - 0.10886
-      - 0.00348
+      - 0.11052
+      - 0.0066
       - 0.02455
       radius: 0.038481110334396364
     - center:
-      - 0.13598
-      - 0.00879
+      - 0.1401
+      - 0.0078
       - 0.02166
       radius: 0.0437902357429266
     - center:
-      - 0.12246
-      - 0.00581
+      - 0.12499
+      - 0.00692
       - -0.03396
       radius: 0.04081360399723053
     - center:
-      - 0.14287
-      - 0.00169
+      - 0.14695
+      - -0.00033
       - -0.01494
       radius: 0.036691398918628694
     - center:
-      - 0.14606
-      - -0.00286
+      - 0.15035
+      - -0.00541
       - 0.00657
       radius: 0.03213732792064548
     - center:
-      - 0.1338
-      - -0.002
+      - 0.13791
+      - -0.00279
       - -0.0377
       radius: 0.03300185278058052
     left_shoulder_pitch_link:
@@ -693,108 +693,108 @@ kinematics:
       radius: 0.009416420012712479
     right_rubber_hand:
     - center:
-      - 0.10502
-      - -0.00649
+      - 0.10766
+      - -0.01003
       - -0.00105
       radius: 0.04148548245429993
     - center:
-      - 0.05575
-      - -0.01085
+      - 0.05868
+      - -0.02132
       - -0.01726
       radius: 0.0458454541862011
     - center:
-      - 0.01629
-      - -0.01413
+      - 0.02018
+      - -0.03005
       - -0.00267
       radius: 0.04913401380181313
     - center:
-      - 0.07713
-      - -0.00673
+      - 0.07965
+      - -0.01421
       - 0.01614
       radius: 0.04172557555139065
     - center:
-      - 0.051
-      - -0.00951
+      - 0.05363
+      - -0.02068
       - 0.01313
       radius: 0.044506491720676424
     - center:
-      - 0.01013
-      - -0.00149
+      - 0.01323
+      - -0.01826
       - 0.01466
       radius: 0.03648526277393103
     - center:
-      - 0.07523
-      - -0.00504
+      - 0.07899
+      - -0.01261
       - 0.05368
       radius: 0.040044212341308595
     - center:
-      - 0.12307
-      - -0.00837
+      - 0.12856
+      - -0.009
       - 0.01732
       radius: 0.043368445336818696
     - center:
-      - 0.08549
-      - -0.00639
+      - 0.08795
+      - -0.0127
       - -0.02248
       radius: 0.041385924071073533
     - center:
-      - 0.03394
-      - -0.00326
+      - 0.03622
+      - -0.01682
       - -0.02291
       radius: 0.03826481718569994
     - center:
-      - 0.02714
-      - -0.00435
+      - 0.03012
+      - -0.01878
       - 0.02448
       radius: 0.03935359288007021
     - center:
-      - 0.12111
-      - -0.00831
+      - 0.1265
+      - -0.00923
       - -0.02612
       radius: 0.04331084676086903
     - center:
-      - 0.05221
-      - -0.0051
+      - 0.05491
+      - -0.01604
       - 0.03983
       radius: 0.04009765349328518
     - center:
-      - 0.10152
-      - -0.00307
+      - 0.10375
+      - -0.00713
       - 0.02804
       radius: 0.03807137962430716
     - center:
-      - 0.1012
-      - 0.0023
+      - 0.10326
+      - -0.00178
       - -0.03628
       radius: 0.032701536640524866
     - center:
-      - 0.12502
-      - -0.00649
+      - 0.12727
+      - -0.00728
       - -0.00105
       radius: 0.04148548245429993
     - center:
-      - 0.14307
-      - -0.00837
+      - 0.14817
+      - -0.00624
       - 0.01732
       radius: 0.043368445336818696
     - center:
-      - 0.10549
-      - -0.00639
+      - 0.10757
+      - -0.00995
       - -0.02248
       radius: 0.041385924071073533
     - center:
-      - 0.14111
-      - -0.00831
+      - 0.14611
+      - -0.00647
       - -0.02612
       radius: 0.04331084676086903
     - center:
-      - 0.12152
-      - -0.00307
+      - 0.12337
+      - -0.00438
       - 0.02804
       radius: 0.03807137962430716
     - center:
-      - 0.1212
-      - 0.0023
+      - 0.12288
+      - 0.00098
       - -0.03628
       radius: 0.032701536640524866
     right_shoulder_pitch_link:
@@ -1505,6 +1505,9 @@ kinematics:
     - left_tcp
     - left_wrist_yaw_link
     - right_rubber_hand
+    - right_wrist_pitch_link
+    - right_wrist_roll_link
+    - right_wrist_yaw_link
     left_shoulder_pitch_link:
     - torso_link
     - left_shoulder_roll_link
@@ -1516,6 +1519,7 @@ kinematics:
     left_shoulder_roll_link:
     - left_shoulder_pitch_link
     - left_shoulder_yaw_link
+    - logo_link
     - right_shoulder_pitch_link
     - right_shoulder_roll_link
     - torso_link
@@ -1523,20 +1527,31 @@ kinematics:
     - left_elbow_link
     - left_shoulder_roll_link
     - left_wrist_roll_link
+    - logo_link
     - torso_link
     left_tcp:
     - left_rubber_hand
     left_wrist_pitch_link:
+    - left_rubber_hand
     - left_wrist_roll_link
     - left_wrist_yaw_link
-    - left_rubber_hand
+    - right_wrist_pitch_link
+    - right_wrist_roll_link
+    - right_wrist_yaw_link
     left_wrist_roll_link:
     - left_elbow_link
-    - left_wrist_pitch_link
     - left_rubber_hand
+    - left_wrist_pitch_link
+    - left_wrist_yaw_link
+    - right_wrist_pitch_link
+    - right_wrist_roll_link
+    - right_wrist_yaw_link
     left_wrist_yaw_link:
-    - left_wrist_pitch_link
     - left_rubber_hand
+    - left_wrist_pitch_link
+    - right_wrist_pitch_link
+    - right_wrist_roll_link
+    - right_wrist_yaw_link
     logo_link:
     - torso_link
     - left_shoulder_pitch_link
@@ -1552,6 +1567,9 @@ kinematics:
     - right_rubber_hand
     right_rubber_hand:
     - left_rubber_hand
+    - left_wrist_pitch_link
+    - left_wrist_roll_link
+    - left_wrist_yaw_link
     - right_tcp
     - right_wrist_yaw_link
     right_shoulder_pitch_link:
@@ -1561,10 +1579,12 @@ kinematics:
     - right_elbow_link
     - right_wrist_roll_link
     right_shoulder_roll_link:
+    - logo_link
     - right_shoulder_pitch_link
     - right_shoulder_yaw_link
     - torso_link
     right_shoulder_yaw_link:
+    - logo_link
     - right_elbow_link
     - right_shoulder_roll_link
     - right_wrist_roll_link
@@ -1577,8 +1597,9 @@ kinematics:
     - right_rubber_hand
     right_wrist_roll_link:
     - right_elbow_link
-    - right_wrist_pitch_link
     - right_rubber_hand
+    - right_wrist_pitch_link
+    - right_wrist_yaw_link
     right_wrist_yaw_link:
     - right_wrist_pitch_link
     - right_rubber_hand

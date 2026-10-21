@@ -107,6 +107,7 @@ class Arms:
         self.loop_hz = 0.0        # measured publish/loop rate, for /state
         self.max_gap_ms = 0.0     # worst tick gap in the last second
         self.fault = None         # over-temperature release reason, until it cools and is engaged again
+        self.warning = None       # motors above warn_motor_temp_c while engaged (the server backs off)
         threading.Thread(target=self._loop, daemon=True, name="arm_sdk").start()
 
     @property
@@ -181,11 +182,15 @@ class Arms:
         return ", ".join(f"{joints.NAMES[j]} {t} C" for j, t in hot.items())
 
     def _overheat_check(self):
-        """Once a second while engaged: release the arms if a motor runs too hot."""
-        if not self.engaged or self.fault:
+        """Once a second while engaged: report motors above warn_motor_temp_c (the server opens the hands and
+        backs away gracefully), and release the arms as a last resort above max_motor_temp_c."""
+        if not self.engaged:
+            self.warning = None
             return
-        hot = self._hot(self.cfg["max_motor_temp_c"])
-        if hot:
+        warm = self._hot(self.cfg["warn_motor_temp_c"])
+        self.warning = f"arm motors hot: {self._describe(warm)}" if warm else None
+        hot = {j: t for j, t in warm.items() if t > self.cfg["max_motor_temp_c"]}
+        if hot and not self.fault:
             self.fault = f"arms released for over-temperature: {self._describe(hot)}"
             log.error(self.fault)
             with self.lock:

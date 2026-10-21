@@ -1,4 +1,5 @@
 """Loads config/config.yaml once. Paths in the config are relative to the project root."""
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -33,8 +34,18 @@ def mode_name(fsm_id: int) -> str:
 
 
 def tcp_frames() -> dict:
-    """Palm contact frames {name: {parent, xyz}} on the glove surface (bare-hand TCP + glove contact offset)."""
+    """Palm contact frames {name: {parent, xyz, rpy}} on the glove's palm surface. The rubber fingers curl
+    in, so the glove surface is innermost at the fingertips (contact_m beyond the bare TCP, at
+    fingertip_contact_x_m) and turns away toward the wrist by palm_twist_deg. The frame lies in that
+    surface: a grasp that puts it flat on an object twists the hand so the whole palm touches.
+    The palm normals are +-y of the hand frames, so the twist is a rotation about z."""
     pm = load()["planner_model"]
-    off = pm.get("glove", {}).get("contact_m", 0.0)
-    return {n: {"parent": t["parent"], "xyz": [x + off * k for x, k in zip(t["xyz"], t["normal"])]}
-            for n, t in pm["tcp"].items()}
+    g = pm.get("glove", {})
+    tw = math.radians(g.get("palm_twist_deg", 0.0))
+    out = {}
+    for n, t in pm["tcp"].items():
+        x = t["xyz"][0]
+        off = g.get("contact_m", 0.0) - (g.get("fingertip_contact_x_m", x) - x) * math.tan(tw)
+        out[n] = {"parent": t["parent"], "xyz": [v + off * k for v, k in zip(t["xyz"], t["normal"])],
+                  "rpy": [0.0, 0.0, tw * t["normal"][1]]}
+    return out

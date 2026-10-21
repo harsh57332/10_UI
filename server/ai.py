@@ -17,7 +17,7 @@ from py_trees.common import Status
 from common import config
 
 from .motion import ArmPlan, SkillError
-from .skills import SKILLS, catalog, run_skill
+from .skills import SKILLS, catalog, check_hands, execute, new_plan, run_skill
 
 BRIEF = (
     "You control a Unitree G1 humanoid robot in a lab. It has two dummy hands without working fingers, so it "
@@ -28,10 +28,12 @@ BRIEF = (
 RULES = (
     "Rules: use only the listed skills with their exact parameter names. find an object or surface before any "
     "skill that uses it. After walk, turn or approach every position is forgotten, so find again before using "
-    "it (approach finds its own target). While holding a box the camera view is partly blocked, so find every "
-    "object you will need near the robot (for example a box to stack on) before pick_box. pick_box needs the box within reach: approach it first unless the box "
-    "is already close (distance under about 0.45 m). place needs a held box; to put a box on a table you are "
-    "not at, approach the table first. Finish with ready once the hands are free. Keep the plan short."
+    "it (approach finds its own target). To pick something up always use pre_grasp, then grasp, then lift. "
+    "While holding the camera view is partly blocked, so find every object you will need near the robot (for "
+    "example a box to stack on) before pre_grasp. pre_grasp needs the object within reach: approach it first "
+    "unless it is already close (distance under about 0.45 m). place needs a held object and ends with the arms "
+    "at ready; to put it on a table you are not at, approach the table first. retreat lets go of an object "
+    "that is gripped but not lifted. Each skill only works in the hand state it lists. Keep the plan short."
 )
 
 
@@ -71,12 +73,12 @@ def llm_plan(ctx, llm, text, kinds, extra=""):
 
 
 def hoist_finds(plan):
-    """A held box blocks part of the camera view, so any find between a pick_box and the next walk/turn
-    moves to just before that pick_box (the robot has not moved, so the measurement stays valid)."""
+    """A held box blocks part of the camera view, so any find between a pre_grasp and the next walk/turn
+    moves to just before that pre_grasp (the robot has not moved, so the measurement stays valid)."""
     out = list(plan)
     i = 0
     while i < len(out):
-        if out[i]["skill"] == "pick_box":
+        if out[i]["skill"] == "pre_grasp":
             j, moved = i + 1, []
             while j < len(out) and SKILLS[out[j]["skill"]]["kind"] != "move":
                 if out[j]["skill"] == "find":
@@ -105,13 +107,13 @@ class MotionPlanning:
             self.state, self.error, self.plan = "generating", None, None
             self.llm_steps, _ = llm_plan(self.ctx, self.llm, text, self.KINDS,
                                          " The robot stands still at the table: do not walk or turn.")
-            plan = ArmPlan(self.ctx.motion)
-            plan.state = {"holding": self.ctx.bb["holding"]}
+            plan = new_plan(self.ctx)
             for n in self.llm_steps:
                 s = SKILLS[n["skill"]]
                 if s["kind"] == "perceive":
                     n["result"] = s["fn"](self.ctx, **n["params"])
                 else:
+                    check_hands(n["skill"], plan.state["hand"])
                     n["result"] = s["fn"](self.ctx, plan, **n["params"])
             self.plan, self.state = plan, "ready"
             return self.status()
@@ -133,7 +135,7 @@ class MotionPlanning:
 
         def worker():
             try:
-                plan.run(on_step=lambda i, label: setattr(self, "current", f"{i + 1}/{len(plan.steps)} {label}"))
+                execute(self.ctx, plan, on_step=lambda i, label: setattr(self, "current", f"{i + 1}/{len(plan.steps)} {label}"))
                 self.state = "done"
             except SkillError as e:
                 self.state, self.error = "failed", str(e)

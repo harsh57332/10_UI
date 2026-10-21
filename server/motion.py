@@ -5,8 +5,14 @@ an ArmPlan converts them to the torso frame with the waist angles it tracks, so 
 toward a target between steps. Section 6 builds a whole plan first and plays it later; AI control
 builds and runs one skill at a time. While a box is squeezed the measured arm angles lag the
 commanded ones, so planning starts from the Agent's commanded angles when the arms are engaged.
+
+Obstacles: the fitted cuboids plus, once build_map() has run, the planner's depth obstacle map (everything
+the camera saw, the robot's arms removed, the handled object cut out). Every move keeps transit_margin_m
+from all of them unless a step asks for less (the last straight approach and the squeeze use 0).
 """
+import base64
 import math
+import zlib
 
 import numpy as np
 
@@ -41,6 +47,7 @@ class ArmMotion:
         self.tcp = config.tcp_frames()
         self.idx = {n + "_joint": i for i, n in enumerate(joints.NAMES)}
         self._names = None
+        self.map_waist = None                   # waist angles when the obstacle map was taken, None = no map
 
     @property
     def names(self):
@@ -84,7 +91,9 @@ class ArmMotion:
     def tool_quat_torso(self, q, name):
         """Current orientation (wxyz) of a palm frame relative to the torso."""
         qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
-        return mat_to_quat(self.fk.pose(self.tcp[name]["parent"], qn)[:3, :3])
+        a = self.tcp[name]["rpy"][2]            # the palm frame is twisted about z on the hand (glove)
+        rz = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
+        return mat_to_quat(self.fk.pose(self.tcp[name]["parent"], qn)[:3, :3] @ rz)
 
     def palms(self, q):
         """Pelvis-frame palm contact points (left, right) for {motor index: rad} (waist included)."""
@@ -97,16 +106,48 @@ class ArmMotion:
         return out
 
     # ---------------------------------------------------------------- planning (torso frame)
-    def plan_pose(self, start, goals, world, attached=None):
+    def plan_pose(self, start, goals, world, attached=None, use_map=None, margin=0.0):
         with self.processing("curobo"):
             return self.planner.call("plan_pose", {"start": [start[self.idx[n]] for n in self.names],
-                                                   "goals": goals, "world": world, "attached": attached})
+                                                   "goals": goals, "world": world, "attached": attached,
+                                                   "map": use_map, "margin": margin})
 
-    def plan_joint(self, start, goal, world, attached=None):
+    def plan_joint(self, start, goal, world, attached=None, use_map=None, margin=0.0):
         with self.processing("curobo"):
             return self.planner.call("plan_joint", {"start": [start[self.idx[n]] for n in self.names],
                                                     "goal": [goal[self.idx[n]] for n in self.names], "world": world,
-                                                    "attached": attached})
+                                                    "attached": attached, "map": use_map, "margin": margin})
+
+    def plan_line(self, start, goals, world, attached=None, use_map=None, margin=0.0):
+        with self.processing("curobo"):
+            return self.planner.call("plan_line", {"start": [start[self.idx[n]] for n in self.names],
+                                                   "goals": goals, "world": world, "attached": attached,
+                                                   "map": use_map, "margin": margin})
+
+    # ---------------------------------------------------------------- depth obstacle map
+    def build_map(self, frame, geometry, exclude=()):
+        """Obstacle map in the planner from one depth frame. exclude: pelvis-frame cuboids of the objects
+        being handled (cut out of the map; they stay cuboids so a squeeze can leave them out)."""
+        q = self.q_now(commanded=False)
+        waist = self.waist_of(q)
+        k = frame.intrinsics
+        depth = base64.b64encode(zlib.compress(np.ascontiguousarray(frame.depth, dtype=np.uint16).tobytes(), 1))
+        with self.processing("curobo"):
+            r = self.planner.call("map", {
+                "depth": depth.decode(), "shape": list(frame.depth.shape), "depth_scale": frame.depth_scale,
+                "intrinsics": [k["fx"], k["fy"], k["ppx"], k["ppy"]],
+                "camera_pose": [*map(float, geometry.t), *map(float, mat_to_quat(geometry.R))],
+                "q": [q[self.idx[n]] for n in self.names],
+                "exclude": [self.cuboid_to_torso(c, waist) for c in exclude]})
+        self.map_waist = waist
+        return r
+
+    def map_pose(self, waist):
+        """{"pose": map frame (torso at capture) in the torso frame for these waist angles}, or None."""
+        if self.map_waist is None:
+            return None
+        T = np.linalg.inv(self.torso_in_pelvis(waist)) @ self.torso_in_pelvis(self.map_waist)
+        return {"pose": [*map(float, T[:3, 3]), *map(float, mat_to_quat(T[:3, :3]))]}
 
     def end_q(self, start, traj):
         q = dict(start)
@@ -125,7 +166,6 @@ class ArmMotion:
                                  f"(limit {lim}): a contorted arm pose")
 
     def execute(self, traj, holding=False):
-        self.check_swing(traj)
         a = self.cfg["arms"]
         dt = traj["dt"] * (a["playback_slowdown_holding"] if holding else a["playback_slowdown"])
         kf = [{"t": dt, "q": {str(self.idx[n]): round(math.degrees(v), 3)
@@ -188,27 +228,48 @@ class ArmPlan:
                 out[k] = self.m.to_torso(v, w)
         return out, [self.m.cuboid_to_torso(c, w) for c in world]
 
-    def to_pose(self, label, goals, world, goals_fn=None):
-        """goals_fn (optional) recomputes the goals at run time from live state (e.g. a corrected grip)."""
+    def _margin(self, margin):
+        return self.m.cfg["manipulation"]["transit_margin_m"] if margin is None else margin
+
+    def to_pose(self, label, goals, world, goals_fn=None, margin=None):
+        """goals_fn (optional) recomputes the goals at run time from live state (e.g. a corrected grip).
+        margin: distance kept from every obstacle (default transit_margin_m)."""
         g, wld = self._torso(goals, world)
+        margin = self._margin(margin)
         try:
-            traj = self.m.plan_pose(self.q, g, wld, self.attached)
+            traj = self.m.plan_pose(self.q, g, wld, self.attached, self.m.map_pose(self.waist), margin)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.m.check_swing(traj, label)
         self.steps.append({"kind": "traj", "label": label, "traj": traj, "goals": goals, "goals_fn": goals_fn,
-                           "world": world, "attached": self.attached, "holding": bool(self.state.get("holding"))})
+                           "world": world, "attached": self.attached, "holding": bool(self.state.get("holding")),
+                           "margin": margin})
         self.q = self.m.end_q(self.q, traj)
 
-    def to_joint(self, label, goal, world):
+    def to_joint(self, label, goal, world, margin=None):
         _, wld = self._torso({}, world)
+        margin = self._margin(margin)
         try:
-            traj = self.m.plan_joint(self.q, goal, wld, self.attached)
+            traj = self.m.plan_joint(self.q, goal, wld, self.attached, self.m.map_pose(self.waist), margin)
+        except RuntimeError as e:
+            raise SkillError(f"{label}: {e}")
+        # no swing check: the goal angles are chosen by us (e.g. the ready pose), not by an IK solver
+        self.steps.append({"kind": "traj", "label": label, "traj": traj, "goal_q": goal, "world": world,
+                           "attached": self.attached, "holding": bool(self.state.get("holding")),
+                           "margin": margin})
+        self.q = self.m.end_q(self.q, traj)
+
+    def line(self, label, goals, world, goals_fn=None, margin=0.0):
+        """Straight-line move of the palms (contact moves): no free re-planning, so no arm flips."""
+        g, wld = self._torso(goals, world)
+        try:
+            traj = self.m.plan_line(self.q, g, wld, self.attached, self.m.map_pose(self.waist), margin)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.m.check_swing(traj, label)
-        self.steps.append({"kind": "traj", "label": label, "traj": traj, "goal_q": goal, "world": world,
-                           "attached": self.attached, "holding": bool(self.state.get("holding"))})
+        self.steps.append({"kind": "traj", "line": True, "label": label, "traj": traj, "goals": goals,
+                           "goals_fn": goals_fn, "world": world, "attached": self.attached,
+                           "holding": bool(self.state.get("holding")), "margin": margin})
         self.q = self.m.end_q(self.q, traj)
 
     def waist_to(self, label, waist):
@@ -243,11 +304,13 @@ class ArmPlan:
         live.state = {"holding": s["holding"]}
         try:
             if "goals" in s:
-                live.to_pose(s["label"], s["goals_fn"]() if s.get("goals_fn") else s["goals"], s["world"])
+                move = live.line if s.get("line") else live.to_pose
+                move(s["label"], s["goals_fn"]() if s.get("goals_fn") else s["goals"], s["world"],
+                     margin=s.get("margin"))
             else:
                 goal = dict(live.q)
                 goal.update({k: v for k, v in s["goal_q"].items() if 15 <= k <= 28})
-                live.to_joint(s["label"], goal, s["world"])
+                live.to_joint(s["label"], goal, s["world"], margin=s.get("margin"))
         except SkillError as e:
             raise SkillError(f"re-planning from the live pose failed: {e}")
         return live.steps[-1]["traj"]
