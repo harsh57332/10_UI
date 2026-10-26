@@ -17,6 +17,7 @@ from common import config, joints
 
 from common.fk import mat_to_quat
 
+from . import heat
 from .motion import ArmPlan, SkillError, cuboid, pose
 
 log = logging.getLogger("skills")
@@ -37,6 +38,14 @@ def skill(name, params, desc, kind, hands=HANDS):
         SKILLS[name] = {"name": name, "params": params, "desc": desc, "kind": kind, "fn": fn, "hands": hands}
         return fn
     return wrap
+
+
+def clean_params(name, params):
+    """Keep only the parameters the skill declares (the LLM sometimes adds extras, e.g. grasp {"object": ...}).
+    Returns (params, the required ones that are missing); a declaration starting with 'optional' is not required."""
+    declared = SKILLS[name]["params"]
+    params = {k: v for k, v in (params or {}).items() if k in declared and v not in (None, "")}
+    return params, [k for k, d in declared.items() if k not in params and not d.startswith("optional")]
 
 
 def catalog(kinds=None):
@@ -108,6 +117,8 @@ def execute(ctx, plan, on_step=None):
         if on_step:
             on_step(i, label)
         _check_heat(ctx)
+    check_waist_lock(ctx)
+    heat.check(ctx, plan)                       # before anything moves: would it reach the heat warning?
     try:
         plan.run(on_step=step)
     except Exception as e:
@@ -116,11 +127,17 @@ def execute(ctx, plan, on_step=None):
 
 
 def recover(ctx):
-    """Bring the hands to EMPTY the safe way for their current state. Returns what was done."""
+    """Bring the hands to EMPTY the safe way for their current state. Returns what was done. Its moves are
+    recovery moves (the agent runs them even after a hold in place). If nothing can be planned, the last
+    resort opens and stows the arms with direct joint moves: a stop never leaves hot arms stuck high."""
     done = []
+    ctx.motion.recovery = True
     try:
+        hand = ctx.bb["hand"]
+        if hand == "HOLDING" and not ctx.bb.get("holding"):   # already let go (the place released it): nothing
+            hand = "EMPTY"                                       # to set down (run 37: set_down on None crashed)
         for name in {"HOLDING": ("set_down", "retreat"), "GRIPPING": ("retreat",),
-                     "AT_OBJECT": ("retreat",)}.get(ctx.bb["hand"], ()):
+                     "AT_OBJECT": ("retreat",)}.get(hand, ()):
             plan = new_plan(ctx)
             SKILLS[name]["fn"](ctx, plan)
             plan.run()
@@ -128,7 +145,89 @@ def recover(ctx):
         return f"recovered: {', '.join(done) or 'nothing to do'}"
     except Exception as e:
         log.error("recovery failed after %s: %s", done, e)
-        return f"RECOVERY FAILED after {done}: {e} (arms still held, not dropped)"
+        try:
+            return f"recovery failed after {done} ({e}); last resort: {_last_resort(ctx)}"
+        except Exception as e2:
+            log.error("last resort failed: %s", e2)
+            return f"RECOVERY FAILED after {done}: {e}; last resort failed: {e2} (arms still held)"
+    finally:
+        ctx.motion.recovery = False
+
+
+def _last_resort(ctx):
+    """Nothing else could be planned: stop squeezing, then only collision-checked moves with everything still
+    known (the world stays until the arms are down): straight up clear of every object, down by the sides,
+    waist straight, release. If even that cannot be planned the arms stay held: never blind joint moves (run 37:
+    the old direct stow swept the just-made stack off)."""
+    M, a = ctx.cfg["manipulation"], ctx.cfg["arms"]
+    _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0)
+    world = _scene_world(ctx)
+    plan = ArmPlan(ctx.motion)
+    left, right = plan.palms()
+    mid, yaw = plan.m.object_frame(left, right)
+    half = float(np.linalg.norm(left - right)) / 2
+    z_up = max([v["top_z"] for v in ctx.bb["objects"].values()] + [float(mid[2]) - _glove()["below"]]) \
+        + _glove()["below"] + M["retreat_clear_m"]
+    try:
+        if z_up > mid[2] + 0.005:
+            plan.line("hands straight up", _hands(mid[0], mid[1], z_up, half, yaw, keep=True),
+                      [w for w in world if w["name"] != "table"])
+        _via_sideways(ctx, plan, M["rest_deg"], "arms down")
+    except SkillError as e:
+        log.error("last resort: no safe path (%s): the arms stay held", e)
+        return f"arms HELD where they are (no collision-free way down: {e})"
+    for st in plan.steps:
+        ctx.motion.execute(st["traj"])
+    j = {x["index"]: x["deg"] for x in ctx.link.state()["joints"]}
+    if abs(j[12]) > 1.0:                        # the arms are down by the sides now: the waist can turn back
+        ctx.motion.move_waist([0.0, math.radians(j[13]), math.radians(j[14])], max(1.0, abs(j[12]) / a["waist_speed_dps"]))
+    ctx.agent("release_upperbody", {}, timeout=15)
+    ctx.bb.update(hand="EMPTY", holding=None, grasp=None, grip=None)
+    return "hands up, arms down by the sides (planned around everything), released"
+
+
+def rest(ctx):
+    """After a task: with empty hands the arms go back to their normal position, released to the walking
+    policy (hanging at the sides), which keeps the motors cool. Arms holding or touching something stay held
+    (never dropped near objects). Returns whether they were released."""
+    if not ctx.cfg["manipulation"]["rest_after_task"] or ctx.bb["hand"] != "EMPTY":
+        return False
+    if not ctx.link.state()["arms"]["engaged"]:
+        return False
+    # first a planned, collision-checked move down to the hanging pose, then release: released from the ready
+    # pose the arms swung down freely and the hands hit the case's front face (the user's photo, 2026-10-24)
+    M = ctx.cfg["manipulation"]
+    plan = ArmPlan(ctx.motion)
+    try:                                        # down by the sides, around the support and the objects
+        _via_sideways(ctx, plan, M["rest_deg"], "arms down")
+        for st in plan.steps:
+            ctx.motion.execute(st["traj"])
+    except SkillError as e:                     # never let them swing into something: stay held at ready
+        log.warning("rest: %s; the arms stay held", e)
+        return False
+    ctx.agent("release_upperbody", {}, timeout=15)
+    return True
+
+
+def check_waist_lock(ctx):
+    """SAFETY: no motion unless the robot's agent locks the same waist joints as this config. After the 2026-10-24
+    fall (a freed waist pitch tilted the torso, the balance policy stepped, the robot fell) an agent left with an
+    older unlocked config must not move before the locked config is deployed."""
+    want = sorted(ctx.cfg["arms"]["waist_hold_joints"])
+    have = ctx.link.state()["arms"].get("waist_held")
+    if have is None or sorted(have) != want:
+        raise SkillError(f"SAFETY: the robot locks waist joints {have}, this config {want}: deploy the config "
+                         f"(scripts/robot.sh deploy && scripts/robot.sh restart agent) before any motion")
+
+
+def check_cool(ctx):
+    """A task starts only with cool arm motors: a stack heats the shoulder pitch by ~35 C, so a warmer start
+    would reach the over-temperature warning half way through."""
+    lim = ctx.cfg["manipulation"]["start_max_temp_c"]
+    hot = {j["name"]: j["temp"] for j in ctx.link.state()["joints"] if 15 <= j["index"] <= 28 and j["temp"] > lim}
+    if hot:
+        raise SkillError(f"arm motors still warm from the last task ({', '.join(f'{k} {v} C' for k, v in hot.items())}): "
+                         f"wait until all are at or below {lim} C (released arms cool fastest)")
 
 
 def run_skill(ctx, name, params, plan=None):
@@ -136,7 +235,9 @@ def run_skill(ctx, name, params, plan=None):
     s = SKILLS.get(name)
     if s is None:
         raise SkillError(f"unknown skill '{name}'")
-    params = dict(params or {})
+    params, missing = clean_params(name, params)
+    if missing:
+        raise SkillError(f"{name} needs {', '.join(missing)}")
     if s["kind"] != "arm":
         check_hands(name, ctx.bb["hand"])
         return s["fn"](ctx, **params)
@@ -203,26 +304,58 @@ def _detect_all(ctx, base, hands=(), frame=None):
     return frame, kept
 
 
-def _look(ctx, base, precision="fine"):
+def _contains(r, o, t=10):
+    """Image rect o (x, y, w, h) lies wholly within rect r (pixels, tolerance t): r is a group around o."""
+    return r[0] <= o[0] + t and r[1] <= o[1] + t and r[0] + r[2] >= o[0] + o[2] - t and r[1] + r[3] >= o[1] + o[3] - t
+
+
+def _waist_settled(ctx):
+    """Wait (up to perception.waist_settle_s) until the waist yaw is at its command and has stopped moving."""
+    P, t0, last = ctx.cfg["perception"], time.monotonic(), None
+    while time.monotonic() - t0 < P["waist_settle_s"]:
+        s = ctx.link.state()
+        meas = next(j["deg"] for j in s["joints"] if j["index"] == 12)
+        cmd = (s["arms"].get("q_cmd_deg") or [meas])[0]
+        if abs(meas - cmd) < P["waist_settle_deg"] and last is not None and abs(meas - last) < 0.2:
+            return
+        last = meas
+        time.sleep(0.1)
+    log.warning("waist not settled after %.1f s (yaw %.1f, command %.1f)", P["waist_settle_s"], meas, cmd)
+
+
+def _look(ctx, base, precision="fine", quals=()):
     """Detect `base` in a frame of the requested precision: 'fine' (manipulation: High Accuracy preset,
-    median depth over several frames) or 'coarse' (walking: one default frame). If the best match is cut
-    off at the top/bottom of the image, tilt the waist (pitch) to bring it into view and look again.
-    Returns (frame, detections, torso-in-pelvis)."""
+    median depth over several frames) or 'coarse' (walking: one default frame). If the wanted match (the
+    left/rightmost for those words, else the best) is cut off at an image edge, turn the waist toward it
+    (yaw; pitch only if the waist pitch is not held) and look again. Returns (frame, detections, torso-in-pelvis)."""
     P = ctx.cfg["perception"]
+    held = ctx.cfg["arms"]["waist_hold_joints"]
+    check_waist_lock(ctx)                       # a look turns the waist
     for attempt in range(P["look_max_tries"] + 1):
+        _waist_settled(ctx)
         frame = ctx.camera.fine() if precision == "fine" else ctx.camera.coarse()
         if frame is None:
             raise SkillError("camera is offline")
-        q = ctx.motion.q_now()
-        T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q))
+        q = ctx.motion.q_now(commanded=False)   # the camera is where the waist really is (run 13: the commanded
+        T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q))   # angle placed both boxes 10-14 deg off)
         frame, dets = _detect_all(ctx, base, _hand_rects(ctx, frame, q, T), frame)
-        (x, y, w, h), _ = dets[0]
-        H, edge = frame.rgb.shape[0], P["look_edge_px"]
-        step = -P["look_step_deg"] if y < edge else (P["look_step_deg"] if y + h > H - edge else 0.0)
-        pitch = math.degrees(q[14]) + step
-        if not step or abs(pitch) > P["look_max_pitch_deg"] or attempt == P["look_max_tries"]:
+        singles = [d for d in dets if not any(o is not d and _contains(d[0], o[0]) for o in dets)] or dets
+        centre = lambda d: d[0][0] + d[0][2] / 2
+        pick = (min if "left" in quals else max)(singles, key=centre) if {"left", "right"} & set(quals) else singles[0]
+        (x, y, w, h), _ = pick
+        (H, W), edge = frame.rgb.shape[:2], P["look_edge_px"]
+        pstep = -P["look_step_deg"] if y < edge else (P["look_step_deg"] if y + h > H - edge else 0.0)
+        ystep = P["look_step_deg"] if x < edge else (-P["look_step_deg"] if x + w > W - edge else 0.0)   # image left = robot's left
+        pitch, yaw = math.degrees(q[14]) + pstep, math.degrees(q[12]) + ystep
+        tilt = pstep and abs(pitch) <= P["look_max_pitch_deg"] and 14 not in held
+        turn = ystep and abs(yaw) <= P["look_max_yaw_deg"] and 12 not in held
+        log.info("look '%s': wanted match at px %d..%d of %d (%s); waist yaw %.1f pitch %.1f (measured)",
+                 base, x, x + w, W,
+                 f"turning the waist {ystep:+.0f} deg" if turn and attempt < P["look_max_tries"] else "in view",
+                 math.degrees(q[12]), math.degrees(q[14]))
+        if attempt == P["look_max_tries"] or not (tilt or turn):
             return frame, dets, T
-        ctx.motion.move_waist([q[12], q[13], math.radians(pitch)], 1.0)    # lean back / forward to see it
+        ctx.motion.move_waist([math.radians(yaw) if turn else q[12], q[13], math.radians(pitch) if tilt else q[14]], 1.0)
         time.sleep(0.3)
     return frame, dets, T
 
@@ -256,8 +389,19 @@ def _choose(cands, quals):
        "after walking or turning, so find again afterwards.",
        "perceive")
 def find(ctx, object, precision="fine"):
+    check_waist_lock(ctx)                       # the side look turns the waist
     base, quals = _parse(object)
-    frame, dets, T = _look(ctx, base, "coarse" if precision == "coarse" else "fine")
+    P = ctx.cfg["perception"]
+    side = 1 if "left" in quals else (-1 if "right" in quals else 0)
+    if side and 12 not in ctx.cfg["arms"]["waist_hold_joints"]:
+        # look toward the named side first: the camera sees only ~ +-17 cm sideways at the table, so a box at the
+        # side was cut off at the image edge (or missed) with the waist straight
+        q = ctx.motion.q_now()
+        yaw = math.radians(side * P["side_look_deg"])
+        if abs(q[12] - yaw) > math.radians(3):
+            ctx.motion.move_waist([yaw, q[13], q[14]], max(1.0, abs(math.degrees(yaw - q[12])) / ctx.cfg["arms"]["waist_speed_dps"]))
+            time.sleep(0.3)
+    frame, dets, T = _look(ctx, base, "coarse" if precision == "coarse" else "fine", quals)
     if any(w in base for w in SURFACE_WORDS):
         fits = [(ctx.geometry.fit_surface(frame, r, T), sc) for r, sc in dets]
         fits = [(f, sc) for f, sc in fits if f is not None]
@@ -272,13 +416,31 @@ def find(ctx, object, precision="fine"):
         b = ctx.geometry.fit_box(frame, r, T)
         if b is None or max(b["dims"]) > M["max_object_size_m"]:      # e.g. the table/case itself
             continue
+        if b["support_z"] < ctx.cfg["perception"]["floor_below_m"]:     # lying on the floor (a 'left box' picked
+            continue                                                    # a tray on the floor 2 m away)
         b["distance_m"] = math.hypot(b["center"][0], b["center"][1])
         b["rect"] = r
         cands.append((b, sc))
     if not cands:
         raise SkillError(f"saw '{base}' but nothing of graspable size with good depth")
+    # a detection around another detected one is a group of them (two boxes side by side), not one object
+    # a detection containing another is a group of objects side by side (one wide box over two) - but a STACK is
+    # tall, not wide: it is kept when it is no wider than what it contains (the stack, not a 56 deg stray, 2026-10-26)
+    wide = lambda b, o: b["dims"][1] > 1.4 * max(o["dims"][1], 0.05)
+    small = ctx.cfg["manipulation"]["min_box_width_m"]          # narrower than any graspable object: a stray or a
+    cands = [(b, sc) for b, sc in cands if min(b["dims"][0], b["dims"][1]) >= small] or cands   # sliver of an edge
+    single = [(b, sc) for b, sc in cands
+              if not any(o is not b and _contains(b["rect"], o["rect"]) and wide(b, o) for o, _ in cands)]
+    for b, sc in cands:
+        log.info("find '%s': candidate at %s, %s cm, score %.2f%s", object, [round(v, 3) for v in b["center"]],
+                 [round(100 * v, 1) for v in b["dims"]], sc, "" if any(b is c for c, _ in single) else " (a group: dropped)")
+    cands = single or cands
     b, score = _choose(cands, quals)
-    ctx.bb["objects"][object] = {**b, "t": time.time()}
+    for k, v in ctx.bb["objects"].items():      # 'left box' and 'right box' must not be the same box
+        if k != object and math.hypot(v["center"][0] - b["center"][0], v["center"][1] - b["center"][1]) < 0.05:
+            raise SkillError(f"'{object}' is the same object as '{k}' (only one of them is in view): "
+                             f"move them into view or closer together")
+    ctx.bb["objects"][object] = {**b, "t": time.time(), "imu_yaw": _pelvis_yaw(ctx)}
     return {"object": object, "center_m": [round(v, 3) for v in b["center"]], "size_m": [round(v, 3) for v in b["dims"]],
             "distance_m": round(b["distance_m"], 3), "score": score, "candidates": len(cands)}
 
@@ -376,26 +538,73 @@ def _ry(a):
     return np.array([[c, 0.0, s_], [0.0, 1.0, 0.0], [-s_, 0.0, c]])
 
 
-def _ensure_ready(ctx, plan):
-    """Plans start far more reliably from the ready pose than from the arms hanging down."""
-    ready = [math.radians(v) for v in ctx.cfg["manipulation"]["ready_deg"]]
-    if max(abs(plan.q[15 + k] - r) for k, r in enumerate(ready)) > math.radians(10):
+def _scene_world(ctx):
+    """The support (a solid block) and every found object, for the arms' big moves near the body."""
+    sup = [v for v in ctx.bb["objects"].values() if "support_z" in v]
+    world = [_table(ctx, sup[0]["support_z"], sup[0].get("support_front_x", sup[0]["front_x"] - 0.10))] if sup else []
+    return world + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()]
+
+
+def _via_sideways(ctx, plan, goal_deg, label):
+    """Arms up or down by the sides: first out to the sideways posture (arms raised out to the sides, away from
+    everything in front), then to the goal. Lifting from hanging and lowering to hanging straight in front hit
+    the case's front face (the user's photo, 2026-10-24)."""
+    M = ctx.cfg["manipulation"]
+    target = [math.radians(v) for v in goal_deg]
+    if max(abs(plan.q[15 + k] - r) for k, r in enumerate(target)) <= math.radians(10):
+        return
+    world = _scene_world(ctx)
+    for name, angles in (("arms out to the sides", M["side_deg"]), (label, goal_deg)):
         goal = dict(plan.q)
-        goal.update({15 + k: r for k, r in enumerate(ready)})
-        plan.to_joint("arms to ready pose", goal, [], margin=ctx.cfg["manipulation"]["near_margin_m"])
+        goal.update({15 + k: math.radians(v) for k, v in enumerate(angles)})
+        plan.to_joint(name, goal, world, margin=M["near_margin_m"])
+
+
+def _ensure_ready(ctx, plan):
+    """Plans start far more reliably from the ready pose than from the arms hanging down (lifted by the sides)."""
+    _via_sideways(ctx, plan, ctx.cfg["manipulation"]["ready_deg"], "arms to ready pose")
 
 
 def _table(ctx, support_z, front_x, y=0.0):
-    """Table/case top as a slab: its measured front edge, raised by the rim height."""
-    M, P = ctx.cfg["manipulation"], ctx.cfg["perception"]
-    top = support_z + P["table_rim_m"]
-    return cuboid("table", (front_x + 0.6, y, top - M["table_block_m"] / 2), (1.2, 1.6, M["table_block_m"]))
+    """Table/case top as a slab at its measured height and front edge (STANDARDS M1.2: no assumed rim; rails
+    and other raised parts are in the depth map). The hands may come support_margin_m close to it."""
+    M = ctx.cfg["manipulation"]
+    c = cuboid("table", (front_x + 0.6, y, support_z - M["table_block_m"] / 2), (1.2, 1.6, M["table_block_m"]))
+    c["margin"] = M["support_margin_m"]
+    return c
 
 
-def _face(ctx, plan, x, y, what, frac=1.0):
-    """Turn the waist (a fraction of the way) so (x, y) comes in front of the arms."""
+def _support_cut(ctx, b):
+    """The support's surface around an object, cut out of the depth map: it is modelled by the table slab,
+    whose smaller margin lets the gloves come down low beside a short object (the map's distance field is
+    1.5 cm coarse). The cut ends support_cut_above_m over the measured support: at 5 mm, the real top (2-4 mm
+    higher) and depth noise left voxels in the open gap between two boxes, and the glove fingers reaching
+    past the object 'collided' with them (run 13: no grasp pose at all). Taller things stay in the map;
+    a low rail inside the cut is met by the touch-checked descent."""
+    pad = ctx.cfg["scene_map"]["exclude_pad_m"]
+    (cx, cy, _), (dx, dy, _) = b["center"], b["dims"]
+    zc = b["support_z"] + ctx.cfg["scene_map"]["support_cut_above_m"] - pad   # (+ the map's exclude pad)
+    return cuboid("support", (cx, cy, zc - 0.025), (dx + 0.20, dy + 0.34, 0.05), b.get("yaw", 0.0))
+
+
+def _face_fractions(ctx):
+    """Waist turns to try toward a target: none while the agent holds the waist yaw."""
+    return [0.0] if 12 in ctx.cfg["arms"]["waist_hold_joints"] else ctx.cfg["manipulation"]["face_fractions"]
+
+
+def _face(ctx, plan, x, y, what, frac=1.0, lean=0.0):
+    """Turn the waist (a fraction of the way) so (x, y) comes in front of the arms, leaning forward `lean` rad
+    (from the resting pitch) when it is beyond the arms' reach."""
     lim = math.radians(ctx.cfg["manipulation"]["max_face_deg"])
-    plan.waist_to(f"turn waist toward {what}", [max(-lim, min(lim, math.atan2(y, x) * frac)), 0.0, 0.0])
+    plan.waist_to(f"turn waist toward {what}" + (" (leaning)" if lean else ""),
+                  [max(-lim, min(lim, math.atan2(y, x) * frac)), 0.0, lean])
+
+
+def _held(m, h, yaw):
+    """goals(x, y, z) for the held object's frame at (x, y, z) turned `yaw`: the grip moved rigidly."""
+    if h.get("grip"):
+        return lambda x, y, z: m.held_goals(h["grip"](), x, y, z, yaw)
+    return lambda x, y, z: _hands(x, y, z, float(np.linalg.norm(np.subtract(*m.palms(m.q_now())))) / 2, yaw, keep=True)
 
 
 def _hands(cx, cy, z, half, yaw, pitch_deg=0.0, keep=False):
@@ -406,78 +615,249 @@ def _hands(cx, cy, z, half, yaw, pitch_deg=0.0, keep=False):
             "right_tcp": {"position": [cx - ux * half, cy - uy * half, z], "quaternion": q}}
 
 
+def _reach_note(ctx, name, x, y, place=False):
+    """STANDARDS M3.1 / M3.3: where an object's centre is relative to the zone where the task is tested to plan
+    (None inside it). Advisory: the planner still tries outside it; a failure there names the standard."""
+    M = ctx.cfg["manipulation"]
+    limit = M["max_place_bearing_deg"] if place else M["max_bearing_deg"]
+    r, bearing = math.hypot(x, y), math.degrees(math.atan2(y, x))
+    (lo, hi), chest = M["reach_m"], M["chest_front_m"]
+    if abs(bearing) > limit:
+        return (f"STANDARDS M3.3: '{name}' is {abs(bearing):.0f} deg to the {'left' if y > 0 else 'right'}, beyond the "
+                f"tested {limit} deg waist turn to {'place on' if place else 'pick'} it (move it, or let the robot side-step)")
+    if not lo <= r <= hi:
+        return (f"STANDARDS M3.1: '{name}' is {(r - chest) * 100:.0f} cm from the chest, outside the tested "
+                f"{(lo - chest) * 100:.0f}-{(hi - chest) * 100:.0f} cm (move it, or let the robot step)")
+    return None
+
+
+_GLOVE = {}
+
+
+def _glove():
+    """The gloved hand's size from the planner's own collision model (so these rules and the planner agree):
+    thickness from its palm contact plane to its back (along the palm normal), and how far it reaches below the
+    palm point (the hand is upright at a grasp)."""
+    if not _GLOVE:
+        import yaml
+        robot = yaml.safe_load(open(config.path(config.load()["services"]["planner"]["robot_yml"])))
+        spheres = robot["kinematics"]["collision_spheres"]
+        thick, below = [], []
+        for name, t in config.tcp_frames().items():
+            a, sign = t["rpy"][2], (-1.0 if name.startswith("left") else 1.0)
+            n = np.array([-math.sin(a), math.cos(a), 0.0]) * sign
+            c = np.array([sp["center"] for sp in spheres[t["parent"]]])
+            r = np.array([sp["radius"] for sp in spheres[t["parent"]]])
+            d = (c - np.array(t["xyz"])) @ n
+            thick.append(float((d + r).max() - (d - r).min()))
+            below.append(float((t["xyz"][2] - c[:, 2] + r).max()))
+        _GLOVE.update(thickness=max(thick), below=max(below))
+    return _GLOVE
+
+
+def _glove_thickness():
+    return _glove()["thickness"]
+
+
+def _hands2(cx, cy, z, half_l, half_r, yaw, pitch_deg=0.0):
+    """Palm goals like _hands, with each palm its own distance from the centre."""
+    return {"left_tcp": _hands(cx, cy, z, half_l, yaw, pitch_deg)["left_tcp"],
+            "right_tcp": _hands(cx, cy, z, half_r, yaw, pitch_deg)["right_tcp"]}
+
+
+def _pelvis_yaw(ctx):
+    """The pelvis heading (rad, IMU) or None (no robot)."""
+    try:
+        return math.radians(ctx.link.state()["imu"]["pelvis_rpy"][2])
+    except Exception:
+        return None
+
+
+def _rebase_objects(ctx):
+    """Found objects are stored in the pelvis frame of the moment they were seen. The robot turns a little on
+    the spot as the waist swings (the balance policy steps: +3..5 deg per run, 2-3 cm at the table), so each
+    is turned by how far the pelvis has turned since (IMU yaw)."""
+    now = _pelvis_yaw(ctx)
+    if now is None:
+        return
+    for k, v in ctx.bb["objects"].items():
+        if v.get("imu_yaw") is None:
+            continue
+        d = now - v["imu_yaw"]
+        if abs(d) < math.radians(0.2):
+            continue
+        c, s_ = math.cos(-d), math.sin(-d)
+        x, y = v["center"][0], v["center"][1]
+        nx, ny = c * x - s_ * y, s_ * x + c * y
+        for key in ("front_x", "support_front_x"):
+            if key in v:
+                v[key] = v[key] + nx - x
+        v["center"] = [nx, ny, *v["center"][2:]]
+        v["yaw"], v["distance_m"], v["imu_yaw"] = v.get("yaw", 0.0) - d, math.hypot(nx, ny), now
+        log.info("'%s': the robot turned %+.1f deg since it was seen: now at (%.3f, %.3f)", k, math.degrees(d), nx, ny)
+
+
+def _obj_xy(ctx, name):
+    _rebase_objects(ctx)
+    return ctx.bb["objects"][name]["center"][:2]
+
+
 def _grasp_geometry(ctx, object):
     """Squeeze grasp of a found object: its centre, the width across the robot's left-right (the palms
     close on those two faces), the grasp height and the cuboids around it."""
     M = ctx.cfg["manipulation"]
+    _rebase_objects(ctx)
     b = ctx.bb["objects"].get(object)
     if b is None:
         raise SkillError(f"'{object}' has not been found yet")
     (cx, cy, cz), (dx, dy, dz) = b["center"], b["dims"]
     if not M["min_box_width_m"] <= dy <= M["max_box_width_m"]:
-        raise SkillError(f"'{object}' is {dy:.2f} m wide, outside {M['min_box_width_m']}..{M['max_box_width_m']} m")
-    zg = max(cz, b["support_z"] + M["grasp_min_above_support_m"])   # centre, but the gloved hand clears the support
-    if zg > b["top_z"] - 0.01:
-        raise SkillError(f"'{object}' is too short to squeeze without the hands hitting what it stands on")
+        raise SkillError(f"STANDARDS M4.3: '{object}' is {dy * 100:.1f} cm wide between its squeeze faces; the gloves "
+                         f"hold {M['min_box_width_m'] * 100:.0f}-{M['max_box_width_m'] * 100:.0f} cm")
+    # centre height, but the gloves' lowest point stays clear of the support: a short object is gripped with
+    # the lower part of the palm, of which enough must be on the object
+    zg = max(cz, b["support_z"] + _glove()["below"] + M["support_clear_m"])
+    contact = b["top_z"] - max(b["support_z"], zg - M["palm_below_m"])
+    if contact < M["min_palm_contact_m"]:
+        need = _glove()["below"] + M["support_clear_m"] - M["palm_below_m"] + M["min_palm_contact_m"]
+        raise SkillError(f"STANDARDS M4.2: '{object}' is {dz * 100:.1f} cm tall; the gloves can grip objects at "
+                         f"least {need * 100:.1f} cm tall (stand it on a taller side)")
+    note = _reach_note(ctx, object, cx, cy)
+    # M5.1: each glove comes straight down beside its face: in the middle of the slot when an object stands
+    # beside it (the same clearance on both sides of the glove), else free_side_off_m off the face
+    thick = _glove_thickness()
+    off = {}
+    for side, sign in (("left", 1), ("right", -1)):
+        gap, near = None, None
+        for k, v in ctx.bb["objects"].items():
+            if k == object or v["top_z"] < b["support_z"] + 0.02:
+                continue
+            along = abs(v["center"][0] - cx) - (v["dims"][0] + dx) / 2      # gap in front of / behind it
+            beside = sign * (v["center"][1] - cy) - (v["dims"][1] + dy) / 2  # gap on this side of it
+            if along < 0.05 and -0.5 * v["dims"][1] < beside and (gap is None or beside < gap):
+                gap, near = beside, k
+        # in a slot the palm side gets the room (the real glove reaches ~2.5 cm past the model's palm plane toward
+        # the object, runs 14 17 19 20); its flat back keeps slot_back_clear_m from the neighbour
+        if gap is not None and gap < M["slot_min_gap_m"]:      # STANDARDS M5.1 (measured: the real glove needs it)
+            raise SkillError(f"STANDARDS M5.1: only {gap * 100:.1f} cm between '{object}' and '{near}' (its {side} side); "
+                             f"a glove needs {M['slot_min_gap_m'] * 100:.0f} cm to come down between them (runs 14-33: "
+                             f"at 12-13 cm it touched one box or the other): move them apart")
+        o = M["free_side_off_m"] if gap is None else min(M["slot_palm_max_m"], (gap - thick) * M["slot_palm_share"])
+        if o < M["slot_clear_min_m"]:
+            raise SkillError(f"STANDARDS M5.1: only {max(gap, 0) * 100:.1f} cm free between '{object}' and '{near}' "
+                             f"(its {side} side); a glove is {thick * 100:.1f} cm thick and needs "
+                             f"{(thick + 2 * M['slot_clear_min_m']) * 100:.1f} cm: move them apart")
+        off[side] = o
+        off[side + "_free"] = gap is None
+        off[side + "_mid"] = o if gap is None else min(M["free_side_off_m"], (gap - thick) / 2)   # centred fallback
     byaw = b.get("yaw", 0.0)
     if abs(byaw) > math.radians(M["max_trusted_box_yaw_deg"]):
         byaw = 0.0                              # a large estimated angle is more likely a mis-fit than real
     others = [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items() if k != object]
-    tallest = max([v["top_z"] for k, v in ctx.bb["objects"].items() if k != object], default=b["support_z"])
-    return {"object": object, "cx": cx, "cy": cy, "cz": cz, "zg": zg, "half": dy / 2, "width": dy,
+    # the lift clears the support and the objects right next to it; the place raises the object over anything
+    # further away only for the last part of the way (holding high costs ~11 Nm per shoulder pitch, low ~8.5)
+    gap = lambda v: max(abs(v["center"][0] - cx) - (v["dims"][0] + dx) / 2, abs(v["center"][1] - cy) - (v["dims"][1] + dy) / 2)
+    tallest = max([v["top_z"] for k, v in ctx.bb["objects"].items() if k != object and gap(v) < M["lift_near_m"]],
+                  default=b["support_z"])
+    near_tops = [v["top_z"] for k, v in ctx.bb["objects"].items() if k != object and gap(v) < 0.25]
+    z_above = max([b["top_z"]] + near_tops) + _glove()["below"] + M["above_clear_m"]
+    # along the object: the hand's two contacts (wrist curve and middle fingertip) centred on the object's centre,
+    # so the squeeze holds it at its centre of mass ("whenever told to lift anything, find its centre"). Run 18:
+    # fingertips at the far corner put the grip 2.6 cm ahead of the centre and the box swung down in the gloves
+    span = config.load()["planner_model"]["glove"]["contact_span_x_m"]
+    shift = config.tcp_frames()["left_tcp"]["xyz"][0] - sum(span) / 2   # the palm frame ahead of the contacts' middle
+    gx, gy = cx + shift * math.cos(byaw), cy + shift * math.sin(byaw)
+    return {"object": object, "cx": gx, "cy": gy, "cz": cz, "zg": zg, "half": dy / 2, "width": dy, "grip_shift": -shift,
+            "center": list(b["center"]),
+            "off_l": off["left"], "off_r": off["right"], "free_l": off["left_free"], "free_r": off["right_free"],
+            "mid_l": off["left_mid"], "mid_r": off["right_mid"], "z_above": max(z_above, zg), "clear": M["release_open_m"][-1],
+            "note": note,
             "dims": list(b["dims"]), "byaw": byaw, "support_z": b["support_z"], "top_z": b["top_z"],
-            "box": cuboid(object, b["center"], b["dims"], byaw), "others": others,
+            "box": cuboid(object, b["center"], b["dims"], byaw), "others": others, "cut": _support_cut(ctx, b),
             "table": _table(ctx, b["support_z"], b.get("support_front_x", b["front_x"] - 0.10), cy),
             "squeeze": min(M["squeeze_m"], max(0.0, (dy - M["min_squeeze_gap_m"]) / 2)),
             "lift": max(M["lift_m"], tallest - b["support_z"] + M["carry_clear_m"])}
 
 
 def _check_lines(plan, moves):
-    """Plan these straight moves from the plan's current pose only to prove they are possible."""
-    mk = plan.mark()
+    """Plan these straight moves from the plan's current pose only to prove they are possible; returns
+    {label: trajectory} so the real steps can reuse exactly what was proven."""
+    mk, out = plan.mark(), {}
     try:
         for label, goals, world in moves:
             plan.line(label, goals, world)
+            out[label] = plan.steps[-1]["traj"]
     finally:
         plan.restore(mk)
+    return out
 
 
 @skill("pre_grasp", {"object": "a found object (box)"},
-       "Bring both gloves beside the object at grasp height, 2 cm off its left and right sides (not touching), "
-       "with the waist turned toward it. The object must be within reach. Next: grasp.", "arm", hands=("EMPTY",))
+       "Bring both gloves straight down beside the object to grasp height (in the middle of the space between it "
+       "and a neighbour, else 2 cm off its side), not touching. The object must be within reach (the waist turns "
+       "toward it). Next: grasp.", "arm", hands=("EMPTY",))
 def pre_grasp(ctx, plan, object):
     M = ctx.cfg["manipulation"]
     g = _grasp_geometry(ctx, object)
     cx, cy, zg, half, sq = g["cx"], g["cy"], g["zg"], g["half"], g["squeeze"]
-    _map_scene(ctx, [g["box"]] + g["others"])   # depth obstacle map first: even the move to ready avoids the case
+    hl, hr, za = half + g["off_l"], half + g["off_r"], g["z_above"]
+    _map_scene(ctx, [g["box"]] + g["others"] + [g["cut"]])   # depth obstacle map first: even the move to ready
+                                                              # avoids the case
     plan.waist_to("straighten waist", [plan.waist[0], 0.0, 0.0])
     _ensure_ready(ctx, plan)
     near = [g["table"], g["box"]] + g["others"]
     free = [g["table"]] + g["others"]           # the object itself is touched from here on
-    last, start = None, plan.mark()
-    # each candidate (waist turn, palm angle, clearance, finger pitch) must also squeeze and lift in straight lines
-    for frac in M["face_fractions"]:
-        for palm in M["palm_align"]:
-            for clear in M["approach_clear_m"]:
-                for pitch in M["grasp_pitch_deg"]:
-                    plan.restore(start)
-                    if frac:
-                        _face(ctx, plan, cx, cy, object, frac)
-                    yaw = palm * g["byaw"] + (1 - palm) * plan.waist[0]
-                    try:
-                        _come_down_beside(ctx, plan, cx, cy, zg, half, yaw, pitch, near)
-                        plan.line("move palms beside the object", _hands(cx, cy, zg, half + clear, yaw, pitch), near)
-                        _check_lines(plan, [("squeeze", _hands(cx, cy, zg, half - sq, yaw, pitch), free),
-                                            ("lift", _hands(cx, cy, zg + g["lift"] + M["lift_sag_comp_m"], half - sq, yaw, pitch), free)])
-                    except SkillError as e:
-                        last = e
-                        continue
-                    g.update(yaw=yaw, pitch=pitch, clear=clear)
-                    _to_state(ctx, plan, "AT_OBJECT", grasp=g)
-                    return {"object": object, "width_m": round(g["width"], 3), "grasp_height_m": round(zg, 3),
-                            "waist_deg": round(math.degrees(plan.waist[0]), 1), "palm_yaw_deg": round(math.degrees(yaw), 1)}
+    best, start = (-1, None), plan.mark()
+    # one free move (cuRobo) to above the object, then straight down beside it; each candidate (waist turn,
+    # palm angle, finger pitch) must also squeeze and lift in straight lines from there
+    # a free side comes down free_side_off_m off the face, or closer if the longer close-in cannot be planned
+    near_l = half + 0.02 if g["free_l"] and g["off_l"] > 0.02 else hl
+    near_r = half + 0.02 if g["free_r"] and g["off_r"] > 0.02 else hr
+    widths = [(hl, hr)] + ([(near_l, near_r)] if (near_l, near_r) != (hl, hr) else [])
+    mid = (half + g["mid_l"], half + g["mid_r"])          # a slot glove centred, if the palm-side room has no pose
+    widths += [mid] if mid not in widths else []
+    leans = [math.radians(d) for d in M["pick_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
+    for lean, frac, palm, pitch, (hl, hr) in [(ln, f, p, t, w) for ln in leans for f in _face_fractions(ctx)
+                                              for p in M["palm_align"] for t in M["grasp_pitch_deg"] for w in widths]:
+        if True:
+            if True:
+                plan.restore(start)
+                _face(ctx, plan, cx, cy, object, frac, lean)   # frac 0: straight (not where a look left it)
+                yaw = palm * g["byaw"] + (1 - palm) * plan.waist[0]
+                stage = 0
+                down, up = _hands2(cx, cy, zg, hl, hr, yaw, pitch), _hands2(cx, cy, za, hl, hr, yaw, pitch)
+                try:
+                    stage = _come_down(ctx, plan, up, down, near)
+                    for sq_try in (sq, -M["squeeze_short_m"]):   # the closing line to the faces, else ending short of
+                        try:                                    # them (far reach): the live close-in goes on by feel
+                            lines = _check_lines(plan, [
+                                ("squeeze", _hands(cx, cy, zg, half - sq_try, yaw, pitch), free),
+                                ("lift", _hands(cx, cy, zg + g["lift"] + M["lift_sag_comp_m"], half - sq_try, yaw, pitch), free)])
+                            g["squeeze"] = sq_try
+                            break
+                        except SkillError:
+                            if sq_try != sq:
+                                raise
+                except SkillError as e:
+                    log.debug("pre_grasp candidate waist %.0f palm %s pitch %s gloves +%.1f/+%.1f cm: stage %d: %s",
+                              math.degrees(plan.waist[0]), palm, pitch, 100 * (hl - half), 100 * (hr - half), stage, e)
+                    if stage > best[0]:             # report the candidate that got furthest, not the last one
+                        best = (stage, f"{e} (waist {math.degrees(plan.waist[0]):.0f} deg, finger pitch {pitch} deg)")
+                    continue
+                g.update(yaw=yaw, pitch=pitch, lines=lines)
+                # the descent runs touch-checked: from here on the gloves are at the object (a failure retreats)
+                descent = plan.steps.pop()
+                descent["dry"] = True
+                _to_state(ctx, plan, "AT_OBJECT", grasp=g)
+                plan.call("come down beside the object (touch-checked)",
+                          lambda t=descent["traj"], d=down, u=up: _descend(
+                              ctx, t, d, u, near, za - _glove()["below"] - M["above_clear_m"]))
+                plan.steps.append(descent)
+                return {"object": object, "width_m": round(g["width"], 3), "grasp_height_m": round(zg, 3),
+                        "waist_deg": round(math.degrees(plan.waist[0]), 1), "palm_yaw_deg": round(math.degrees(yaw), 1),
+                        "glove_clearance_cm": [round((hl - half) * 100, 1), round((hr - half) * 100, 1)]}
     plan.restore(start)
-    raise SkillError(f"cannot bring the gloves beside '{object}': {last}")
+    raise SkillError(f"cannot bring the gloves beside '{object}': {best[1]}" + (f". {g['note']}" if g["note"] else ""))
 
 
 @skill("grasp", {}, "Squeeze the object the gloves are beside (after pre_grasp): close in until they touch it, "
@@ -486,12 +866,28 @@ def grasp(ctx, plan):
     g = plan.state["grasp"]
     cx, cy, zg, half, sq, yaw, pitch = (g[k] for k in ("cx", "cy", "zg", "half", "squeeze", "yaw", "pitch"))
     free = [g["table"]] + g["others"]
-    grip = {"extra": 0.0, "dx": 0.0, "dy": 0.0}  # squeeze correction and hand-measured centre shift
+    grip = {"extra": 0.0, "dx": 0.0, "dy": 0.0, "gap": None, "force": 0.0,  # filled in by _press
+            "lines": g.get("lines")}
     _to_state(ctx, plan, "GRIPPING", grip=grip)
     plan.call("close until contact", lambda: _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, free, grip))
     # planned only so later steps (lift) start from a squeeze pose; the call above does the real closing
-    plan.line("squeeze", _hands(cx, cy, zg, half - sq, yaw, pitch), free)
+    plan.line("squeeze", _hands(cx, cy, zg, half - sq, yaw, pitch), free, traj=g["lines"]["squeeze"])
     plan.steps[-1]["dry"] = True
+    # ...and the plan holds the object as wide as the real grip is: the force squeeze stops the palms where the
+    # object (wrists first) stops them, grip_hold_extra_m wider than its width. Planning the carry and place at
+    # the modelled squeeze gap made them look reachable when they were not (runs 10-12: the far place)
+    g["hold"] = None
+    mk = plan.mark()
+    try:
+        plan.line("grip width", _hands(cx, cy, zg, half + ctx.cfg["manipulation"]["grip_hold_extra_m"] / 2, yaw, pitch),
+                  free, margin=0.0)
+        plan.steps[-1]["dry"] = True
+        g["hold"] = half + ctx.cfg["manipulation"]["grip_hold_extra_m"] / 2
+    except SkillError as e:
+        plan.restore(mk)
+        log.warning("grip width: %s; planning the carry at the squeeze gap", e)
+    g["grip_plan"] = plan.m.grip_of(plan.q)     # how the plan holds it, until the live squeeze measures the grip
+    g["grip_yaw"] = plan.m.object_frame(*plan.palms())[1]
     return {"object": g["object"], "squeeze_m": round(sq, 3)}
 
 
@@ -505,14 +901,21 @@ def lift(ctx, plan):
     free = [g["table"]] + g["others"]
     z_lift = zg + g["lift"]
     z_cmd = z_lift + M["lift_sag_comp_m"]       # the arms sag ~3 cm under the object; aim that much higher
-    hold = lambda x, y, z: (lambda: _hands(x + grip["dx"], y + grip["dy"], z, half - sq - grip["extra"], yaw, pitch))
+    the_grip = lambda: grip.get("G") or g["grip_plan"]
+    grip_yaw = lambda: grip["yaw"] if grip.get("G") else g["grip_yaw"]
+    hold = lambda x, y, z: (lambda: plan.m.held_goals(the_grip(), x + grip["dx"], y + grip["dy"], z, grip_yaw()))
     plan.call("secure the grip (test lift)", lambda: _secure_grip(ctx, cx, cy, zg, half, sq, yaw, pitch, free, grip))
-    plan.line("lift", hold(cx, cy, z_cmd)(), free, goals_fn=hold(cx, cy, z_cmd))
+    up = g["others"]                            # straight up: the support it leaves is not in the way
+    try:                                        # planned from the grip-width pose; else the line proven by pre_grasp
+        plan.line("lift", hold(cx, cy, z_cmd)(), up, goals_fn=hold(cx, cy, z_cmd), traj=None if g.get("hold") else g["lines"]["lift"])
+    except SkillError as e:
+        log.warning("lift at the grip width: %s; using the proven lift line", e)
+        plan.line("lift", hold(cx, cy, z_cmd)(), up, goals_fn=hold(cx, cy, z_cmd), traj=g["lines"]["lift"])
     held = {"object": g["object"], "width": g["width"], "dims": g["dims"], "grasp_above_bottom": zg - g["support_z"],
-            "support_z": g["support_z"], "gap_cmd": g["width"] - 2 * sq,
-            "gap_of": lambda: g["width"] - 2 * (sq + grip["extra"]), "pitch": pitch, "clear": g["clear"], "yaw": yaw}
+            "support_z": g["support_z"], "gap_of": lambda: grip["gap"], "pitch": pitch, "clear": g["clear"], "yaw": yaw,
+            "shift": g["grip_shift"], "grip": the_grip}           # the object's centre is this far ahead of the palms (along them)
     _to_state(ctx, plan, "HOLDING", holding=held)
-    plan.attach(cuboid("held", (cx, cy, cz + g["lift"] + M["lift_sag_comp_m"]), g["dims"], g["byaw"]))
+    plan.attach(cuboid("held", (g["center"][0], g["center"][1], cz + g["lift"] + M["lift_sag_comp_m"]), g["dims"], g["byaw"]))
     # draw the object toward the chest along the torso's forward axis: shorter lever, less load (carry pose)
     wy = plan.waist[0]
     pull = min(M["pull_in_m"], max(0.0, math.hypot(cx, cy) - M["min_carry_x_m"]))
@@ -521,6 +924,7 @@ def lift(ctx, plan):
         mk = plan.mark()
         try:
             plan.line("pull in to the carry pose", hold(px, py, z_cmd)(), free, goals_fn=hold(px, py, z_cmd))
+            plan.steps[-1]["optional"] = True   # also skipped at run time if the live line is impossible
         except SkillError:
             plan.restore(mk)
     plan.call("check lift height", lambda: _check_height(ctx, z_lift, "the object did not come up to the lift height"))
@@ -534,11 +938,10 @@ def lift(ctx, plan):
 def set_down(ctx, plan):
     M = ctx.cfg["manipulation"]
     h = plan.state["holding"]
-    left, right = plan.palms()
-    mid, half = (left + right) / 2, float(np.linalg.norm(left - right)) / 2
-    yaw = math.atan2(-(left - right)[0], (left - right)[1])
-    z = h["support_z"] + h["grasp_above_bottom"] + M["place_clear_m"]
-    plan.line("set down", _hands(mid[0], mid[1], z, half, yaw, keep=True), [])
+    mid, yaw = plan.m.object_frame(*plan.palms())
+    floor = h["support_z"] + h["grasp_above_bottom"] - M["land_overrun_m"]   # never below where it came from
+    plan.call("set down until it sits on something", lambda: _lower_until_contact(
+        ctx, lambda: mid[:2], floor, _held(ctx.motion, h, yaw), [], fast=False))
     plan.attached = None
     _to_state(ctx, plan, "GRIPPING", holding=None)
     return {"set_down": h["object"]}
@@ -553,7 +956,12 @@ def retreat(ctx, plan):
     mid, half = (left + right) / 2, float(np.linalg.norm(left - right)) / 2
     yaw = math.atan2(-(left - right)[0], (left - right)[1])
     world = [g["table"]] + g["others"] if g else []
+    clear = list(world)
+    if g:                                       # the object between the gloves, where it is now (set down elsewhere
+        bottom = mid[2] - (g["zg"] - g["support_z"])         # than it was found): the hands rise clear of it
+        clear.append(cuboid(g["object"], (mid[0], mid[1], bottom + g["dims"][2] / 2), g["dims"], yaw))
     plan.attached = None
+    plan.call("stop squeezing", lambda: _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0))
     for extra in (M["retreat_open_m"], 0.02, 0.01):  # as far as the neighbours allow
         opened = half + extra
         mk = plan.mark()
@@ -565,21 +973,26 @@ def retreat(ctx, plan):
     else:                                       # pressed against a neighbour in the model: lift straight up
         opened = half                           # instead, checked against the support only
         lines = [g["table"]] if g else []
-        _back_to_ready(ctx, plan, lines, mid[0], mid[1], mid[2], opened, yaw, 0.0, True, ready_world=world)
+        _back_to_ready(ctx, plan, lines, mid[0], mid[1], mid[2], opened, yaw, 0.0, True, ready_world=world, clear=clear)
         _to_state(ctx, plan, "EMPTY", grasp=None, grip=None)
         return {"retreated": True, "opened": False}
-    _back_to_ready(ctx, plan, world, mid[0], mid[1], mid[2], opened, yaw, 0.0, True)
+    _back_to_ready(ctx, plan, world, mid[0], mid[1], mid[2], opened, yaw, 0.0, True, clear=clear)
     _to_state(ctx, plan, "EMPTY", grasp=None, grip=None)
     return {"retreated": True}
 
 
-def _back_to_ready(ctx, plan, world, x, y, z, half, yaw, pitch, keep, ready_world=None):
+def _back_to_ready(ctx, plan, world, x, y, z, half, yaw, pitch, keep, ready_world=None, clear=None, before_waist=None):
     """From open gloves around an object: straight up as far as reachable, straight back toward the chest
     out of the object's area, then the ready pose planned around everything (the straight moves cannot
     fail to be tried; only the last free move needs a plan)."""
     M = ctx.cfg["manipulation"]
     wy = plan.waist[0]
-    for rise in (0.08, 0.04, 0.02, 0.0):
+    # first up until the gloves' lowest point clears every object top around the hands (a fixed 8 cm left the
+    # gloves beside a just-placed 9 cm box, and drawing back dragged it off the stack)
+    tops = [c["pose"][2] + c["dims"][2] / 2 for c in (clear or world) if c["name"] != "table"
+            and math.hypot(c["pose"][0] - x, c["pose"][1] - y) < 0.25]
+    need = max(tops, default=-1.0) + M["retreat_clear_m"] - (z - _glove()["below"])
+    for rise in ([need] if need > 0.08 else []) + [0.08, 0.04, 0.02, 0.0]:
         mk = plan.mark()
         try:
             if rise:
@@ -589,28 +1002,38 @@ def _back_to_ready(ctx, plan, world, x, y, z, half, yaw, pitch, keep, ready_worl
             plan.restore(mk)
     else:
         rise = 0.0
-    for back in (0.12, 0.08, 0.04):
-        mk = plan.mark()
-        try:
-            plan.line("draw the hands back", _hands(x - math.cos(wy) * back, y - math.sin(wy) * back, z + rise, half,
-                                                    yaw, pitch, keep=keep), world)
-            break
-        except SkillError:
-            plan.restore(mk)
     goal = dict(plan.q)
     goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
-    for wld, margin in ((ready_world or world, M["near_margin_m"]), (ready_world or world, 0.0), (world, 0.0)):
-        mk = plan.mark()
-        try:
-            plan.to_joint("ready pose", goal, wld, margin=margin)
-            break
-        except SkillError as e:
-            plan.restore(mk)
-            last = e
-    else:
+
+    def to_ready():
+        for wld, margin in ((ready_world or world, M["near_margin_m"]), (ready_world or world, 0.0), (world, 0.0)):
+            mk = plan.mark()
+            try:
+                plan.to_joint("ready pose", goal, wld, margin=margin)
+                return None
+            except SkillError as e:
+                plan.restore(mk)
+                last = e
+        return last
+    # from above everything straight to ready (a collision-checked joint path, else up and over); drawing the
+    # open hands back first, keeping their angle, bent the wrists to their limit (92 deg): only if needed
+    last = to_ready()
+    if last is not None:
+        for back in (0.12, 0.08, 0.04):
+            mk = plan.mark()
+            try:
+                plan.line("draw the hands back", _hands(x - math.cos(wy) * back, y - math.sin(wy) * back, z + rise,
+                                                        half, yaw, pitch, keep=keep), world)
+                break
+            except SkillError:
+                plan.restore(mk)
+        last = to_ready()
+    if last is not None:
         raise last
-    plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
-    plan.call("relax the wrists", lambda: _relax_wrists(ctx))
+    plan.call("relax the wrists", lambda: _relax_wrists(ctx))   # before the waist turns: a wrist pressed off its
+    if before_waist:                                             # (e.g. the placed-object check, still facing it)
+        plan.call(*before_waist)
+    plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])   # command tripped the guard (run 24)
 
 
 WRISTS = (19, 20, 21, 26, 27, 28)
@@ -627,44 +1050,23 @@ def _relax_wrists(ctx):
     ctx.agent("play_upperbody", {"keyframes": [{"t": 0.5, "q": q}], "interp": "linear"}, timeout=15)
 
 
-def _come_down_beside(ctx, plan, cx, cy, zg, half, yaw, pitch, world):
-    """Bring the palms down beside the object, as far off its faces as fits between its neighbours
-    (approach_far_m, first that plans), from the highest approach_rise_m above the grasp height that is
-    reachable (that move keeps the transit margin; the short descent the near margin)."""
-    M = ctx.cfg["manipulation"]
-    last = None
-    for far in M["approach_far_m"]:
-        mk = plan.mark()
-        try:
-            for rise in M["approach_rise_m"]:
-                try:
-                    plan.to_pose("palms above, beside the box", _hands(cx, cy, zg + rise, half + far, yaw, pitch), world)
-                    break
-                except SkillError:
-                    plan.restore(mk)
-            plan.to_pose("lower beside the box", _hands(cx, cy, zg, half + far, yaw, pitch), world,
-                         margin=M["near_margin_m"])
-            return far
-        except SkillError as e:
-            plan.restore(mk)
-            last = e
-    raise last
-
-
 def _map_scene(ctx, exclude):
     """Depth obstacle map for this skill from a fresh frame (live robot only; offline checks plan with the
     fitted cuboids alone). exclude: every found object (each is planned around as its fitted cuboid, which
     is tighter than the map's surfaces); the map covers everything else (the support, its rim, unknowns)."""
     if ctx.camera is None or ctx.geometry is None:
         return None
-    return ctx.motion.build_map(ctx.camera.fine(), ctx.geometry, exclude)
+    # the support around every found object is cut out too (it is the table slab, with its own small margin): the
+    # whole plan is built up front and uses the LAST map for its live re-plans, so a map built for one skill (place)
+    # must still let the hands rest low beside the object picked earlier (it made every live close-in fail)
+    cuts = [_support_cut(ctx, v) for v in ctx.bb["objects"].values()]
+    return ctx.motion.build_map(ctx.camera.fine(), ctx.geometry, list(exclude) + cuts)
 
 
 def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
-    """Squeeze by feel: close the gloves in small straight steps. Each hand stops as soon as IT touches (it
-    lags its command sideways by contact_lag_m more than before closing) while the other keeps closing; then
-    both press grip_preload_m, centred where they found the object. The force is set by the preload, whatever
-    the glove/object model errors; closing far past the faces without contact means the object is not there."""
+    """Close the gloves in one straight move until a hand touches (it lags its command sideways by
+    contact_lag_m more than before closing), then squeeze by force (_press), which also brings the other hand
+    onto the object. Closing far past the faces without contact means the object is not there."""
     M = ctx.cfg["manipulation"]
     m = ctx.motion
     axis = np.array([-math.sin(yaw), math.cos(yaw)])
@@ -676,79 +1078,165 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
         return (float(np.dot(lc[:2] - c, axis)), float(-np.dot(rc[:2] - c, axis)),
                 float(np.dot(lm[:2] - lc[:2], axis)), float(np.dot(rc[:2] - rm[:2], axis)), lm, rm)
 
-    def goals(hl, hr, centre):
-        left, right = _hands(centre[0], centre[1], zg, hl, yaw, pitch), _hands(centre[0], centre[1], zg, hr, yaw, pitch)
+    def goals(hl, hr, centre, z=zg):
+        left, right = _hands(centre[0], centre[1], z, hl, yaw, pitch), _hands(centre[0], centre[1], z, hr, yaw, pitch)
         return {"left_tcp": left["left_tcp"], "right_tcp": right["right_tcp"]}
+
+    def stalled(name, palm, side):              # a hand stopped well outside the face: not the object
+        out = side * float(np.dot(palm[:2] - c, axis)) - half
+        if out > M["contact_early_m"]:
+            raise SkillError(f"the {name} hand stopped {out * 100:.0f} cm outside the object's face: "
+                             f"blocked by something else")
 
     time.sleep(M["close_settle_s"])
     hl, hr, base_l, base_r, lm, rm = state()
-    touch_l = touch_r = False
-    while not (touch_l and touch_r):
-        _check_heat(ctx)
-        if not touch_l:
-            hl -= M["close_step_m"]
-        if not touch_r:
-            hr -= M["close_step_m"]
-        if min(hl, hr) < half - sq - M["close_overrun_m"]:
+    for name, lag in (("left", base_l), ("right", base_r)):
+        if lag > M["blocked_lag_m"]:
+            raise SkillError(f"the {name} hand is already held {lag * 100:.0f} cm back before closing: blocked")
+    # one straight close toward the faces (to close_overrun_m past them), played in short pieces and stopped
+    # as soon as either hand touches; the force squeeze then closes the other hand onto the object (stepping
+    # each hand with its own plan took 5-8 s with the arms out: the heat budget of the whole task)
+    p = _contact_plan(m)
+    # aim at the planned squeeze (pre_grasp proved that straight line); further in, the gloves nearly meet
+    # and the wrists flip ("close in: the arm would flip at 100%")
+    proven = (grip.get("lines") or {}).get("squeeze")       # the squeeze line pre_grasp proved, if we are on it
+    if proven and max(abs(p.q[m.idx[n]] - v) for n, v in zip(proven["joint_names"], proven["positions"][0])) < math.radians(2):
+        p.steps.append({"kind": "traj", "line": True, "label": "close in", "traj": proven})
+    else:
+        # not where the plan expected (e.g. the gloves came to rest on the support a little above the planned
+        # height): close in sideways at the height the hands are at, not back down to the planned one
+        lc, rc = m.palms(m.q_now(commanded=True))
+        z_live, last = float(lc[2] + rc[2]) / 2, None
+        for z in ([z_live, zg] if abs(z_live - zg) > 0.005 else [zg]):
+            try:
+                _line_or_free(p, "close in", goals(half - sq, half - sq, c, z), world)
+                break
+            except SkillError as e:
+                last = e
+        else:
+            raise last
+        log.info("close in from the live pose at %.1f cm %s the planned height", 100 * abs(z_live - zg),
+                 "above" if z_live > zg else "below")
+    touched, count = {}, {"left": 0, "right": 0}
+    last = {"left": (hl, float(np.dot(lm[:2] - c, axis))), "right": (hr, float(-np.dot(rm[:2] - c, axis)))}
+
+    def touch():
+        """A hand touches when it lags its command sideways AND has nearly stopped closing while the command went on,
+        for two pieces in a row (starting late, or dragging on the table, only slows it: that stopped a close-in
+        4 cm before the object)."""
+        cl, cr, lag_l, lag_r, lm_, rm_ = state()
+        now = {"left": (cl, float(np.dot(lm_[:2] - c, axis))), "right": (cr, float(-np.dot(rm_[:2] - c, axis)))}
+        for name, lag, palm, side in (("left", lag_l - base_l, lm_, 1), ("right", lag_r - base_r, rm_, -1)):
+            closed_cmd, closed = last[name][0] - now[name][0], last[name][1] - now[name][1]
+            stopped = closed_cmd > 0.003 and closed < M["descent_follow_min"] * closed_cmd
+            count[name] = count[name] + 1 if lag >= M["contact_lag_m"] and stopped else 0
+            log.info("close %s: lag %.1f mm, last piece in %.1f of %.1f mm", name, 1000 * lag, 1000 * closed,
+                     1000 * closed_cmd)
+            if count[name] >= 2:
+                stalled(name, palm, side)
+                touched[name] = True
+        last.update(now)
+        return bool(touched)
+    if not m.execute(p.steps[-1]["traj"], holding=True, slowdown=M["close_slowdown"], stop=touch) and not touch():
+        time.sleep(M["close_settle_s"])        # the move ended: a hand still held back from its command is against it
+        _, _, lag_l, lag_r, _, _ = state()
+        if max(lag_l - base_l, lag_r - base_r) < M["contact_lag_m"]:
             raise SkillError("closed past the measured faces without touching: the object is not where the camera put it")
-        p = ArmPlan(m)
-        p.line("close in", goals(hl, hr, c), world)
-        m.execute(p.steps[-1]["traj"], holding=True)
-        time.sleep(M["close_settle_s"])
-        _, _, lag_l, lag_r, lm, rm = state()
-        touch_l = touch_l or lag_l - base_l >= M["contact_lag_m"]
-        touch_r = touch_r or lag_r - base_r >= M["contact_lag_m"]
-    # both touch: centre on the object as the hands found it, press only the preload
-    gap = float(np.dot(lm[:2] - rm[:2], axis))
-    mid = (lm[:2] + rm[:2]) / 2
-    shift = mid - c
-    grip["dx"], grip["dy"] = float(shift[0]), float(shift[1])
-    hold = max(M["min_squeeze_gap_m"] / 2, gap / 2 - M["grip_preload_m"])
-    grip["extra"] = (half - sq) - hold
-    p = ArmPlan(m)
-    p.line("light squeeze", goals(hold, hold, mid), world)
-    m.execute(p.steps[-1]["traj"], holding=True)
-    return {"contact_gap_m": round(gap, 3), "hold_gap_m": round(2 * hold, 3), "centre_shift_m": [round(float(v), 3) for v in shift]}
+    return _press(ctx, cx, cy, half, sq, yaw, grip, M["squeeze_n"])
 
 
-def _settle_grip(ctx, cx, cy, zg, half_cmd, yaw, pitch, world, grip):
-    """The squeeze aims past the faces and the object stops the hands somewhere before that (glove and
-    object models are never exact). Re-aim each hand grip_preload_m past where it actually stopped, centred
-    where the hands found the object: a light, repeatable squeeze force for any object, no overheating."""
+def _grip_force(ctx, squeeze_n=None, payload_kg=None):
+    """Set the agent's squeeze force (N per hand, the palms pushing toward each other) and/or the held mass
+    it carries in the feedforward, and wait while they ramp."""
+    p = {k: v for k, v in (("squeeze_n", squeeze_n), ("payload_kg", payload_kg)) if v is not None}
+    if squeeze_n == 0.0:
+        ctx.motion.grip = None                  # not squeezing: holding moves no longer follow a grip
+    r = ctx.agent("arm_ff", p)
+    time.sleep(r.get("ramp_s", 0.0) + 0.1)
+    return r
+
+
+def _hold_here(ctx):
+    """Move the arm position command to where the arms are: the position spring stops pushing, so only the
+    feedforward (gravity, payload, squeeze) acts."""
+    s = ctx.link.state()
+    q = {str(j["index"]): round(j["deg"], 2) for j in s["joints"] if 15 <= j["index"] <= 28}
+    ctx.agent("play_upperbody", {"keyframes": [{"t": 0.3, "q": q}], "interp": "linear",
+                                 "recovery": ctx.motion.recovery}, timeout=15)
+
+
+def _close_wrists(ctx):
+    """The second half of the squeeze: with the hard wrist housings on the object, the wrist yaws turn the fingers
+    in (left -, right +: 5 deg = 1.5 cm at the fingertips) so the fingertips press the far corners (the user's pick-up
+    pose, Media 53). Commanded past the contact by wrist_close_deg: the wrist spring keeps them pressing."""
+    d = ctx.cfg["manipulation"]["wrist_close_deg"]
+    if not d:                                   # off: the arms alone squeeze (the user, 2026-10-24)
+        return
+    s = ctx.link.state()
+    cmd = s["arms"].get("q_cmd_deg")
+    q = {str(15 + k): round(v, 2) for k, v in enumerate(cmd[3:17])} if cmd else \
+        {str(j["index"]): round(j["deg"], 2) for j in s["joints"] if 15 <= j["index"] <= 28}
+    q["21"], q["28"] = q["21"] - d, q["28"] + d
+    ctx.agent("play_upperbody", {"keyframes": [{"t": 0.6, "q": q}], "interp": "linear",
+                                 "recovery": ctx.motion.recovery}, timeout=15)
+    time.sleep(ctx.cfg["manipulation"]["press_settle_s"])
+
+
+def _press(ctx, cx, cy, half, sq, yaw, grip, force):
+    """Squeeze by force: the agent pushes each palm toward the other with `force`, and the position command
+    follows the hands to where the object stops them, so the whole force presses the object (a position
+    preload against a mis-detected contact gave no grip at all). The palm gap must then match the object."""
     M = ctx.cfg["manipulation"]
     m = ctx.motion
-    time.sleep(0.4)
+    _grip_force(ctx, squeeze_n=force)
+    for _ in range(M["press_iters"]):
+        time.sleep(M["press_settle_s"])
+        _hold_here(ctx)
+    time.sleep(M["press_settle_s"])
     lm, rm = m.palms(m.q_now(commanded=False))
     axis = np.array([-math.sin(yaw), math.cos(yaw)])
     gap = float(np.dot(lm[:2] - rm[:2], axis))
+    lo, hi = (2 * half + t for t in M["grip_gap_tol_m"])
+    log.info("squeeze %.0f N: palms %.1f cm apart, object measured %.1f cm wide", force, 100 * gap, 200 * half)
+    if not lo <= gap <= hi:
+        raise SkillError(f"squeezing with {force:.0f} N the palms are {gap * 100:.1f} cm apart, the object is "
+                         f"{2 * half * 100:.1f} cm wide: {'nothing between them' if gap < lo else 'held apart by something'}")
     mid = (lm[:2] + rm[:2]) / 2
     shift = mid - np.array([cx, cy])
-    grip["dx"], grip["dy"] = float(shift[0]), float(shift[1])
-    hs = max(M["min_squeeze_gap_m"] / 2, gap / 2 - M["grip_preload_m"])
-    grip["extra"] = half_cmd - hs
-    p = ArmPlan(m)
-    p.line("settle the grip", _hands(mid[0], mid[1], zg, hs, yaw, pitch), world)
-    m.execute(p.steps[-1]["traj"], holding=True)
-    return {"palm_gap_m": round(gap, 3), "hold_gap_m": round(2 * hs, 3), "centre_shift_m": [round(v, 3) for v in shift]}
+    grip.update(dx=float(shift[0]), dy=float(shift[1]), extra=(half - sq) - gap / 2,
+                gap=float(np.linalg.norm(lm - rm)), force=force)
+    _close_wrists(ctx)                          # ...and the fingers: squeezing is both ways (user, Media 53)
+    lw, rw = m.palms(m.q_now(commanded=False))  # the slip reference AFTER the wrists close: turning the hands moves
+    grip["gap"] = float(np.linalg.norm(lw - rw))   # the palm points ~3 cm closer (run 31 read that as a slip)
+    qc = m.q_now(commanded=True)                # = where the hands are (the command follows them), wrists closed
+    m.grip = grip["G"] = m.grip_of(qc)          # the grip, frozen: holding moves only move the object
+    grip["yaw"] = m.object_frame(*m.palms(qc))[1]
+    return {"squeeze_n": force, "palm_gap_m": round(gap, 3), "centre_shift_m": [round(float(v), 3) for v in shift]}
 
 
 def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
-    """Test lift: raise 2 cm, hold, and check the box comes with the hands (height) without slipping
-    (palm gap). If not, put it back down, squeeze 1 cm deeper and try again. Runs live on the robot."""
+    """Test lift: carry the object's weight in the feedforward, raise 2 cm, hold, and check the hands came up
+    without the palms closing in (a slipping object lets the squeeze force push them together). If not, put
+    it back down, squeeze grip_retry_n harder and try again. Runs live on the robot."""
     M = ctx.cfg["manipulation"]
     m = ctx.motion
-    for attempt in range(M["grip_retries"] + 1):
-        hs = half - squeeze - grip["extra"]
+    lm, rm = m.palms(m.q_now(commanded=False))
+    z0 = float(lm[2] + rm[2]) / 2               # where the hands really are (resting gloves sit above the plan)
+    while True:
         gx, gy = cx + grip["dx"], cy + grip["dy"]
-        p = ArmPlan(m)
-        p.line("test lift", _hands(gx, gy, zg + M["test_lift_m"], hs, yaw, pitch), world)
+        _grip_force(ctx, payload_kg=M["payload_kg"])
+        p = _contact_plan(m)
+        up = [w for w in world if w["name"] != "table"]     # straight up cannot hit the support it leaves
+        _line_or_free(p, "test lift", m.held_goals(grip["G"], gx, gy, z0 + M["test_lift_m"], grip["yaw"]), up,
+                      free=False)
         m.execute(p.steps[-1]["traj"], holding=True)
         time.sleep(M["test_hold_s"])
-        left, right = m.palms(m.q_now(commanded=False))
+        (lc, rc), (left, right) = m.palms(m.q_now(commanded=True)), m.palms(m.q_now(commanded=False))
         gap, z = float(np.linalg.norm(left - right)), float(left[2] + right[2]) / 2
-        gap_cmd = 2 * hs
-        ok_gap = gap - gap_cmd >= M["drop_gap_m"]
-        ok_z = z >= zg + M["test_lift_m"] - M["lift_tolerance_m"]
+        ok_gap = grip["gap"] - gap < M["test_slip_m"]   # the palms closing in at all = it starts to slip
+        ok_z = z >= z0 + M["test_lift_m"] / 2    # the hands (and the object between them) really came up
+        log.info("test lift at %.0f N: hands up %.1f cm (of %.1f), palms %.1f cm apart (gripped at %.1f)", grip["force"],
+                 100 * (z - z0), 100 * M["test_lift_m"], 100 * gap, 100 * grip["gap"])
         if ok_gap and ok_z:
             # self-calibration: the gripping palms are centred on the box, so their midpoint (from joint
             # angles) minus the camera's box centre is the camera-to-arm offset along the squeeze axis
@@ -756,14 +1244,22 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
             axis = np.array([-math.sin(yaw), math.cos(yaw)])
             err = float(np.dot(mid[:2] - np.array([cx, cy]), axis))
             ctx.bb["calib"] = {"offset_xy": (axis * err).tolist(), "t": time.time()}
-            return {"extra_squeeze_m": grip["extra"], "palm_gap_m": round(gap, 3), "camera_offset_m": round(err, 3)}
-        if grip["extra"] + M["grip_retry_step_m"] > M["max_extra_squeeze_m"]:
+            if grip["force"] < M["carry_squeeze_n"]:   # held: a firmer squeeze for lifting and turning with it (the
+                _grip_force(ctx, squeeze_n=M["carry_squeeze_n"])   # 2 cm test passed at 12 N, the turn slid it out)
+                grip["force"] = M["carry_squeeze_n"]
+                time.sleep(M["press_settle_s"])     # the slip reference with the firmer squeeze: it compresses the
+                lw, rw = m.palms(m.q_now(commanded=False))   # gloves further (run 35: a held, level box read as slipped)
+                grip["gap"] = float(np.linalg.norm(lw - rw))
+            return {"squeeze_n": grip["force"], "palm_gap_m": round(gap, 3), "camera_offset_m": round(err, 3),
+                    "hands_above_command_m": round(z - float(lc[2] + rc[2]) / 2, 4)}   # >0: weight over-assumed
+        if grip["force"] + M["grip_retry_n"] > M["max_squeeze_n"]:
             break
-        p = ArmPlan(m)                          # back down, squeeze a little deeper, retry
-        grip["extra"] += M["grip_retry_step_m"]
-        p.line("set back down", _hands(gx, gy, zg, half - squeeze - grip["extra"], yaw, pitch), world)
+        _grip_force(ctx, payload_kg=0.0)        # back down, squeeze harder, retry
+        p = _contact_plan(m)
+        _line_or_free(p, "set back down", m.held_goals(grip["G"], gx, gy, z0 + 0.003, grip["yaw"]), up, free=False)
         m.execute(p.steps[-1]["traj"], holding=True)
-    raise SkillError("could not get a secure grip on the box (it slips in the test lift)")
+        _press(ctx, cx, cy, half, squeeze, yaw, grip, grip["force"] + M["grip_retry_n"])
+    raise SkillError(f"could not get a secure grip on the box (it slips in the test lift at {grip['force']:.0f} N)")
 
 
 def _calibrated(ctx, plan, x, y):
@@ -783,7 +1279,7 @@ def _palm_mids(ctx):
     return (lc + rc) / 2, (lm + rm) / 2, float(np.linalg.norm(lc - rc)) / 2
 
 
-def _align_over(ctx, live_xy, z, yaw, h, keep, world, corr):
+def _align_over(ctx, live_xy, z, yaw, h, world, corr):
     """Closed loop: move until the MEASURED palm midpoint (= box centre) is over the target centre."""
     M = ctx.cfg["manipulation"]
     for _ in range(M["align_iters"]):
@@ -793,39 +1289,350 @@ def _align_over(ctx, live_xy, z, yaw, h, keep, world, corr):
         corr["xy"] = cmd[:2] - meas[:2]
         if np.linalg.norm(err) < M["align_tol_m"]:
             break
-        p = ArmPlan(ctx.motion)
-        p.attached = None
-        p.line("line up", _hands(*(cmd[:2] + err), z, half, yaw, h.get("pitch", 0), keep=keep), world)
+        p = _contact_plan(ctx.motion)
+        try:
+            _line_or_free(p, "line up", _held(ctx.motion, h, yaw)(*(cmd[:2] + err), z), world, free=False)
+        except SkillError as e:                 # a refinement only: lower from here rather than fail the task
+            log.warning("line up skipped (%.1f cm off): %s", 100 * float(np.linalg.norm(err)), e)
+            break
         ctx.motion.execute(p.steps[-1]["traj"], holding=True)
     _, meas, _ = _palm_mids(ctx)
     return {"error_m": round(float(np.linalg.norm(np.array(live_xy()) - meas[:2])), 4),
             "correction_m": [round(float(v), 4) for v in corr["xy"]]}
 
 
-def _gentle_release(ctx, yaw, h, keep, world, corr):
-    """Stop pressing down, open the palms a little and slowly, lift away, then open fully."""
-    M = ctx.cfg["manipulation"]
+def _contact_plan(m):
+    """A live plan for a contact move (closing on, lifting, lowering, letting go of an object): from the arms'
+    pose now, without a held object, checked against the measured cuboids only (see ArmPlan.use_map)."""
+    p = ArmPlan(m)
+    p.attached = None
+    p.use_map = False
+    return p
+
+
+def _line_or_free(p, label, goals, world, free=True):
+    """A straight move, or if that is impossible from the real pose, a free collision-checked path to the
+    same goal (live contact steps must not fail on one marginal line). free=False while an object is held:
+    a contact plan has no held object and its world leaves out what the object lands on, so a free path can
+    sweep the object through it (runs 10 and 11: the held box pushed into the target box while lowering)."""
+    mk = p.mark()
+    try:
+        p.line(label, goals, world)
+    except SkillError as e:
+        if not free:
+            raise
+        p.restore(mk)
+        log.warning("'%s': %s; using a free path", label, e)
+        p.to_pose(label, goals, world, margin=p.m.cfg["manipulation"]["contact_free_margin_m"])
+
+
+def _photo(ctx, tag):
+    """Save the head camera's colour image now (logs/runs/<time>_<tag>.png): evidence of an unexpected touch."""
+    try:
+        f = ctx.camera.fine() if ctx.camera else None
+        if f is not None:
+            path = config.path("logs/runs") / f"{time.strftime('%Y%m%d_%H%M%S')}_{tag}.png"
+            cv2.imwrite(str(path), f.rgb)
+            log.info("photo: %s", path)
+    except Exception as e:                      # never let a diagnostic photo break a recovery
+        log.warning("photo failed: %s", e)
+
+
+def _zlag(ctx):
+    """How far the palms are above their command (they stop following it down once the object touches)."""
     m = ctx.motion
-    pitch = h.get("pitch", 0)
-    time.sleep(0.3)
-    cmd, meas, half = _palm_mids(ctx)
-    xy, zc = cmd[:2], float(meas[2]) + 0.003          # command at the contact height: no downward press
-    for label, hw, zz in (("ease off", half, zc),
-                          ("open a little", h["width"] / 2 + M["release_open_m"], zc),
-                          ("lift hands", h["width"] / 2 + M["release_open_m"], zc + M["release_lift_m"]),
-                          ("open fully", h["width"] / 2 + h["clear"], zc + M["release_lift_m"])):
-        p = ArmPlan(m)
-        p.line(label, _hands(*xy, zz, hw, yaw, pitch, keep=keep), world)
-        m.execute(p.steps[-1]["traj"], holding=True)    # slow playback
-    return {"released_at_z": round(zc, 3)}
+    (lc, rc), (lm, rm) = m.palms(m.q_now(commanded=True)), m.palms(m.q_now(commanded=False))
+    return float(lm[2] + rm[2] - lc[2] - rc[2]) / 2
 
 
-def _check_gap(ctx, gap_cmd, msg):
+def _lower_until_contact(ctx, xy_fn, z_floor, goals_at, world, fast=True, proven=None):
+    """Lower the held object straight down, slowly and in short pieces, until it sits on whatever is under it:
+    the hands stop following their command down (land_lag_m). Then the command moves to where the hands
+    stopped, so they never press down after landing (pressing on after an early landing slid the gloves down
+    the box onto the one below). Fails if nothing is touched before z_floor. `proven`: the planned lowering
+    (continuous by construction): played when the arms are at its start; if a lowering from where the arms are
+    (e.g. after a line-up) cannot be planned, the arms go back to its start and play it instead."""
+    M, m = ctx.cfg["manipulation"], ctx.motion
+
+    def at_start():
+        now = np.array([m.q_now()[m.idx[n]] for n in proven["joint_names"]])
+        return np.degrees(np.abs(now - np.array(proven["positions"][0]))).max() < 2.0
+
+    def play_proven():
+        time.sleep(M["close_settle_s"])
+        base = _zlag(ctx)
+        if m.execute(proven, holding=True, slowdown=M["lower_slowdown"],
+                     stop=lambda: _zlag(ctx) - base >= M["land_lag_m"]):
+            _hold_here(ctx)
+            return {"landed_lag_m": round(_zlag(ctx) - base, 4), "path": "planned"}
+        return None                             # at the planned height without touching: the rest slowly
+
+    if proven is not None and at_start():
+        r = play_proven()
+        if r:
+            return r
+        return _lower_live(ctx, xy_fn, z_floor, goals_at, world, fast=False)
+    try:
+        return _lower_live(ctx, xy_fn, z_floor, goals_at, world, fast)
+    except SkillError as e:
+        if proven is None or "without touching" in str(e) or "arm motion failed" in str(e):
+            raise                               # only a lowering that cannot be PLANNED falls back (a blocked or
+        log.warning("lowering from here is impossible (%s): back to the start of the planned lowering", e)  # hot arm: recover)
+    p = _contact_plan(m)
+    goal = dict(p.q)
+    goal.update({m.idx[n]: v for n, v in zip(proven["joint_names"], proven["positions"][0])})
+    turn = max(abs(math.degrees(goal[i] - p.q[i])) for i in goal)
+    if turn > M["back_to_lowering_max_deg"]:    # its path is not checked for the held object: short moves only
+        raise SkillError(f"lowering impossible from here and the planned lowering is {turn:.0f} deg away")
+    gap0, gap = (float(np.linalg.norm(np.subtract(*m.palms(q)))) for q in (goal, p.q))
+    if abs(gap - gap0) > 0.01:                  # planned at the modelled squeeze gap: it would crush the object
+        raise SkillError(f"lowering impossible from here and the planned lowering holds the object "
+                         f"{100 * gap0:.1f} cm wide (gripped at {100 * gap:.1f})")
+    p.to_joint("back to the planned lowering", goal, world, margin=0.0)
+    m.execute(p.steps[-1]["traj"], holding=True)
+    return play_proven() or _lower_live(ctx, xy_fn, z_floor, goals_at, world, fast=False)
+
+
+def _lower_live(ctx, xy_fn, z_floor, goals_at, world, fast=True):
+    """_lower_until_contact planned from where the arms are now."""
+    M, m = ctx.cfg["manipulation"], ctx.motion
+    z_slow = z_floor + M["land_overrun_m"] + M["lower_fast_above_m"]   # just above where it should touch
+    lc, rc = m.palms(m.q_now())
+    if fast and (lc[2] + rc[2]) / 2 > z_slow + 0.005:   # the way down to there at normal speed (only when
+                                                        # the surface height is known: not for a set-down)
+        p = _contact_plan(m)
+        _line_or_free(p, "lower", goals_at(*xy_fn(), z_slow), world, free=False)
+        m.execute(p.steps[-1]["traj"], holding=True)
+    time.sleep(M["close_settle_s"])
+    base = _zlag(ctx)
+    lc, rc = m.palms(m.q_now())
+    z_now = float(lc[2] + rc[2]) / 2
+    for z_end in [z_floor + k * 0.03 for k in range(8) if z_floor + k * 0.03 < z_now - 0.02] or [z_floor]:
+        p = _contact_plan(m)                    # as far down as can be planned: it stops where it touches anyway
+        try:
+            _line_or_free(p, "lower until contact", goals_at(*xy_fn(), z_end), world, free=False)
+            break
+        except SkillError as e:
+            last = e
+    else:
+        raise last
+    landed = m.execute(p.steps[-1]["traj"], holding=True, slowdown=M["lower_slowdown"],
+                       stop=lambda: _zlag(ctx) - base >= M["land_lag_m"])
+    if not landed:
+        time.sleep(M["close_settle_s"])
+        landed = _zlag(ctx) - base >= M["land_lag_m"]
+    if not landed:
+        raise SkillError("lowered past where the surface should be without touching it")
+    _hold_here(ctx)
+    return {"landed_lag_m": round(_zlag(ctx) - base, 4)}
+
+
+def _come_down(ctx, plan, up, down, world, labels=("grasp pose", "palms above the object", "come down beside the object")):
+    """Plan the move to above the object and the straight descent beside it, bottom-up: an arm configuration
+    at the bottom (IK), the straight line from it up to the top, played in reverse. The descent is then
+    continuous to the very bottom (a line planned down from whatever configuration the top pose got ran into a
+    joint limit part way), and the free move (transit margin) goes to its top. Returns 2 (stages done) or raises
+    a SkillError; stage numbers let pre_grasp report the candidate that got furthest."""
+    M = ctx.cfg["manipulation"]
+    bottom = plan.ik(labels[0], down, world, margin=M["descent_margin_m"])
+    probe = ArmPlan(plan.m, start=bottom)
+    probe.attached = plan.attached
+    probe.line(labels[2], up, world, margin=M["descent_margin_m"])
+    rise = probe.steps[-1]["traj"]
+    top = plan.m.end_q(bottom, rise)
+    margins = (M["transit_margin_m"], M["near_margin_m"], M["min_free_margin_m"])
+    for k, margin in enumerate(margins):        # cramped: a little closer, never 0 (an object close to the chest
+        try:                                    # puts an elbow ~1 cm over its neighbour: run 15)
+            plan.to_joint(labels[1], top, world, margin=margin)
+            if k:
+                log.info("'%s' planned with only %.1f cm clearance", labels[1], 100 * margin)
+            break
+        except SkillError:
+            if k == len(margins) - 1:
+                raise
+    plan.line(labels[2], down, world, margin=M["descent_margin_m"], traj={**rise, "positions": rise["positions"][::-1]})
+    return 2
+
+
+def _descend(ctx, traj, down, up, world, top=None):
+    """Come straight down beside the object, touch-checked: played in short pieces, stopped as soon as a glove
+    stops following down (it met an edge: the space is tighter than the camera measured). Then it goes back
+    up the same line and refuses, rather than pushing anything."""
+    M, m = ctx.cfg["manipulation"], ctx.motion
+    p = ArmPlan(m)
+    p.attached = None
+    now = np.array([p.q[m.idx[n]] for n in traj["joint_names"]])
+    if np.degrees(np.abs(now - np.array(traj["positions"][0]))).max() > 2.0:   # not where planned: same line, live
+        p.line("come down beside the object", down, world, margin=M["descent_margin_m"])
+        traj = p.steps[-1]["traj"]
+    time.sleep(M["close_settle_s"])
+
+    def heights():                              # each palm's commanded and measured height
+        (lc, rc), (lm, rm) = m.palms(m.q_now(commanded=True)), m.palms(m.q_now(commanded=False))
+        return {"left": (float(lc[2]), float(lm[2])), "right": (float(rc[2]), float(rm[2]))}
+    start = heights()
+    base = {k: zm - zc for k, (zc, zm) in start.items()}
+    last = dict(start)
+    hit, count = {}, {"left": 0, "right": 0}
+    below = _glove()["below"]
+
+    def touched():
+        """Blocked = the hand stopped going down for two pieces in a row: it lags its command AND hardly moved
+        down while the command did (rubbing along a face only slows it), or it lags far behind. Not while its
+        lowest point is still above every object top around (there is nothing to meet up there: a soft arm
+        starting to move lags its command, which stopped two descents at their very start)."""
+        now = heights()
+        for side, (zc, zm) in now.items():
+            lag = zm - zc - base[side]
+            drop_cmd, drop = last[side][0] - zc, last[side][1] - zm
+            log.info("descent %s: lag %.1f mm, last piece down %.1f of %.1f mm", side, 1000 * lag, 1000 * drop,
+                     1000 * drop_cmd)
+            stopped = drop_cmd > 0.004 and drop < M["descent_follow_min"] * drop_cmd
+            near = top is None or zm - below < top + 0.01
+            blocked = (lag >= M["land_lag_m"] and stopped and near) or lag >= M["descent_block_lag_m"]
+            count[side] = count[side] + 1 if blocked else 0
+            if count[side] >= 2:
+                hit[side] = lag
+        last.update(now)
+        return bool(hit)
+    if not m.execute(traj, slowdown=M["descent_slowdown"], stop=touched):
+        lagged = {k: zm - zc - base[k] for k, (zc, zm) in heights().items()}
+        if max(lagged.values()) > M["land_lag_m"] / 2:   # resting on the support: stop pressing into it
+            _hold_here(ctx)
+        log.info("descent done, lags at the bottom %s", {k: round(1000 * v, 1) for k, v in lagged.items()})
+        return {"descended": True}
+    lm, rm = m.palms(m.q_now(commanded=False))
+    above = (lm[2] + rm[2]) / 2 - down["left_tcp"]["position"][2]
+    contact = top - ((lm[2] + rm[2]) / 2 - M["palm_below_m"]) if top is not None else 0.0
+    if above < M["land_lag_m"] * 1.5 or (above <= M["rest_high_max_m"] and contact >= M["min_palm_contact_m"]):
+        # down, or resting on something just below (a rail, the case edge) with enough palm still on the
+        # object: grip from here (the close-in works from where the hands are)
+        _hold_here(ctx)
+        log.info("descent: %s glove rests %.1f cm above the grasp height, %.1f cm of palm on the object: gripping "
+                 "from here", " and ".join(sorted(hit)), 100 * above, 100 * contact)
+        return {"descended": True, "touched": sorted(hit), "above_m": round(float(above), 3)}
+    _hold_here(ctx)
+    _photo(ctx, "descent_touch")                # what the glove met, before backing off
+    back = _contact_plan(m)                     # straight back up the way it came (it may rest on an edge)
+    _line_or_free(back, "back up", up, world)
+    m.execute(back.steps[-1]["traj"])
+    raise SkillError(f"the {' and '.join(sorted(hit))} glove met something {above * 100:.0f} cm above the grasp "
+                     f"height: the space beside the object is tighter than measured")
+
+
+def _take_off(ctx, world):
+    """Let go of an object that rests on something: no push anywhere (command = where the hands are), no
+    carried weight, no squeeze, then each glove straight outward along the line between the palms; if a
+    glove meets something (the agent holds in place), a smaller opening. The moves are recovery moves, so a
+    blocked first try never leaves the arms stuck. Then _back_to_ready lifts and stows them."""
+    M, m = ctx.cfg["manipulation"], ctx.motion
+    m.recovery, was = True, m.recovery
+    try:
+        _hold_here(ctx)
+        _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0)
+        _hold_here(ctx)
+        lm, rm = m.palms(m.q_now(commanded=False))
+        mid, half = (lm + rm) / 2, float(np.linalg.norm(lm - rm)) / 2
+        yaw = math.atan2(-(lm - rm)[0], (lm - rm)[1])
+        last = None
+        for extra in M["release_open_m"]:
+            try:
+                p = _contact_plan(m)
+                _line_or_free(p, "open the gloves", _hands(mid[0], mid[1], mid[2], half + extra, yaw, keep=True), world)
+                m.execute(p.steps[-1]["traj"], holding=True)
+                return {"opened_m": extra}
+            except SkillError as e:
+                last = e
+                time.sleep(0.3)
+        raise SkillError(f"could not open the gloves: {last}")
+    finally:
+        m.recovery = was
+
+
+def _turn_clear_angle(ctx, plan, h, goal):
+    """The waist yaw (between now and `goal`) up to which the held object, swept around the waist axis at its
+    current height, stays turn_clear_m away from every object taller than its bottom."""
+    M = ctx.cfg["manipulation"]
+    left, right = plan.palms()
+    mid = (left + right) / 2
+    bottom = mid[2] - h["grasp_above_bottom"]
+    yaw0 = math.atan2(-(left - right)[0], (left - right)[1])
+    held = (h["dims"][0] / 2 + M["turn_clear_m"], h["dims"][1] / 2 + M["turn_clear_m"])
+    others = [v for k, v in ctx.bb["objects"].items() if k != h["object"] and v["top_z"] > bottom - M["turn_clear_m"]]
+    w0 = plan.waist[0]
+    n = max(1, int(abs(math.degrees(goal - w0))))
+    for k in range(1, n + 1):
+        d = (goal - w0) * k / n
+        c = (math.cos(d) * mid[0] - math.sin(d) * mid[1], math.sin(d) * mid[0] + math.cos(d) * mid[1])
+        for v in others:
+            if _rects_overlap(c, held, yaw0 + d, v["center"][:2], (v["dims"][0] / 2, v["dims"][1] / 2), v.get("yaw", 0.0)):
+                return w0 + (goal - w0) * (k - 1) / n
+    return goal
+
+
+def _rects_overlap(c1, e1, t1, c2, e2, t2):
+    """Oriented rectangles (centre, half sizes, yaw) overlap (separating axis test)."""
+    axes = [(math.cos(t), math.sin(t)) for t in (t1, t1 + math.pi / 2, t2, t2 + math.pi / 2)]
+    d = (c2[0] - c1[0], c2[1] - c1[1])
+    for nx, ny in axes:
+        r = lambda e, t: e[0] * abs(math.cos(t) * nx + math.sin(t) * ny) + e[1] * abs(-math.sin(t) * nx + math.cos(t) * ny)
+        if abs(d[0] * nx + d[1] * ny) > r(e1, t1) + r(e2, t2):
+            return False
+    return True
+
+
+def _turn_carrying(ctx, plan, h, x, y, what, frac, z_high, world, lean=0.0):
+    """Turn the waist toward (x, y) with the object held low as far as it clears everything on the way, then
+    raise it to z_high (hands' height) and finish the turn: the arms are high, and heating fastest, only for
+    the last part of the way."""
+    M = ctx.cfg["manipulation"]
+    lim = math.radians(M["max_face_deg"])
+    goal = max(-lim, min(lim, math.atan2(y, x) * frac))
+    w0 = plan.waist[0]
+    safe = _turn_clear_angle(ctx, plan, h, goal)
+    if safe == goal:
+        plan.waist_to(f"turn waist toward {what}", [goal, 0.0, lean])
+        return
+    part = safe - math.copysign(math.radians(M["turn_margin_deg"]), goal - w0)
+    if (part - w0) * (goal - w0) > 0:
+        plan.waist_to(f"turn waist toward {what} (held low)", [part, 0.0, lean])
+    m = ctx.motion
+
+    def up():                                   # straight up from where the object is (the grip moved rigidly)
+        mid, yaw_now = m.object_frame(*m.palms(m.q_now()))
+        return _held(m, h, yaw_now)(mid[0], mid[1], z_high)
+    mid, yaw_p = plan.m.object_frame(*plan.palms())
+    plan.line("raise it over the objects", _held(plan.m, h, yaw_p)(mid[0], mid[1], z_high), world, goals_fn=up)
+    plan.waist_to(f"turn waist toward {what}", [goal, 0.0, lean])
+
+
+def _verify_placed(ctx, x, y, top_expected, dims, on):
+    """The place is DONE only if the camera sees the placed object's top where it should be: the depth points within
+    the object's footprint (shrunk 3 cm) reach top_expected (run 40: every step reported done, but the box had
+    fallen off the target)."""
+    _waist_settled(ctx)
+    frame = ctx.camera.fine()
+    if frame is None:
+        raise SkillError("cannot check the placed object: camera offline")
+    q = ctx.motion.q_now(commanded=False)
+    P = ctx.geometry.points(frame, step=2, T=ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q)))
+    r = max(0.03, min(dims[0], dims[1]) / 2 - 0.03)
+    near = P[np.hypot(P[:, 0] - x, P[:, 1] - y) < r]
+    top = float(np.percentile(near[:, 2], 90)) if len(near) > 30 else None
+    log.info("placed-object check on '%s': top %s, expected %.3f", on, "unseen" if top is None else f"{top:.3f}", top_expected)
+    if top is None or top < top_expected - ctx.cfg["manipulation"]["placed_check_tol_m"]:
+        raise SkillError(f"the object is NOT on '{on}': the camera sees its top at "
+                         f"{'nothing' if top is None else f'{top:.3f} m'} where it should be {top_expected:.3f} m")
+    return {"top_m": round(top, 3)}
+
+
+def _check_gap(ctx, gap_ref, msg):
+    """Slipped: the squeeze force pushed the palms closer together than when they gripped."""
     time.sleep(0.3)
     left, right = ctx.motion.palms(ctx.motion.q_now(commanded=False))
     gap = float(np.linalg.norm(left - right))
-    if gap - gap_cmd < ctx.cfg["manipulation"]["drop_gap_m"]:
-        raise SkillError(f"{msg} (palm gap {gap:.3f} m, commanded {gap_cmd:.3f} m)")
+    if gap_ref - gap >= ctx.cfg["manipulation"]["drop_gap_m"]:
+        raise SkillError(f"{msg} (palm gap {gap:.3f} m, gripped at {gap_ref:.3f} m)")
     return gap
 
 
@@ -847,18 +1654,20 @@ def place(ctx, plan, on):
     if not h:
         raise SkillError("not holding anything")
     left, right = plan.palms()
-    half = float(np.linalg.norm(left - right)) / 2
     target_yaw = h["yaw"]
+    _rebase_objects(ctx)
     if on in ctx.bb["objects"]:                       # stack on another object
         t = ctx.bb["objects"][on]
         x, y, z_s = t["center"][0], t["center"][1], t["top_z"]
         x, y = _calibrated(ctx, plan, x, y)
+        note = _reach_note(ctx, on, x, y, place=True)
         target_yaw = t.get("yaw", 0.0)                # square the box to the one below it
         if abs(target_yaw) > math.radians(M["max_trusted_box_yaw_deg"]):
             target_yaw = 0.0
         world = [cuboid(on, t["center"], t["dims"], target_yaw),
                  _table(ctx, t["support_z"], t.get("support_front_x", t["front_x"] - 0.10), y)]
     else:
+        note = None
         if on not in ctx.bb["surfaces"]:
             find(ctx, on)
         sf = ctx.bb["surfaces"][on]
@@ -867,21 +1676,29 @@ def place(ctx, plan, on):
         world = [_table(ctx, z_s, sf["front_x"], y)]
     z = z_s + h["grasp_above_bottom"] + M["place_clear_m"]
     above = max(z + M["place_above_m"], float(left[2] + right[2]) / 2)  # never below the carry height before arriving
+    sh = h.get("shift", 0.0)                    # the object's centre is this far ahead of the palms' midpoint
+
+    def palms_at(px, py, th):                   # the palms' midpoint that puts the object's centre at (px, py)
+        return px - sh * math.cos(th), py - sh * math.sin(th)
     mid = (left + right) / 2                    # the held box (between the palms) is cut out of the obstacle map
-    _map_scene(ctx, [cuboid(h["object"], (mid[0], mid[1], mid[2] - h["grasp_above_bottom"] + h["dims"][2] / 2),
-                            h["dims"], h["yaw"])]
+    _map_scene(ctx, [cuboid(h["object"], (mid[0] + sh * math.cos(h["yaw"]), mid[1] + sh * math.sin(h["yaw"]),
+                                          mid[2] - h["grasp_above_bottom"] + h["dims"][2] / 2), h["dims"], h["yaw"])]
                + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()])
     last, base, aligned = None, plan.mark(), False
-    for frac in M["face_fractions"]:            # turn toward the target; the lift was verified before this
-        for align in (True, False):             # square the box to the target first, else keep the grip angle
+    leans = [math.radians(d) for d in M["place_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
+    for align in (True, False):                 # squared to the target at ANY waist turn before keeping the grip
+        for frac, lean in [(f, ln) for f in _face_fractions(ctx) for ln in leans]:   # angle (run 36: placed turned)
             plan.restore(base)
-            if frac:
-                _face(ctx, plan, x, y, on, frac)
-            goal = (_hands(x, y, above, half, target_yaw, h.get("pitch", 0)) if align
-                    else _hands(x, y, above, half, plan.waist[0], keep=True))
             try:
-                plan.to_pose("move above the target", goal, world)
-                aligned = align
+                if frac or lean:
+                    _turn_carrying(ctx, plan, h, x, y, on, frac, above, world, lean)
+                th = target_yaw if align else plan.m.object_frame(*plan.palms())[1]
+                px, py = palms_at(x, y, th)
+                held = _held(plan.m, h, th)     # the grip moved rigidly: the box stays level, the hands never turn on it
+                # above the target, then straight down onto it: planned bottom-up (always continuous to the bottom)
+                _come_down(ctx, plan, held(px, py, above), held(px, py, z), world,
+                           labels=("place pose", "move above the target", "lower"))
+                aligned, yaw = align, th
                 break
             except SkillError as e:
                 last = e
@@ -890,39 +1707,74 @@ def place(ctx, plan, on):
         break
     else:
         plan.restore(base)
-        raise SkillError(f"cannot bring the box above '{on}': {last}")
-    yaw = target_yaw if aligned else plan.waist[0]
+        raise SkillError(f"cannot bring the box above '{on}': {last}" + (f". {note}" if note else ""))
     keep = not aligned
-    live_half = lambda: float(np.linalg.norm(np.subtract(*ctx.motion.palms(ctx.motion.q_now())))) / 2
-    tx, ty = x, y
-    if plan.state.get("use_calib") and on in ctx.bb["objects"]:
-        raw = ctx.bb["objects"][on]["center"]
-        live_xy = lambda: _calibrated(ctx, plan, raw[0], raw[1])
+    log.info("place on '%s': %s, waist %.0f deg", on, "squared to it" if aligned else "NOT squared (no plan squared)",
+             math.degrees(plan.waist[0]))
+    hx, hy = palms_at(x, y, yaw)                # where the palms go (x, y: where the object's centre goes)
+    if on in ctx.bb["objects"]:                 # where the target is now (the robot may have turned since)
+        live_xy = lambda: palms_at(*_calibrated(ctx, plan, *_obj_xy(ctx, on)), yaw)
     else:
-        live_xy = lambda: (tx, ty)
-    plan.steps[-1]["goals_fn"] = lambda: _hands(*live_xy(), above, live_half(), yaw, h.get("pitch", 0), keep=keep)
-    plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_of"]() if h.get("gap_of") else h["gap_cmd"],
-                                                               f"'{h['object']}' slipped while moving"))
+        live_xy = lambda: (hx, hy)
+    lower = plan.steps.pop()                    # the proven straight lowering: played live below
+    lower["dry"] = True
+    plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_of"](), f"'{h['object']}' slipped while moving"))
     corr = {"xy": np.zeros(2)}                  # commanded - measured palm midpoint (tracking error under load)
-    plan.call("line up over the target", lambda: _align_over(ctx, live_xy, above, yaw, h, keep, world, corr))
-    lower_goal = lambda: _hands(*(np.array(live_xy()) + corr["xy"]), z, live_half(), yaw, h.get("pitch", 0), keep=keep)
-    plan.line("lower", _hands(x, y, z, half, yaw, h.get("pitch", 0), keep=keep), world, goals_fn=lower_goal)
-    plan.call("release gently", lambda: _gentle_release(ctx, yaw, h, keep, world, corr))
-    # planned for feasibility/continuity only; the gentle release above does the real opening
-    plan.to_pose("open hands (check only)", _hands(x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep=keep), world,
-                 margin=0.0)
-    plan.steps[-1]["dry"] = True
-    plan.state["holding"] = None
+    def line_up():
+        r = _align_over(ctx, live_xy, above, yaw, h, world, corr)
+        log.info("line up over '%s': %.1f cm off after aligning (tracking correction %s cm)", on,
+                 100 * r["error_m"], [round(100 * v, 1) for v in r["correction_m"]])
+        return r
+    plan.call("line up over the target", line_up)
+    z_touch = z_s + h["grasp_above_bottom"]     # hands' height once the object sits on the target
+    below = [w for w in world if w["name"] != on]   # the object comes down onto the target
+    plan.call("lower until it sits on the target", lambda: _lower_until_contact(
+        ctx, lambda: np.array(live_xy()) + corr["xy"], z_touch - M["land_overrun_m"], _held(ctx.motion, h, yaw),
+        below, proven=lower["traj"]))
+    plan.steps.append(lower)                    # planned only so the steps after it start from the set-down pose
+    plan.call("let go", lambda: _take_off(ctx, world))
+    plan.attached = None                        # released: it stays on the target (a cuboid there from now on)
     placed = {"center": [x, y, z_s + h["dims"][2] / 2], "dims": h["dims"], "top_z": z_s + h["dims"][2],
-              "support_z": z_s, "front_x": x - h["dims"][0] / 2, "distance_m": math.hypot(x, y)}
+              "support_z": z_s, "front_x": x - h["dims"][0] / 2, "distance_m": math.hypot(x, y), "yaw": yaw}
+    away = world + [cuboid(h["object"], placed["center"], placed["dims"], yaw)]
+    # planned for feasibility/continuity only; the gentle release above does the real opening. The opened pose
+    # must clear the placed object (the move there starts from the squeeze pose, planned inside it, so the path
+    # is not checked against it): the widest opening the live release would also try first
+    for opened in M["release_open_m"]:
+        try:
+            q_open = plan.ik("open hands", _hands(hx, hy, z, h["width"] / 2 + opened, yaw, h.get("pitch", 0), keep=keep),
+                             away, margin=0.0)
+            plan.to_joint("open hands (check only)", q_open, world, margin=0.0)
+            back_world = away
+            break
+        except SkillError as e:
+            last = e
+    else:                                       # no opened pose clear of the placed object in the model (the wrist
+        back_world = world                      # beside it): open against the rest, and still rise clear of it first
+        log.warning("open hands: %s; planning the release without the placed object", last)
+        for opened in M["release_open_m"] + [0.0]:
+            if not opened:                      # none reachable here: the live release opens as far as it can
+                log.warning("open hands: no opened pose reachable; leaving the opening to the live release")
+                break
+            try:
+                plan.to_pose("open hands (check only)", _hands(hx, hy, z, h["width"] / 2 + opened, yaw, h.get("pitch", 0),
+                                                               keep=keep), world, margin=0.0)
+                break
+            except SkillError:
+                continue
+    if opened:
+        plan.steps[-1]["dry"] = True
+    plan.state["holding"] = None
 
     def done():
         ctx.bb["holding"] = None
-        ctx.bb["objects"][h["object"]] = {**placed, "t": time.time()}
+        ctx.bb["objects"][h["object"]] = {**placed, "t": time.time(), "imu_yaw": _pelvis_yaw(ctx)}
     plan.call("released", done)
-    away = world + [cuboid(h["object"], placed["center"], placed["dims"])]
-    _back_to_ready(ctx, plan, away, x, y, z, h["width"] / 2 + h["clear"], yaw, h.get("pitch", 0), keep)
-    _to_state(ctx, plan, "EMPTY", grasp=None, grip=None, holding=None)
+    _to_state(ctx, plan, "EMPTY", grasp=None, grip=None, holding=None)   # empty from here (a later stop: no set_down)
+    plan.call("relax the wrists", lambda: _relax_wrists(ctx))           # stop pushing at once (run 37: left wrist 93 C)
+    _back_to_ready(ctx, plan, back_world, hx, hy, z, h["width"] / 2 + opened, yaw, h.get("pitch", 0), keep, clear=away,
+                   before_waist=("check the object is on the target",
+                                 lambda: _verify_placed(ctx, x, y, z_s + h["dims"][2], h["dims"], on)))
     return {"placed": h["object"], "on": on, "height_m": round(z_s, 3)}
 
 
@@ -932,11 +1784,12 @@ def ready(ctx, plan):
     if plan.state.get("holding"):
         raise SkillError("holding a box: place it first")
     M = ctx.cfg["manipulation"]
+    plan.call("no squeeze force", lambda: _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0))
     goal = dict(plan.q)
     goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
     plan.to_joint("ready pose", goal, [])
-    plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])
-    plan.call("relax the wrists", lambda: _relax_wrists(ctx))
+    plan.call("relax the wrists", lambda: _relax_wrists(ctx))   # before the waist turns: a wrist pressed off its
+    plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])   # command tripped the guard (run 24)
     return {"ready": True}
 
 
@@ -946,7 +1799,7 @@ def check_holding(ctx):
     h = ctx.bb["holding"]
     if not h:
         return {"holding": None}
-    gap = _check_gap(ctx, h["gap_of"]() if h.get("gap_of") else h["gap_cmd"], f"'{h['object']}' slipped out of the hands")
+    gap = _check_gap(ctx, h["gap_of"](), f"'{h['object']}' slipped out of the hands")
     return {"holding": h["object"], "palm_gap_m": round(gap, 3)}
 
 

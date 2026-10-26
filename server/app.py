@@ -3,6 +3,7 @@
 Run: scripts/run_server.sh
 """
 import base64
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -26,11 +27,22 @@ from .skills import Ctx
 from .tracking import Tracking
 
 CFG = config.load()
+logging.basicConfig(level=CFG["logging"]["level"], format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)      # one line per request otherwise
 STATIC = Path(__file__).parent / "static"
 FFMPEG = str(Path(sys.executable).parent / "ffmpeg")
 
 app = FastAPI(title="g1ui-server")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.middleware("http")
+async def no_ui_cache(request, call_next):
+    """The browser always loads the current UI files (a cached app.js kept section 3 disabled after a change)."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 link = AgentLink()
 camera = ImageClient()
 vision = Service("vision")

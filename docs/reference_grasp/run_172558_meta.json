@@ -1,0 +1,62 @@
+{
+ "seq": 122682,
+ "t": 1792842960.6411648,
+ "depth_scale": 0.00019999999494757503,
+ "intrinsics": {
+  "fx": 607.6315307617188,
+  "fy": 607.23046875,
+  "ppx": 329.3606262207031,
+  "ppy": 255.4264373779297,
+  "model": "distortion.inverse_brown_conrady",
+  "coeffs": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ]
+ },
+ "joints_deg": {
+  "left_hip_pitch": -20.41,
+  "left_hip_roll": -0.27,
+  "left_hip_yaw": -0.25,
+  "left_knee": 35.92,
+  "left_ankle_pitch": -16.52,
+  "left_ankle_roll": -0.16,
+  "right_hip_pitch": -19.01,
+  "right_hip_roll": 0.13,
+  "right_hip_yaw": 0.2,
+  "right_knee": 35.42,
+  "right_ankle_pitch": -19.45,
+  "right_ankle_roll": 0.43,
+  "waist_yaw": 14.96,
+  "waist_roll": 0.03,
+  "waist_pitch": -1.87,
+  "left_shoulder_pitch": 16.32,
+  "left_shoulder_roll": 13.03,
+  "left_shoulder_yaw": -1.1,
+  "left_elbow": 56.23,
+  "left_wrist_roll": 9.99,
+  "left_wrist_pitch": 1.35,
+  "left_wrist_yaw": -0.63,
+  "right_shoulder_pitch": 16.57,
+  "right_shoulder_roll": -12.76,
+  "right_shoulder_yaw": 1.5,
+  "right_elbow": 56.27,
+  "right_wrist_roll": -5.51,
+  "right_wrist_pitch": 1.17,
+  "right_wrist_yaw": -0.21
+ },
+ "imu": {
+  "pelvis_rpy": [
+   -0.07,
+   1.8,
+   -7.96
+  ],
+  "torso_rpy": [
+   0.53,
+   0.46,
+   27.34
+  ]
+ }
+}

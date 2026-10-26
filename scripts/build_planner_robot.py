@@ -58,8 +58,9 @@ def glove(spheres, tcp, normals, g):
     """Padded gloves: every hand sphere grows by the padding, the fingertip spheres (outer third of the hand
     along x, the finger direction) get copies shifted out by the extra glove finger length, and nothing
     reaches past the glove's flat palm surface (the contact frame) toward the box: the rubber fingertips
-    curl in further than the gloved palm, so those spheres are pushed back to it."""
-    pad, extra = g.get("pad_m", 0.0), g.get("finger_extra_m", 0.0)
+    curl in further than the gloved palm, so those spheres are pushed back to it. Nothing reaches further
+    back than the measured glove thickness (palm surface to back) either."""
+    pad, extra, thick = g.get("pad_m", 0.0), g.get("finger_extra_m", 0.0), g.get("thickness_m")
     for name, t in tcp.items():
         a = t["rpy"][2]                         # the palm surface is twisted about z (see config.tcp_frames)
         rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
@@ -78,6 +79,13 @@ def glove(spheres, tcp, normals, g):
                 r -= excess / 2                     # glove's back padding) stays where it was
                 if r < MIN_R:
                     ctr -= (MIN_R - r) * n
+                    r = MIN_R
+            back = (p0 - ctr) @ n + r - thick if thick else 0.0   # how far it reaches past the glove's back
+            if back > 0:                            # same on the back: the measured palm-to-back thickness
+                ctr += back / 2 * n
+                r -= back / 2
+                if r < MIN_R:
+                    ctr += (MIN_R - r) * n
                     r = MIN_R
             out.append({"center": [round(float(v), 5) for v in ctr], "radius": round(float(r), 5)})
         spheres[link] = out
@@ -125,7 +133,19 @@ def main():
     ign["attached_object"] = sorted(set(ign.get("attached_object", [])) | set(pm["held_object_ignore"]))
     for link, others in pm.get("self_collision_ignore", {}).items():
         ign[link] = sorted(set(ign.get(link, [])) | set(others))
+    for link, others in pm.get("self_collision_check", {}).items():   # checked even where the fit ignores them
+        for a, b in [(link, o) for o in others] + [(o, link) for o in others]:
+            if b in ign.get(a, []):
+                ign[a].remove(b)
+    k["self_collision_buffer"].update(pm.get("self_collision_buffer", {}))
     data["kinematics"]["self_collision_ignore"] = ign
+    if pm.get("cspace"):                        # the posture cuRobo's IK leans toward (natural arms), per-joint weights
+        import math
+        cs, names = pm["cspace"], k["cspace"]["joint_names"]
+        side = lambda n: (n.split("_", 1)[1], 1.0 if n.startswith("left") or "pitch" in n or "elbow" in n else -1.0)
+        k["cspace"]["default_joint_position"] = [math.radians(cs["default_deg"][side(n)[0].replace("_joint", "")] * side(n)[1])
+                                                 for n in names]
+        k["cspace"]["null_space_weight"] = [float(cs["null_space_weight"][side(n)[0].replace("_joint", "")]) for n in names]
     yaml.safe_dump(data, open(yml, "w"), sort_keys=False)
     n = sum(len(v) for v in k["collision_spheres"].values())
     print(f"robot yml: {yml} ({n} spheres, {sum(len(v) for v in ign.values())} ignore pairs)")

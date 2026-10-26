@@ -67,28 +67,50 @@ locomotion:
 arms:
   rate_hz: 50
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
-  playback_slowdown: 2.5         # planned trajectories play this many times slower (1.0 = as planned; slower = less body sway)
-  playback_slowdown_holding: 3.0 # ...and this much slower while holding a box (gentle accelerations)
+  playback_slowdown: 1.5         # planned trajectories play this many times slower (1.0 = as planned; slower = less body
+                                 # sway, but heat grows with time under load: 2.5 kept the arms out ~35-40 s per stack)
+  chunk_s: 0.3                   # moves that may end early (lowering until contact) play in pieces this long
+  playback_slowdown_holding: 1.5 # ...and this much slower while holding a box (3.0 kept the shoulders loaded too
+                                 # long: holding a box out costs ~8 Nm of shoulder pitch, ~1.7 C/s)
   max_arm_turn_deg: 300          # refuse a planned move whose joints of one arm turn more than this in
                                  # total: cuRobo accepts any collision-free IK, incl. arms wrapped over the
                                  # shoulders (that one was ~500-600; standing -> ready is ~180)
   waist_speed_dps: 10            # waist turns while manipulating (20 swung the whole robot)
-  waist_speed_holding_dps: 6     # ...and while holding a box (it fell during a 20 deg/s turn)
+  waist_speed_holding_dps: 10    # ...and while holding a box (it fell during a 20 deg/s turn with the old weak grip)
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
   release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
-  warn_motor_temp_c: 80          # any upper-body motor hotter than this while engaged -> state arms.warning;
+  warn_motor_temp_c: 92          # (80 stopped every stack: a stack adds ~36 C to the shoulder pitch, which idles at
+                                 # 50-55 C; the user approved 92 for the stacking test series, 2026-10-21; revisit
+                                 # with the long-carry solution) any upper-body motor hotter than this while engaged -> state arms.warning;
                                  # the server then opens the hands and backs away (a release while gripping
                                  # dropped the arms around the box and knocked it over)
   max_motor_temp_c: 95           # last resort: arms HOLD IN PLACE (stop pushing; never dropped: a drop wrecked the setup)
   resume_motor_temp_c: 75        # after a hold-in-place, engaging is refused until all are below this
-  max_track_err_deg: 8           # a joint this far from its command (not moving) for max_track_err_s -> hold
-  max_track_err_s: 2             #   in place: it is pushing against something
-  # kp / kd per joint index (12..28). Values from the previous G1, verify on this one.
+  max_push_nm: 8                 # an arm joint pushing this hard against its command (kp x error), moving or not,
+  max_push_s: 1.0                #   for this long is blocked by something -> hold in place (the left upper arm in
+  block_check_s: 0.1             #   the torso pushed 16 Nm, 90 C in 3 s; normal moves ~3 Nm, a grip ~4 Nm)
+  # kp / kd per joint index (12..28), as Unitree's xr_teleoperate under arm_sdk: soft arms (80/3) carried
+  # by a gravity feedforward torque. kp 150 without it heated the shoulders within seconds of any motion
   gains:
     waist: {kp: 300.0, kd: 3.0, joints: [12, 13, 14]}
-    arm:   {kp: 150.0, kd: 4.0, joints: [15, 16, 17, 18, 22, 23, 24, 25]}   # 80 sagged 8 cm holding a box
+    arm:   {kp: 80.0,  kd: 3.0, joints: [15, 16, 17, 18, 22, 23, 24, 25]}
     wrist: {kp: 30.0,  kd: 1.5, joints: [19, 20, 21, 26, 27, 28]}   # 60 kept the left wrist yaw pushing against
                                                                      # the glove cuff a few deg off: 92 C at ready
+  waist_hold_joints: [13, 14]    # waist roll AND PITCH are LOCKED where they were at engage (targets ignored).
+                                 # SAFETY 2026-10-24: with pitch freed, the camera look tilted the torso +15 deg
+                                 # with the arms up; the balance policy stepped and the robot FELL and injured the
+                                 # user. Never free the pitch again without the user's explicit OK. Earlier notes:
+                                 # (as in Unitree's teleop): tilting under arm_sdk fought the balance policy (body
+                                 # sway, waist pitch 79 C). Yaw still turns, slowly (waist_speed_*), to face a
+                                 # target: arms alone can't carry a box sideways without pressing into the torso
+  gravity_ff:                    # arm joint torques that cancel gravity at the commanded pose (URDF masses)
+    enabled: true
+    scale: 1.0
+    glove_kg: 0.15               # per padded work glove (estimate)
+    max_payload_kg: 3.0          # arm_ff payload_kg: a held object's mass, split between the palms
+    max_squeeze_n: 40            # arm_ff squeeze_n: force each palm pushes toward the other (J^T F)
+    squeeze_rate_nps: 30         # the squeeze force ramps at this rate...
+    payload_rate_kgps: 3.0       # ...and the payload at this one (no jerks on the arms)
 
 audio:
   tts_speaker_id: 1              # 0 = Chinese, 1 = English (verify)
@@ -115,6 +137,10 @@ camera:
   presets:                       # D400 visual_preset per precision mode
     fine: 3                      # High Accuracy (manipulation)
     coarse: 1                    # Default (walking)
+  depth_units_m:                 # raw depth unit per mode: fine = 1 mm / k (k = 5; the user asked to try k 3..7:
+    fine: 0.0002                 # 1 mm steps spoiled the manipulation frame), still 13 m of 16-bit range
+    coarse: 0.001
+  switch_skip_frames: 3          # after a preset/units switch, drop frames captured with the old units
   width: 640
   height: 480
   fps: 20                        # sent rate (the D435i has no 20 fps mode, so capture runs faster)
@@ -162,12 +188,34 @@ services:
     interpolation_dt: 0.02                       # s between trajectory points sent to the robot
     ik_solutions: 32                             # IK solutions per pose goal; the nearest to the start is used
     ik_tries: 3                                  # ...or the next nearest if no path to it is found
+    rng_seed: 0                                  # random numbers re-seeded per request: same scene, same plan
+    natural:                                     # deterministic, natural-looking arms: IK seeds and the ranking of solutions
+      # natural posture (14 arm joints, L then R: shoulder pitch/roll/yaw, elbow, wrist roll/pitch/yaw): elbows
+      # out to the sides, forearms forward, wrists straight
+      posture_deg: [-40, 15, 0, 35, 0, 0, 0, -40, -15, 0, 35, 0, 0, 0]   # = planner_model.cspace.default_deg
+      weights: [0.05, 0.2, 0.3, 0.05, 3.0, 3.0, 3.0, 0.05, 0.2, 0.3, 0.05, 3.0, 3.0, 3.0]   # per rad^2: wrists straight first
+      adduction_free_deg: 5                      # shoulder roll toward the body beyond this costs (use the space sideways)
+      adduction_weight: 3.0
+      continuity: 0.05                           # cost of the change from the start pose (per rad^2)
+      wrist_max_deg: 100                         # hard: solutions with a wrist joint beyond this are dropped
+      seed_spread_deg: 25                        # fixed variations around the start and the posture (IK seeds)
+    path:                                        # deterministic free moves (cuRobo's sampling planners are not used)
+      step_deg: 2.0                              # collision check every this far along a joint-space path
+      joint_speed_dps: 60                        # peak speed of the largest joint (minimum-jerk profile)
+      min_duration_s: 0.6
+      over_clear_m: [0.05, 0.10, 0.15]           # up-and-over: palms this far above the highest obstacle (in order)
+      # ...else through fixed transit postures (14 arm joints, deg), tried in order: hands high in front, the ready pose
+      transit_deg: [[-70, 20, 0, -30, 0, 0, 0, -70, -20, 0, -30, 0, 0, 0], [0, 35, 30, -45, 0, 0, 0, 0, -35, -30, -45, 0, 0, 0]]
     line:                                        # straight-line moves (contact moves: close in, squeeze, lift, lower, retreat)
       step_m: 0.01                               # IK every this far along the line, each nearest the previous
       step_deg: 3.0
       max_joint_step_deg: 12                     # a bigger jump between steps = an arm flip: refused
       seeds: 8                                   # IK seeds per step, all at the current angles (+ noise)
       seed_noise_deg: 2.0
+      noise_seed: 0                              # the noise is seeded: the same request always plans the same path
+      max_halvings: 3                            # a step that fails or jumps is retried in halves down to step/8: an
+                                                 # arm swivelling as the hands close in moves continuously (1 cm steps
+                                                 # jumped 18 deg in wrist roll at random: 2 of 3 squeezes refused)
       joint_speed_rps: 0.5                       # timing of the resulting trajectory (before playback slowdown)
     timeout_s: 60
 
@@ -205,17 +253,24 @@ planner_model:
     contact_m: 0.005             # innermost glove point (the curled fingertips) beyond the bare TCP, 3.5 cm
                                  # from the hand axis: two photo-checked reaches (gloves 9/3 cm short)
     fingertip_contact_x_m: 0.13  # ...that innermost point is this far along the hand (the fingertips)
-    palm_twist_deg: 8            # the glove's contact line runs from the curled fingertips (3.5 cm out) to the
+    contact_span_x_m: [0.05, 0.05]      # the grip centres the PALM CENTRE (rubber palm, x 5 cm) on the object's centre (user
+                                 # 2026-10-24: squeeze with the palm centre, arms/shoulders only)
+    palm_twist_deg: 3.4            # the glove's contact line runs from the curled fingertips (3.5 cm out) to the  # 2026-10-24 user's definition (Media 51/52): the WRIST CURVE (2.7 cm from the hand axis, x -0.6 cm) and the gloved
+                                 # MIDDLE FINGERTIP (3.5 cm, x 13 cm) both touch the face, near its two corners: the contact plane runs
+                                 # through both -> atan(0.8/13.6) = 3.4 deg (8 deg put the wrist 1.1 cm ahead: the box pivoted on it)
                                  # palm heel (~1.8 cm: 1.3 rubber + thin glove) over 13 cm. The contact frame
                                  # lies in it, so grasps twist the hand until heel and fingertips both touch
                                  # (square hands touched with the fingertips only: slips)
-    pad_m: 0.025                 # padding thickness all round (grows the hand collision spheres; estimate)
+    pad_m: 0.009                 # glove fabric/padding all round (grows the hand collision spheres): measured
+                                 # 2026-10-23 with the head camera, gloved hand 5.0 cm palm to back over a 3.2 cm
+                                 # rubber palm -> ~0.9 cm a side (the earlier 2.5 cm estimate squeezed short boxes
+                                 # 2.5 cm too high: the user's correction on the robot)
+    thickness_m: 0.050           # palm surface to back (the same measurement)
     finger_extra_m: 0.02         # glove fingertips beyond the rubber fingertips (estimate)
-  # extra self-collision ignores: the fitted upper-arm spheres overlap the torso by 1-2 cm even in the
-  # robot's normal standing pose, which made every start state "in collision" (joint limits keep them apart)
+  # extra self-collision ignores: the shoulder joint housings always touch the torso spheres,
   # and the two rubber hands: when squeezing, the box sits between them (soft rubber, slow squeeze)
   self_collision_ignore: {left_shoulder_roll_link: [torso_link, logo_link], right_shoulder_roll_link: [torso_link, logo_link],
-                          left_shoulder_yaw_link: [torso_link, logo_link], right_shoulder_yaw_link: [torso_link, logo_link],
+                          left_shoulder_yaw_link: [logo_link], right_shoulder_yaw_link: [logo_link],
                           left_rubber_hand: [right_rubber_hand, right_wrist_yaw_link, right_wrist_pitch_link,
                                              right_wrist_roll_link],
                           right_rubber_hand: [left_rubber_hand, left_wrist_yaw_link, left_wrist_pitch_link,
@@ -229,7 +284,20 @@ planner_model:
   # every lift above ~6 cm "collide"; the real wrist pitches +-92 deg freely)
   # ...and the two wrists/hands: the squeeze command aims the gloves inside the object (the object stops
   # them), which in the model brings the wrist ends together; with an object between them they never touch
-  fit_seed: 7                    # sphere fitting is random; a fixed seed keeps rebuilds identical
+  # Upper arm vs torso IS checked (the fit ignores it): ignoring it let the left arm, reaching across to a box,
+  # press into the torso's side (16 Nm on the shoulder roll, 90 C in 3 s). The fitted spheres overlap by
+  # 1.1 cm with the arms straight down (fine on the robot) and by 1.8 cm at the photo-checked light contact.
+  # Shrunk by only 0.4 cm (was 1.2): on the real meshes 1.2 allowed ~0 cm clearance, and run 10 (2026-10-24, a
+  # place with the waist turned 33 deg, plan 0.4 cm from the torso mesh) blocked the carrying right arm (12 Nm on
+  # the shoulder roll). 0.4 keeps ~0.7 cm of mesh clearance; the squeeze pose (0.9 cm on the meshes) still plans
+  cspace:                       # the posture cuRobo's IK leans toward (its null-space cost): hands in front at table
+                                # height, elbows out, wrists straight; the left arm's angles, mirrored for the right
+                                # (roll and yaw sign-flipped). Stiffer wrists and shoulder yaw = natural solutions
+    default_deg: {shoulder_pitch: -40, shoulder_roll: 15, shoulder_yaw: 0, elbow: 35, wrist_roll: 0, wrist_pitch: 0, wrist_yaw: 0}
+    null_space_weight: {shoulder_pitch: 1.0, shoulder_roll: 1.0, shoulder_yaw: 2.0, elbow: 1.0, wrist_roll: 5.0, wrist_pitch: 5.0, wrist_yaw: 5.0}
+  self_collision_check: {left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link]}
+  self_collision_buffer: {left_shoulder_yaw_link: -0.004, right_shoulder_yaw_link: -0.004}
+  fit_seed: 7                   # sphere fitting is random; a fixed seed keeps rebuilds identical
   held_object_spheres: 40        # sphere slots for a held box (planner avoids collisions with it)
   held_object_ignore: [left_rubber_hand, right_rubber_hand, left_wrist_yaw_link, right_wrist_yaw_link,
                        left_wrist_pitch_link, right_wrist_pitch_link, left_wrist_roll_link, right_wrist_roll_link,
@@ -247,6 +315,8 @@ scene_map:
   depth_max_m: 1.2
   robot_filter_m: 0.03           # depth this close to the robot's own collision spheres is the robot
   exclude_pad_m: 0.02            # the cut-out around the handled object is this much bigger than its cuboid
+  support_cut_above_m: 0.02      # the support surface around found objects is cut out of the map up to here (the
+                                 # table slab models it); 0.005 left the real top's voxels in the gap between boxes
 
 # Head camera mount. Depth is aligned to the RGB camera; points come out in its optical frame.
 camera_mount:
@@ -264,60 +334,171 @@ manipulation:
   # left wrist yaw 4 deg: the gloved wrist rests there and cannot reach 0 (commanded 0 it pushed
   # constantly and heated to 113 C)
   ready_deg: [0, 35, 30, -45, 0, 0, 4, 0, -35, -30, -45, 0, 0, 0]
-  grasp_pitch_deg: [0, 20, 40, 60, 75]   # fingers tilted down by these angles until a plan is found
+  grasp_pitch_deg: [12, 0, 20, 40, 60, 75]   # fingers tilted down by these angles until a plan is found
   waist_deg: [0, 0, 0]
   max_face_deg: 45               # waist yaw limit when turning toward a target
-  transit_margin_m: 0.025       # arm moves keep this far from every obstacle (map and cuboids); only the last
+  transit_margin_m: 0.035       # arm moves keep this far from every obstacle (map and cuboids); only the last
                                  # straight approach and the squeeze use 0 (model and tracking errors are ~1-2 cm)
-  near_margin_m: 0.01            # moves that end close to a surface by design (coming down beside the object
-                                 # to the grasp height, ~3.5 cm above its support) keep at least this
-  approach_far_m: [0.06, 0.04, 0.03]   # gloves come down beside the object this far off its faces (the first
-                                       # that fits between the neighbours), from above...
-  approach_rise_m: [0.08, 0.05, 0.03]  # ...starting this much above the grasp height (first reachable): the move
-                                       # there keeps transit_margin_m, only the short descent uses near_margin_m
-  approach_clear_m: [0.02, 0.03]         # ...then move straight in to this far off the faces before the squeeze
-                                         # (closest first; 1 cm is inside the planner's collision margin)
-  squeeze_m: 0.02                # palms are commanded this far inside each face -> grip force (deeper
+  near_margin_m: 0.015           # moves that end close to things by design (to the ready pose near objects) keep this
+  min_free_margin_m: 0.01        # last resort for the free move above an object (the descent after it plans at
+                                 # descent_margin_m and is touch-checked); an object near the chest needs it
+  # coming down beside an object (STANDARDS M5.1): one free move to above it, then straight down. A glove with an
+  # object beside it comes down in the middle of that slot (the same clearance on both sides); a free side
+  # comes down free_side_off_m off the face. Only the short straight moves near the object use small margins
+  above_clear_m: 0.04            # gloves' lowest point this far above every nearby object top before coming down
+  free_side_off_m: 0.045         # a glove with nothing beside it comes down this far off the object's face (4 cm: both
+                                 # gloves rubbed the faces coming down, runs 14 17 19; 2 cm: the
+                                 # camera's ~1-2 cm error put a glove on the box's top edge, run 2026-10-24 11:16)
+  slot_min_gap_m: 0.06           # STANDARDS M5.1: a glove comes down between two objects only this far apart (at 12-13 cm
+                                 # the real glove touched one or the other, runs 14-33)
+  slot_palm_max_m: 0.035         # ...but at most this (a wide gap put it 5.6 cm off: no grasp pose, run 40)
+  slot_palm_share: 0.55          # in a slot the palm side gets this share of the free space, the back the rest
+  slot_back_clear_m: 0.035      # in a slot the glove's back keeps this from the neighbour; the palm side gets the rest
+  slot_clear_min_m: 0.003        # in a slot, at least this on each side of the glove (else refused: too tight; the
+                                 # user's demonstration fitted the 5.0 cm glove into a 5.6 cm gap)
+  descent_margin_m: 0.01         # planning margin of the straight descent (touch-checked when it runs)
+  descent_slowdown: 2.0          # it plays this slow, in short pieces, stopping if a glove meets an edge
+  descent_follow_min: 0.3        # a glove is blocked when it lags (land_lag_m) and went down less than this part of the
+  descent_block_lag_m: 0.025     #   commanded drop in the last piece (rubbing a face only slows it), or lags this much
+  rest_high_max_m: 0.03          # a glove stopped this close above the grasp height (on a rail, the case edge) with
+                                 # min_palm_contact_m of palm still on the object grips from there instead of refusing
+  squeeze_short_m: 0.01          # if the closing line cannot reach the faces (far object), it is planned to end this far
+                                 # outside them; the live close-in continues by feel (close_overrun_m past the planned end)
+  squeeze_m: 0.005               # palms are commanded this far inside each face -> grip force (deeper
                                  # squeezes saturated the arm motors, so the lift only reached 4-6 cm)
   min_squeeze_gap_m: 0.02        # ...but never closer than this to each other
-  lift_m: 0.10
-  carry_clear_m: 0.025           # held box bottom at least this far above every other object
+  lift_m: 0.06                   # lift this high (low carry: holding high costs ~11 Nm per shoulder pitch, low ~8.5)...
+  lift_near_m: 1.0               # ...or above objects this close to it (1 m: above everything around, then one turn;
+                                 # the low turn + raise split failed live: 'raise it over the objects' blocked)
+                                 # away only for the last part of the way
+  carry_clear_m: 0.045           # held box bottom at least this far above every other object (> turn_clear_m: the
+                                 # waist then turns in one go; 2.5 cm split it into a low turn + a raise that failed live)
+  turn_clear_m: 0.03             # a waist turn carrying an object low keeps it this far from what it passes...
+  turn_margin_deg: 3             # ...and stops this short of where it would come closer, raises it, then goes on
   place_above_m: 0.04            # approach the place pose from this far above
-  pull_in_m: 0.08                # after lifting, draw the box this far toward the chest (less arm sag)
+  pull_in_m: 0.0                 # after lifting, draw the box this far toward the chest. Off: it saves <1 Nm of
+                                 # shoulder pitch but swings the upper arms inward (the left upper arm hit the
+                                 # torso, 12 Nm on the shoulder roll, with the box 4 cm off centre)
   min_carry_x_m: 0.30
+  placed_check_tol_m: 0.03        # the placed object's top seen at least its expected height minus this, or the place failed
   place_clear_m: 0.01            # box bottom this far above the surface when released
   max_object_size_m: 0.70        # detections bigger than this (any side) are surfaces, not objects
-  min_box_width_m: 0.04
-  max_box_width_m: 0.50
-  grasp_min_above_support_m: 0.115   # palm point height above the support: the gloved hand reaches ~8 cm
-                                     # below it (photo-checked); objects are grasped at their centre if higher
-  table_block_m: 0.10            # table slab thickness below its top (arms may hang below the table edge)
-  drop_gap_m: 0.012              # hands within this of their squeeze targets -> the box slipped
+  min_box_width_m: 0.05          # STANDARDS M4.3
+  max_box_width_m: 0.40
+  # STANDARDS M3 / M5: checked before any planning, refused with the rule number
+  reach_m: [0.335, 0.415]        # M3.1 (advisory: the planner still tries outside) object centre's distance from the
+                                 # torso axis where the stack is tested to plan: 24-32 cm from the chest (grid
+                                 # 2026-10-23 with the measured 5 cm glove; failures only at 21-23 cm; beyond 32 cm the
+                                 # shoulders heat up, which the heat gate checks)
+  chest_front_m: 0.095           # chest front ahead of the torso axis (measured; for messages in chest terms)
+  max_bearing_deg: 25            # M3.3 (advisory) waist turn toward an object to pick (tested up to 24 deg)...
+  max_place_bearing_deg: 32      # ...and toward a place target (passed up to 32 deg); max_face_deg is the hard limit
+  # grasp height (STANDARDS M4.2): at the object's centre, but the gloves' lowest point stays support_clear_m
+  # above the support. A short object is then gripped with the lower part of the palm: the rubber palm reaches
+  # palm_below_m under the palm point (mesh: 5.3 cm), and at least min_palm_contact_m of it must touch the object
+  support_clear_m: 0.003         # gloves' lowest point (from the planner's glove model) above the support at grasp
+                                 # height (the descent is touch-checked: touching down at the bottom is accepted)
+  support_margin_m: 0.002        # planning keeps at most this far from the support (the table cuboid; < support_clear_m)
+  palm_below_m: 0.05
+  min_palm_contact_m: 0.04
+  table_block_m: 1.0             # the support is a solid block from its top down to the floor (a 10 cm slab let the
+                                 # hands pass through the case's front face where they hang: the user's photo 2026-10-24)
+  side_deg: [10, 50, 0, 95, 0, 0, 0, 10, -50, 0, 95, 0, 0, 0]   # sideways posture: arms raised out to the sides; every
+                                 # move between hanging and ready passes here (never straight in front of the body)
+  rest_deg: [16.6, 13.0, -1.2, 56.2, 11.4, 1.5, -2.0, 16.8, -12.6, 1.5, 56.2, -5.5, 1.3, -0.1]   # hanging (policy) pose:
+                                 # the arms are moved here (planned) before they are released
+  drop_gap_m: 0.018              # palms this much closer than when they gripped -> the box slipped (the
+                                 # squeeze force pushes them together when it goes)
   lift_tolerance_m: 0.03         # measured hand height must reach the lift target within this
-  lift_sag_comp_m: 0.03          # command the lift this much higher: the arms sag under a held box
+  lift_sag_comp_m: 0.0           # command the lift this much higher (the payload feedforward now carries the
+                                 # box's weight; with a position-only grip the arms sagged ~3 cm)
   test_lift_m: 0.02              # grip test: raise this much and hold
-  use_grasp_calibration: false   # closed-loop line-up over the target replaces it
+  test_slip_m: 0.015             # ...and if the palms close in by more than this (the object starts to slip: 5 mm in the
+                                 # test lift, then the box slid out during the turn, 2026-10-24 11:27) squeeze grip_retry_n harder
+  use_grasp_calibration: true    # the gripped palms' midpoint vs the camera's box centre = the camera's offset along the
+                                 # squeeze axis: applied to the place target (corners mismatched on 2026-10-24 run 1)
+  rest_after_task: true          # after every task with empty hands, release the arms to the walking policy
+                                 # (they hang at the sides: no load, they cool); held objects keep them held
+  start_max_temp_c: 70           # (sanity bound only: the heat model gate decides) a task starts only with every arm motor at or below this (released arms settle at
+                                 # 50-56 C; a stack adds ~36 C to the shoulder pitch; the warning is warn_motor_temp_c)
   align_iters: 3                 # line up the measured palm midpoint over the target (place)
   align_tol_m: 0.005
-  release_open_m: 0.01           # first open the palms to this far outside the box faces, slowly
+  lower_fast_above_m: 0.02       # lowering an object: at normal speed down to this far above where it should touch,
+  lower_slowdown: 4.0            # ...then this slow until it touches down (contact within mm)...
+  back_to_lowering_max_deg: 20   # lowering after a line-up: if no straight line from there, the joint move back to the
+                                 # planned lowering's start only when every joint is within this (the held box is not modelled)
+  land_lag_m: 0.008              # ...and stops once the hands are this far above their command (it sits down)
+  land_overrun_m: 0.03           # lower at most this far below where the surface should be, else refuse
+  contact_free_margin_m: 0.01     # a live contact move that falls back to a free path keeps this far from obstacles
+  release_open_m: [0.05, 0.03, 0.015]  # letting go: each glove straight outward this far (smaller if a glove meets something;
+                                       # 5 cm first: the wrist presses the face too, see planner_model.glove.contact_span_x_m)
   retreat_open_m: 0.03           # retreat: gloves open straight out this far before moving up and away
-  release_lift_m: 0.04           # then lift the hands this much before opening fully
+  retreat_clear_m: 0.03          # ...and move up until their lowest point is this far above every object top around them
+  last_resort_open_deg: 10       # nothing plannable: shoulder rolls outward this much to free the gloves, then stow
   test_hold_s: 0.6
-  grip_preload_m: 0.01           # squeeze: each hand pressed this far past where the object stopped it (sets
-                                 # the force: ~1200 N/m hand stiffness -> ~12 N, enough for 1-2 kg; 2-3.5 cm
-                                 # overheated a shoulder to 108 C in seconds). Raise only if the test lift slips
-  close_step_m: 0.005            # squeeze by feel: close this much per step...
+  squeeze_n: 18                  # grip by FORCE: each palm pushes toward the other this hard (agent feedforward
+                                 # J^T F). 15 N lifted the ~0.5 kg test box "slightly"; the user asked for 20% more.
+                                 # (A position preload past a mis-detected contact gave no grip with the kp 80 arms)
+  wrist_close_deg: 0             # 0 = off: the arms/shoulders alone squeeze (user 2026-10-24); >0 = wrist yaws turn the fingers in
+  carry_squeeze_n: 20            # once the test lift holds, squeeze this hard for lifting and turning (12 N passed the
+                                 # 2 cm test but the box slid out during the turn, twice on 2026-10-24)
+  grip_retry_n: 5                # the test lift slips: set it down, squeeze this much harder, retry...
+  max_squeeze_n: 30              # ...up to this
+  payload_kg: 0.5                # assumed mass of a held object, carried in the feedforward from the test lift on
+                                 # (the test boxes are empty, 0.4-0.6 kg; later objects up to 2 kg)
+  press_iters: 2                 # squeezing: the position command follows the hands this many times...
+  press_settle_s: 0.3            # ...this long apart, so the whole force presses the object
+  grip_gap_tol_m: [-0.06, 0.055] # squeezed palm gap vs the object width: outside -> refuse (+5.5: the wrists press first, 1.6 cm
+                                 # each further in than the palm, run 9: 16.3 on a box measured 12.3). The camera's width varies by
+                                 # ~1.5 cm (one box: 12.5 / 13.6 / 14.3 cm) and the glove surface is modelled ~1 cm off;
+                                 # 1.5 cm refused a good grip (14.7 on a box measured 12.5). The test lift decides
+  close_slowdown: 3.0            # closing on the object plays this slow, in arms.chunk_s pieces, until a hand touches...
   contact_lag_m: 0.006           # ...until both hands lag their command by this much (touching)
   close_settle_s: 0.3
+  contact_early_m: 0.035         # a hand "touching" further than this outside the measured face is stopped by
+                                 # something else (camera/glove errors are ~1-2 cm) -> refuse
+  blocked_lag_m: 0.02            # a hand already this far behind its command before closing is blocked -> refuse
+  grip_hold_extra_m: 0.03        # the real squeezed palm gap minus the object's measured width (runs 10-12: +2.8,
+                                 # +4.0, +3.0 cm: the wrists press first); the plan carries/places at this width
+  pick_lean_deg: [0, 10, 20]     # waist pitch (forward lean, from the resting pitch) tried for a pick beyond reach
+                                 # (10 deg brings the shoulders 4.3 cm closer; a box 42 cm from the chest needs ~20)
+  place_lean_deg: [0, 10, 20]    # ...and for a place when the target is too far
+                                 # for the real grip width at no lean (needed >= 5 deg at 42 cm, run 12 layout)
   close_overrun_m: 0.02          # no contact this far past the planned squeeze -> the object is not there
-  grip_retries: 2                # test lift failed: squeeze grip_retry_step_m deeper and retry
-  grip_retry_step_m: 0.005
-  max_extra_squeeze_m: 0.02
   palm_align: [1.0, 0.5, 0.0]    # palm angle: 1 = flat on the measured faces (centred on them) ... 0 = along the
                                  # turned torso (a 22 deg waist turn put the palms 4.6 cm behind the box centre)
   max_trusted_box_yaw_deg: 15    # larger box-angle estimates are treated as mis-fits (run 8 gripped the length)
   face_fractions: [1.0, 0.5, 0.0]   # waist turn toward a target, as fractions of its angle (tried in order);
                                     # palms squeeze along the turned torso, the box turns to meet them
+
+# Motor heat model: per arm motor dT/dt = a*tau^2 - b*(T - amb), fitted on this robot's logs (2026-10-21,
+# ~4000 windows of 10 s; shoulder pitch rms error ~2 C). Arm plans are replayed with it before they run and
+# refused if a motor would reach arms.warn_motor_temp_c - margin_c. Holding a box 37 cm out costs ~8.5 Nm of
+# shoulder pitch: +1.5 C/s, settling ~94 C. For long holds keep the shoulder pitch at or below ~6 Nm (~74 C).
+thermal:
+  torque_scale: 1.0              # (1.2 over-predicted the passing UI stack: 88 vs 76 C real)
+  start_ok_c: 60                 # a task starting with every arm motor <= this runs even if the peak is predicted
+                                 # over the limit (user 2026-10-26); the agent still warns at 92 and holds at 95 C
+  margin_c: 2                    # (whole-run replays: within ~5 C; it over-predicted the stack that passed, 89 vs 85 C)
+  step_s: 0.5                    # simulation step
+  default: {a: 0.012, b: 0.02}   # motors the logs barely excited (shoulder yaw, elbow, wrists); amb = their start
+  motors:                        # motor index: a (C/s per Nm^2), b (1/s), amb (C, what they cool toward)
+    "15": {a: 0.0204, b: 0.0354, amb: 54.0}   # left shoulder pitch
+    "16": {a: 0.0175, b: 0.0236, amb: 54.4}   # left shoulder roll
+    "22": {a: 0.0205, b: 0.0415, amb: 55.6}   # right shoulder pitch
+    "23": {a: 0.0148, b: 0.0199, amb: 51.0}   # right shoulder roll
+  call_s:                        # how long the live (call) steps of a plan usually take, s
+    default: 1.0
+    "close until contact": 3.0
+    "come down beside the object (touch-checked)": 3.0
+    "secure the grip (test lift)": 3.0
+    "line up over the target": 2.0
+    "lower until it sits on the target": 3.0
+    "let go": 3.0
+    "set down until it sits on something": 4.0
+  squeeze_on: ["close until contact"]                       # the squeeze force starts here...
+  payload_on: ["secure the grip (test lift)"]               # ...the carried weight here...
+  force_off: ["let go", "stop squeezing", "no squeeze force"]   # ...and both end here
 
 # AI control and skills.
 ai:
@@ -329,6 +510,7 @@ ai:
   approach_max_leg_m: 1.5        # walk at most this far before looking again
   lateral_tolerance_m: 0.06
   max_replans: 2
+  plan_fix_tries: 2               # an invalid LLM plan goes back with the exact problem at most this often
   min_battery_pct: 20
 
 # Depth-based measurement (calibrated on the Dex1-1 boxes: real 19 x 14 x 8 cm).
@@ -336,11 +518,14 @@ perception:
   fine_frames: 15                # manipulation: per-pixel median depth over this many frames
   fine_settle_s: 0.6             # wait after switching the camera preset
   box_edge_bias_m: 0.015         # added to box width/depth: dark box edges lose depth
-  table_rim_m: 0.015             # raised rim/rails on a table or case top
   floor_below_m: -0.6            # points lower than this (pelvis frame) are floor, never a support
-  look_edge_px: 6                # a detection this close to the top/bottom edge is cut off
-  look_step_deg: 8               # waist pitch change per look adjustment
-  look_max_pitch_deg: 20
+  waist_settle_s: 2.0            # a look waits up to this for the waist to reach its command and stop
+  waist_settle_deg: 1.0
+  look_edge_px: 12               # a detection this close to an image edge is cut off (6 missed a box cut at the edge)
+  look_step_deg: 8               # waist turn (yaw; pitch if not held) per look adjustment
+  look_max_pitch_deg: 0          # SAFETY: a look never tilts the waist pitch (it caused the 2026-10-24 fall)
+  look_max_yaw_deg: 25           # an object cut off at the image side: the waist turns toward it up to this
+  side_look_deg: 15              # 'left ...' / 'right ...': the waist turns this far toward that side before looking
   look_max_tries: 2
 
 # Detect & track in the image client (server side).

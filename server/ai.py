@@ -17,7 +17,8 @@ from py_trees.common import Status
 from common import config
 
 from .motion import ArmPlan, SkillError
-from .skills import SKILLS, catalog, check_hands, execute, new_plan, run_skill
+from . import heat
+from .skills import SKILLS, catalog, check_cool, check_hands, clean_params, execute, new_plan, rest, run_skill
 
 BRIEF = (
     "You control a Unitree G1 humanoid robot in a lab. It has two dummy hands without working fingers, so it "
@@ -33,8 +34,13 @@ RULES = (
     "example a box to stack on) before pre_grasp. pre_grasp needs the object within reach: approach it first "
     "unless it is already close (distance under about 0.45 m). place needs a held object and ends with the arms "
     "at ready; to put it on a table you are not at, approach the table first. retreat lets go of an object "
-    "that is gripped but not lifted. Each skill only works in the hand state it lists. Keep the plan short."
+    "that is gripped but not lifted. Each skill only works in the hand state it lists. Keep the plan short. "
+    "To stack object A on object B: find A, find B, pre_grasp A, grasp, lift, place on B (A is the object that "
+    "moves; B stays where it is). Only one object can be held at a time. Do not add ready at the end: the arms "
+    "go back to their normal position by themselves after the task."
 )
+AFTER = {"pre_grasp": "AT_OBJECT", "grasp": "GRIPPING", "lift": "HOLDING", "place": "EMPTY",
+         "set_down": "GRIPPING", "retreat": "EMPTY"}       # hand state after each arm skill
 
 
 def plan_schema(names):
@@ -56,20 +62,58 @@ class Busy:
 
 
 def llm_plan(ctx, llm, text, kinds, extra=""):
+    """The LLM's skill plan, checked against the hand-state machine and find-before-use before anything is
+    planned or moved; an invalid plan goes back to the LLM with the exact problem (bounded). Temperature 0:
+    the same task gives the same plan."""
     allowed = catalog(kinds)
-    user = (f"Task: {text}\n\nSkills:\n{json.dumps(allowed, indent=1)}\n\nWhat the robot currently knows:\n"
-            f"{json.dumps(ctx.summary())}\n\n{RULES}{extra}\n\nReturn JSON: "
-            '{"plan": [{"skill": ..., "params": {...}, "why": ...}], "notes": ...}')
-    with ctx.processing("llm"):
-        out = llm.call("chat", {"system": BRIEF, "user": user, "schema": plan_schema([s["skill"] for s in allowed])})
-    plan = (out["json"] or {}).get("plan")
-    if not plan:
-        raise SkillError(f"the LLM returned no usable plan: {out['text'][:300]}")
-    for n in plan:
-        if n.get("skill") not in SKILLS or SKILLS[n["skill"]]["kind"] not in kinds:
-            raise SkillError(f"the LLM chose a skill that is not allowed here: {n.get('skill')}")
-        n["params"] = n.get("params") or {}
-    return hoist_finds(plan), (out["json"] or {}).get("notes", "")
+    fix = ""
+    for attempt in range(config.load()["ai"]["plan_fix_tries"] + 1):
+        user = (f"Task: {text}\n\nSkills:\n{json.dumps(allowed, indent=1)}\n\nWhat the robot currently knows:\n"
+                f"{json.dumps(ctx.summary())}\n\n{RULES}{extra}{fix}\n\nReturn JSON: "
+                '{"plan": [{"skill": ..., "params": {...}, "why": ...}], "notes": ...}')
+        with ctx.processing("llm"):
+            out = llm.call("chat", {"system": BRIEF, "user": user, "temperature": 0.0,
+                                    "schema": plan_schema([s["skill"] for s in allowed])})
+        plan = (out["json"] or {}).get("plan")
+        if not plan:
+            raise SkillError(f"the LLM returned no usable plan: {out['text'][:300]}")
+        for n in plan:
+            if n.get("skill") not in SKILLS or SKILLS[n["skill"]]["kind"] not in kinds:
+                raise SkillError(f"the LLM chose a skill that is not allowed here: {n.get('skill')}")
+            n["params"] = clean_params(n["skill"], n.get("params"))[0]
+        plan = hoist_finds(plan)
+        problem = check_plan(ctx, plan)
+        if not problem:
+            return plan, (out["json"] or {}).get("notes", "")
+        fix = (f"\n\nYour previous plan {[(n['skill'], n['params']) for n in plan]} is invalid: {problem}. "
+               f"Return a corrected plan.")
+    raise SkillError(f"the LLM could not make a valid plan: {problem}")
+
+
+def check_plan(ctx, plan):
+    """The first problem in a skill plan (None if valid): each step must start from a hand state it allows
+    (simulated through the plan), and an object must be found before pre_grasp uses it."""
+    hand = ctx.bb["hand"]
+    known = set(ctx.bb["objects"])
+    for k, n in enumerate(plan, 1):
+        s = SKILLS[n["skill"]]
+        missing = clean_params(n["skill"], n["params"])[1]
+        if missing:
+            return f"step {k} ({n['skill']}) is missing its parameter {', '.join(missing)}"
+        if hand not in s["hands"]:
+            return (f"step {k} ({n['skill']}) needs the hands {' or '.join(s['hands'])}, but after the steps "
+                    f"before it they are {hand}")
+        if s["kind"] == "move":                     # walking/turning forgets positions; approach finds its target
+            known = {n["params"].get("target")} if n["skill"] == "approach" else set()
+        if n["skill"] == "find":
+            known.add(n["params"].get("object"))
+        if n["skill"] == "pre_grasp" and n["params"].get("object") not in known:
+            return f"step {k} (pre_grasp) uses '{n['params'].get('object')}' before it is found"
+        if n["skill"] == "place" and n["params"].get("on") not in known:
+            return (f"step {k} (place) puts the object on '{n['params'].get('on')}', which is not found first "
+                    f"(find it before pre_grasp: a held object blocks the camera)")
+        hand = AFTER.get(n["skill"], hand)
+    return None
 
 
 def hoist_finds(plan):
@@ -98,6 +142,7 @@ class MotionPlanning:
     def __init__(self, ctx, llm):
         self.ctx, self.llm = ctx, llm
         self.state, self.error, self.llm_steps, self.plan, self.current = "idle", None, [], None, None
+        self.heat = None                        # predicted motor peaks of the generated plan (or why it is refused)
 
     def generate(self, text):
         if not Busy.lock.acquire(blocking=False):
@@ -105,6 +150,7 @@ class MotionPlanning:
         Busy.owner = "motion planning"
         try:
             self.state, self.error, self.plan = "generating", None, None
+            self.ctx.forget_positions()           # people move things between tasks: always find again
             self.llm_steps, _ = llm_plan(self.ctx, self.llm, text, self.KINDS,
                                          " The robot stands still at the table: do not walk or turn.")
             plan = new_plan(self.ctx)
@@ -116,6 +162,10 @@ class MotionPlanning:
                     check_hands(n["skill"], plan.state["hand"])
                     n["result"] = s["fn"](self.ctx, plan, **n["params"])
             self.plan, self.state = plan, "ready"
+            try:
+                self.heat = {"peaks_c": heat.check(self.ctx, plan)}
+            except SkillError as e:
+                self.heat = {"refused": str(e)}
             return self.status()
         except (SkillError, TypeError) as e:
             self.state, self.error = "failed", str(e)
@@ -129,6 +179,12 @@ class MotionPlanning:
             raise SkillError("generate a motion first")
         if not Busy.lock.acquire(blocking=False):
             raise SkillError(f"robot is busy ({Busy.owner})")
+        try:
+            check_cool(self.ctx)
+        except SkillError as e:
+            self.error = str(e)                 # shown in the UI (a 409 alone was invisible)
+            Busy.lock.release()
+            raise
         Busy.owner = "motion planning"
         plan, self.plan = self.plan, None          # a plan is played once (its start state is now stale)
         self.state, self.error = "playing", None
@@ -140,6 +196,10 @@ class MotionPlanning:
             except SkillError as e:
                 self.state, self.error = "failed", str(e)
             finally:
+                try:
+                    rest(self.ctx)                 # arms back to their normal position after every task
+                except Exception as e:
+                    self.error = f"{self.error or ''} (arms not released: {e})"
                 self.current, Busy.owner = None, None
                 Busy.lock.release()
         threading.Thread(target=worker, daemon=True, name="plan6").start()
@@ -148,7 +208,7 @@ class MotionPlanning:
     def status(self):
         return {"state": self.state, "error": self.error, "current": self.current,
                 "llm_plan": [{k: n.get(k) for k in ("skill", "params", "why")} for n in self.llm_steps],
-                "steps": self.plan.summary() if self.plan else None,
+                "steps": self.plan.summary() if self.plan else None, "heat": self.heat,
                 "duration_s": round(sum(s["duration"] or 0 for s in self.plan.summary()), 1) if self.plan else None}
 
 
@@ -212,6 +272,8 @@ class AIControl:
     def _run(self):
         try:
             self._safety(None)
+            check_cool(self.ctx)
+            self.ctx.forget_positions()           # people move things between tasks: always find again
             plan, notes = llm_plan(self.ctx, self.llm, self.task, self.KINDS)
             self.nodes = [{**n, "status": "pending"} for n in plan]
             self._say(f"plan: {' -> '.join(n['skill'] for n in plan)}" + (f" ({notes})" if notes else ""))
@@ -243,6 +305,11 @@ class AIControl:
             self.state, self.error = "failed", str(e)
             self._say(f"stopped: {e}")
         finally:
+            try:
+                if rest(self.ctx):                 # arms back to their normal position after every task
+                    self._say("arms released to their normal position")
+            except Exception as e:
+                self._say(f"arms not released: {e}")
             Busy.owner = None
             Busy.lock.release()
 
@@ -274,7 +341,8 @@ class AIControl:
                 n["status"] = "skipped"
                 self._say(f"step {i + 1} {n['skill']} skipped: {review['reason']}")
                 return
-            n["params"] = review.get("params") or n["params"]
+            params, missing = clean_params(n["skill"], review.get("params") or n["params"])
+            n["params"] = n["params"] if missing else params     # a review that drops a needed input is ignored
             if self.mode == "step":
                 n["status"] = "waiting"
                 self.state = "waiting"

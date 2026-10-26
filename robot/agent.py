@@ -177,7 +177,8 @@ def _play_upperbody(params, stop):
             targets[idx] = _upper_deg_to_rad(idx, deg)
         parsed.append((t, targets))
     _require_mode("arm_modes")
-    _wait_move(stop, g1.arms.move(parsed, smooth=params.get("interp", "smooth") == "smooth"))
+    _wait_move(stop, g1.arms.move(parsed, smooth=params.get("interp", "smooth") == "smooth",
+                                  recovery=bool(params.get("recovery"))))
     return {"frames": len(parsed), "interrupted": stop.is_set()}
 
 
@@ -255,6 +256,19 @@ def _set_end_effector_state(params):
     raise Rejected("no end effector detected (dummy hands)")
 
 
+def _arm_ff(params):
+    """Feedforward: {"enabled": bool, "payload_kg": total mass held between the palms, "squeeze_n": force each
+    palm pushes toward the other}; all optional."""
+    ff = CFG["arms"]["gravity_ff"]
+    payload, squeeze = params.get("payload_kg"), params.get("squeeze_n")
+    if payload is not None:
+        payload = _num(params, "payload_kg", 0.0, ff["max_payload_kg"])
+    if squeeze is not None:
+        squeeze = _num(params, "squeeze_n", 0.0, ff["max_squeeze_n"])
+    enabled = params.get("enabled")
+    return g1.arms.set_feedforward(None if enabled is None else bool(enabled), payload, squeeze)
+
+
 # name -> (function, kind). kind: motion | audio | instant
 ACTIONS = {
     "forward":      (lambda p, s: _walk(p, s, vx=+1), "motion"),
@@ -283,6 +297,7 @@ ACTIONS = {
     "get_imu":      (lambda p: g1.imu(), "instant"),
     "get_end_effector_state": (_get_end_effector_state, "instant"),
     "set_end_effector_state": (_set_end_effector_state, "instant"),
+    "arm_ff":       (_arm_ff, "instant"),
 }
 
 
@@ -382,7 +397,10 @@ def state():
         "arms": {"engaged": g1.arms.engaged, "moving": g1.arms.moving(), "weight": round(g1.arms.weight, 3),
                  "loop_hz": round(g1.arms.loop_hz, 1), "max_gap_ms": round(g1.arms.max_gap_ms, 1),
                  "q_cmd_deg": g1.arms.q_cmd_deg(), "fault": g1.arms.fault,
-                 "warning": g1.arms.warning},
+                 "warning": g1.arms.warning, "waist_held": CFG["arms"]["waist_hold_joints"],
+                 "ff": {"enabled": g1.arms.ff_enabled, "payload_kg": round(g1.arms.gravity.payload_kg, 3),
+                        "squeeze_n": round(g1.arms.gravity.squeeze_n, 2),
+                        "tau": {str(j): round(t, 2) for j, t in g1.arms.tau_ff.items()}}},
         "joints": g1.joint_states(),
         "imu": g1.imu(),
         "battery": g1.battery(),

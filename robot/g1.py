@@ -21,7 +21,8 @@ from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_, IMUState_, LowCmd_, LowState_
 from unitree_sdk2py.utils.crc import CRC
 
-from common import joints
+from common import config, joints
+from common.dynamics import Gravity
 
 log = logging.getLogger("g1")
 
@@ -84,7 +85,9 @@ class Headlight:
 
 
 class Arms:
-    """The single rt/arm_sdk publisher for the 17 upper-body joints (motor index 12..28)."""
+    """The single rt/arm_sdk publisher for the 17 upper-body joints (motor index 12..28).
+    The waist joints in waist_hold_joints (roll, pitch) stay where they were at engage (as in Unitree's
+    teleop): tilting them under arm_sdk fought the balance policy (the body swayed, waist pitch heated)."""
 
     def __init__(self, g1, cfg):
         self.g1, self.cfg = g1, cfg
@@ -94,6 +97,13 @@ class Arms:
         for g in cfg["gains"].values():
             for j in g["joints"]:
                 self.kp[j], self.kd[j] = g["kp"], g["kd"]
+        ff = cfg["gravity_ff"]
+        self.gravity = Gravity(config.path(g1.cfg["robot"]["urdf"]), ff, config.tcp_frames())
+        self.ff_enabled = bool(ff["enabled"])
+        self.squeeze_target = 0.0 # N per hand; the feedforward ramps toward these
+        self.payload_target = 0.0 # kg between the palms
+        self.tau_ff = {}          # last feedforward sent {motor index: Nm}, for /state
+        self._ff_error = None
         self.pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
         self.pub.Init()
         self.cmd = unitree_hg_msg_dds__LowCmd_()
@@ -108,7 +118,8 @@ class Arms:
         self.max_gap_ms = 0.0     # worst tick gap in the last second
         self.fault = None         # over-temperature release reason, until it cools and is engaged again
         self.warning = None       # motors above warn_motor_temp_c while engaged (the server backs off)
-        self._blocked = 0         # consecutive 1 s checks with a joint far from its command
+        self._push_since = None   # when an arm joint started pushing hard against its command
+        self.recover_until = 0.0  # a recovery move runs until then (no over-temperature hold meanwhile)
         threading.Thread(target=self._loop, daemon=True, name="arm_sdk").start()
 
     @property
@@ -124,14 +135,16 @@ class Arms:
         with self.lock:
             return [round(math.degrees(v), 3) for v in self.q] if self.engaged and self.q is not None else None
 
-    def engage(self):
-        """Take over the arms at their current measured pose (no jump). After an over-temperature release
-        this is refused until every upper-body motor has cooled below resume_motor_temp_c."""
+    def engage(self, recovery=False):
+        """Take over the arms at their current measured pose (no jump). After a hold in place, moves are
+        refused until every upper-body motor has cooled below resume_motor_temp_c, except recovery moves:
+        those unload the arms (set down, open, lower), and refusing them left hot arms stuck high."""
         if self.fault:
             hot = self._hot(self.cfg["resume_motor_temp_c"])
-            if hot:
+            if hot and not recovery:
                 raise RuntimeError(f"{self.fault}; still too hot to engage ({self._describe(hot)}, "
                                    f"wait until below {self.cfg['resume_motor_temp_c']} C)")
+            log.warning("cleared for a %s move: %s", "recovery" if recovery else "new", self.fault)
             self.fault = None
         with self.lock:
             if self.weight_target == 1.0:
@@ -144,6 +157,7 @@ class Arms:
 
     def release(self, wait=True):
         with self.lock:
+            self._let_go()
             self.segments = []
             self.weight_target = 0.0
             self.weight_rate = 1.0 / self.cfg["release_s"]
@@ -153,21 +167,31 @@ class Arms:
     def drop(self):
         """Emergency: hand the arms back to the policy immediately."""
         with self.lock:
+            self._let_go()
             self.segments, self.weight_target, self.weight = [], 0.0, 0.0
 
-    def move(self, keyframes, smooth=True):
-        """keyframes: [(duration_s, {motor_index: rad})]. Unnamed joints hold their position.
-        Returns the total duration in seconds."""
-        self.engage()
+    def _let_go(self):
+        self.squeeze_target = self.payload_target = 0.0
+        self.gravity.squeeze_n = self.gravity.payload_kg = 0.0
+
+    def move(self, keyframes, smooth=True, recovery=False):
+        """keyframes: [(duration_s, {motor_index: rad})]. Unnamed joints hold their position, and so does the
+        waist joints in waist_hold_joints. Returns the total duration in seconds. A recovery move runs even
+        after a hold in place and is not interrupted by the over-temperature hold (it unloads the arms)."""
+        self.engage(recovery)
+        held = self.cfg["waist_hold_joints"]
         with self.lock:
             t = t_begin = time.monotonic()
             q_from = self.q.copy()
             for duration, targets in keyframes:
                 q_to = q_from.copy()
                 for idx, rad in targets.items():
-                    q_to[joints.UPPER_BODY.index(idx)] = rad
+                    if idx not in held:
+                        q_to[joints.UPPER_BODY.index(idx)] = rad
                 self.segments.append((t, t + duration, q_from, q_to, smooth))
                 t, q_from = t + duration, q_to
+            if recovery:
+                self.recover_until = max(self.recover_until, t + 1.0)
         return t - t_begin
 
     def _hot(self, limit):
@@ -191,17 +215,29 @@ class Arms:
         warm = self._hot(self.cfg["warn_motor_temp_c"])
         self.warning = f"arm motors hot: {self._describe(warm)}" if warm else None
         hot = {j: t for j, t in warm.items() if t > self.cfg["max_motor_temp_c"]}
-        if hot and not self.fault:
+        if hot and not self.fault and time.monotonic() > self.recover_until:
             self._hold_in_place(f"over-temperature: {self._describe(hot)}")
-        # blocked: a joint stuck far from its command for a while is pushing against something (it heats in
-        # seconds); stop pushing. A squeeze leaves only a small error (a light preload).
+
+    def _blocked_check(self, now):
+        """An arm joint pushing hard against its command (kp x error above max_push_nm) for max_push_s, moving
+        or not, is blocked by something: stop pushing and hold in place. (The left upper arm pressed into the
+        torso pushed 16 Nm and heated to 90 C in 3 s; normal moves push ~3 Nm, a grip ~4 Nm.) The held waist
+        is left out: its error is the torso's weight."""
         m = self.g1.low.get()
-        if m is not None and self.q is not None and not self.fault and self.weight_target == 1.0 and self.weight > 0.999:
-            err = np.degrees(np.abs(np.array([m.motor_state[j].q for j in joints.UPPER_BODY]) - self.q))
-            k = int(err.argmax())
-            self._blocked = self._blocked + 1 if err[k] > self.cfg["max_track_err_deg"] and not self.segments else 0
-            if self._blocked >= self.cfg["max_track_err_s"]:
-                self._hold_in_place(f"blocked: {joints.NAMES[joints.UPPER_BODY[k]]} {err[k]:.0f} deg from its command")
+        if m is None or self.q is None or self.fault or self.weight_target < 1.0 or self.weight < 0.999:
+            self._push_since = None
+            return
+        k0 = len(joints.UPPER_BODY) - len(joints.ARMS)
+        err = np.array([m.motor_state[j].q for j in joints.ARMS]) - self.q[k0:]
+        push = np.abs(err) * self.kp[joints.ARMS]
+        k = int(push.argmax())
+        if push[k] < self.cfg["max_push_nm"]:
+            self._push_since = None
+        elif self._push_since is None:
+            self._push_since = now
+        elif now - self._push_since >= self.cfg["max_push_s"]:
+            self._hold_in_place(f"blocked: {joints.NAMES[joints.ARMS[k]]} pushing {push[k]:.0f} Nm "
+                                f"({math.degrees(err[k]):+.0f} deg from its command)")
 
     def _hold_in_place(self, why):
         """Stop pushing without moving: command the arms where they are (never drop them near objects).
@@ -212,6 +248,42 @@ class Arms:
             self.segments = []
             self.q = self.g1.upper_q()
 
+    def set_feedforward(self, enabled=None, payload_kg=None, squeeze_n=None):
+        """Feedforward on/off; the mass held between the palms (kg, both hands together) and the squeeze force
+        (N per hand). Both ramp to the new value; returns how long that takes (ramp_s)."""
+        ff = self.cfg["gravity_ff"]
+        with self.lock:
+            if enabled is not None:
+                self.ff_enabled = bool(enabled)
+            if payload_kg is not None:
+                self.payload_target = float(payload_kg)
+            if squeeze_n is not None:
+                self.squeeze_target = float(squeeze_n)
+            ramp = max(abs(self.squeeze_target - self.gravity.squeeze_n) / ff["squeeze_rate_nps"],
+                       abs(self.payload_target - self.gravity.payload_kg) / ff["payload_rate_kgps"])
+        return {"enabled": self.ff_enabled, "payload_kg": self.payload_target, "squeeze_n": self.squeeze_target,
+                "ramp_s": round(ramp, 2)}
+
+    def _feedforward(self):
+        """Gravity torques at the commanded pose, scaled by the arm_sdk weight (no extra push while the
+        policy still owns part of the blend). A failure only logs: the publish loop must never die."""
+        if not self.ff_enabled:
+            self.tau_ff = {}
+            return self.tau_ff
+        try:
+            ff, g = self.cfg["gravity_ff"], self.gravity
+            g.squeeze_n = _toward(g.squeeze_n, self.squeeze_target, ff["squeeze_rate_nps"] * self.dt)
+            g.payload_kg = _toward(g.payload_kg, self.payload_target, ff["payload_rate_kgps"] * self.dt)
+            k = ff["scale"] * self.weight
+            self.tau_ff = {j: k * t for j, t in g.torques(self.q).items()}
+            self._ff_error = None
+        except Exception as e:
+            if self._ff_error != str(e):
+                log.exception("gravity feedforward failed")
+                self._ff_error = str(e)
+            self.tau_ff = {}
+        return self.tau_ff
+
     def _wait_weight(self, target):
         while abs(self.weight - target) > 1e-6:
             if target > 0 and self.fault:           # released for over-temperature during the engage ramp
@@ -221,7 +293,7 @@ class Arms:
     def _loop(self):
         # Monotonic clock only: an NTP jump of the wall clock must never speed up or freeze the arms.
         # A late tick resyncs instead of bursting to catch up; ramps scale with real elapsed time.
-        nxt = last = stat_t = time.monotonic()
+        nxt = last = stat_t = block_t = time.monotonic()
         ticks, max_gap = 0, 0.0
         while True:
             nxt += self.dt
@@ -237,6 +309,9 @@ class Arms:
                 self.loop_hz, self.max_gap_ms = ticks / (now - stat_t), max_gap * 1000
                 ticks, max_gap, stat_t = 0, 0.0, now
                 self._overheat_check()
+            if now - block_t >= self.cfg["block_check_s"]:
+                block_t = now
+                self._blocked_check(now)
             with self.lock:
                 if self.weight == 0.0 and self.weight_target == 0.0:
                     continue
@@ -249,9 +324,11 @@ class Arms:
                     u = min(max((now - t0) / max(t1 - t0, 1e-6), 0.0), 1.0)
                     s = u * u * (3 - 2 * u) if smooth else u
                     self.q = qa + (qb - qa) * s
+                tau = self._feedforward()
                 for k, j in enumerate(joints.UPPER_BODY):
                     m = self.cmd.motor_cmd[j]
-                    m.q, m.dq, m.tau, m.kp, m.kd = float(self.q[k]), 0.0, 0.0, float(self.kp[j]), float(self.kd[j])
+                    m.q, m.dq, m.kp, m.kd = float(self.q[k]), 0.0, float(self.kp[j]), float(self.kd[j])
+                    m.tau = tau.get(j, 0.0)
                 self.cmd.motor_cmd[29].q = self.weight
                 self.cmd.crc = self.crc.Crc(self.cmd)
                 self.pub.Write(self.cmd)
@@ -318,6 +395,7 @@ class G1:
                 "deg": round(math.degrees(s.q), 2) if s else None,
                 "min": lim[i][0], "max": lim[i][1],
                 "temp": max(s.temperature) if s else None,
+                "tau": round(s.tau_est, 2) if s else None,
             })
         return out
 
@@ -368,6 +446,10 @@ class G1:
         if code != 0:
             raise RuntimeError(f"GetVolume failed (code {code})")
         return data.get("volume", data) if isinstance(data, dict) else data
+
+
+def _toward(v, target, step):
+    return min(v + step, target) if v < target else max(v - step, target)
 
 
 def hex_to_rgb(h):

@@ -36,10 +36,14 @@ def hardware_reset():
         d.hardware_reset()
 
 
-def set_preset(profile, value):
+def set_preset(profile, value, units):
+    """Visual preset and depth units (m per raw unit) for a precision mode; returns the depth scale now in use."""
     sensor = profile.get_device().first_depth_sensor()
     if sensor.supports(rs.option.visual_preset):
         sensor.set_option(rs.option.visual_preset, float(value))
+    if sensor.supports(rs.option.depth_units):
+        sensor.set_option(rs.option.depth_units, float(units))
+    return sensor.get_depth_scale()
 
 
 def main():
@@ -62,19 +66,23 @@ def main():
         try:
             pipe, align, intr, scale = open_camera(c)
             profile = pipe.get_active_profile()
-            set_preset(profile, c["presets"][mode])
+            scale = set_preset(profile, c["presets"][mode], c["depth_units_m"][mode])
             log.info("streaming %dx%d @ %d fps on :%d", c["width"], c["height"], c["fps"], c["zmq_port"])
-            next_t = 0.0
+            next_t, skip = 0.0, 0
             while True:
                 frames = pipe.wait_for_frames(c["frame_timeout_ms"])
                 try:                                 # precision switch from the server (non-blocking)
                     req = ctl.recv_json(flags=zmq.NOBLOCK)
                     if req.get("preset") in c["presets"]:
                         mode = req["preset"]
-                        set_preset(profile, c["presets"][mode])
+                        scale = set_preset(profile, c["presets"][mode], c["depth_units_m"][mode])
+                        skip = c["switch_skip_frames"]   # frames already captured carry the old depth units
                     ctl.send_json({"preset": mode})
                 except zmq.Again:
                     pass
+                if skip:
+                    skip -= 1
+                    continue
                 now = time.monotonic()               # scheduling only; meta "t" stays wall time
                 if now + half_frame < next_t:        # decimate capture_fps -> fps
                     continue

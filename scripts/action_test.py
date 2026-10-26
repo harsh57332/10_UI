@@ -17,7 +17,7 @@ from server.image_client import ImageClient
 from server.motion import ArmMotion
 from server.robot_link import AgentLink
 from server.services import Service
-from server.skills import SKILLS, Ctx, _check_heat, check_hands, execute, new_plan, recover, run_skill
+from server.skills import SKILLS, Ctx, _check_heat, check_cool, check_hands, execute, new_plan, recover, rest, run_skill
 
 ARGS = {"pre_grasp": ["object"], "place": ["on"], "find": ["object"], "approach": ["target"],
         "turn": ["direction", "angle_deg"], "walk": ["direction", "distance_m"], "speak": ["text"]}
@@ -49,6 +49,8 @@ def main():
     ctx = Ctx(link, cam, Service("vision"), Geometry(), ArmMotion(link, Service("planner"), lambda s: nullcontext()),
               lambda s: nullcontext())
     try:
+        if not a.plan_only:
+            check_cool(ctx)
         for name in filter(None, (x.strip() for x in a.find.split(","))):
             print("find:", run_skill(ctx, "find", {"object": name}))
         if a.plan_only or a.all_at_once:
@@ -80,6 +82,8 @@ def main():
     finally:
         if not a.keep and not a.plan_only and ctx.bb["hand"] != "EMPTY":
             print("back to EMPTY:", recover(ctx))
+        if not a.keep and not a.plan_only:
+            print("arms released to their normal position:", rest(ctx))
         cam.stop()
 
 

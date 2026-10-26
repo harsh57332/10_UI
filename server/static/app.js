@@ -328,7 +328,7 @@ async function poll() {
     updateModes(state.mode);
     updateJoints(state.joints);
     updateManip(state.joints);
-    gate("s3", state.mode === "locomotion", "· active only in Locomotion mode");
+    gate("s3", (UI.modes.walk_modes || ["locomotion"]).includes(state.mode), "· active in Locomotion or Manipulation mode");
     gate("s4", state.mode === "manipulation", "· active only in Manipulation mode");
     gate("s6", state.mode === "manipulation", "· active only in Manipulation mode");
     gate("s7", state.mode === "manipulation", "· active only in Manipulation mode");

@@ -1,0 +1,18 @@
+# Switch On Robot
+
+# Start service
+scripts/svc.sh start all
+
+# Check Status
+scripts/svc.sh status
+
+# If any new changes made on server
+scripts/robot.sh deploy && scripts/robot.sh restart agent
+
+# To Shut down
+
+# Trash
+Walking at 0.4 m/s for 2 seconds
+-> Initially a point in air at an angle was 92 cm far and after it become 42 cm at an angle (will be use in knowing how much duration to walk  (in seconds) to approach a table), This measurement is taken from the head camera to that point.
+-> change in distance of tip of the shoe is 64.5 cm (This is pure horizontally, straight line on ground).
+-> both these measurements are done using real measuring tape
