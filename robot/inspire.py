@@ -83,13 +83,14 @@ class Hand:
 
 
 def probe(cfg):
-    """Both Inspire hands answer on their Modbus port (detection at start-up)."""
+    """An Inspire hand answers on its Modbus port (detection at start-up; they come as a pair, one may be down)."""
     for side in ("left", "right"):
         try:
             socket.create_connection((cfg["hands"][side]["ip"], cfg["port"]), timeout=cfg["timeout_s"]).close()
+            return True
         except OSError:
-            return False
-    return True
+            pass
+    return False
 
 
 class Hands:

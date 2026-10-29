@@ -253,26 +253,35 @@ hands = None                    # the Inspire hands' link (polled even when abse
 
 
 def _detected():
-    """The hand profile the wrists show: inspire when both Inspire hands answer, else dummy."""
-    return "inspire" if hands is not None and all(h["connected"] for h in hands.state().values()) else "dummy"
+    """The hand profile the wrists show: inspire when an Inspire hand answers (they come as a pair), else dummy."""
+    return "inspire" if hands is not None and any(h["connected"] for h in hands.state().values()) else "dummy"
 
 
 def _watch_hands():
-    """Auto-detection: switch the hand profile (gravity model with it) when other hands answer, only while the arms
-    are released; until then the change is reported as pending."""
+    """Auto-detection, one way only: dummy -> inspire when Inspire hands answer (while the arms are released; until
+    then reported as pending). Never back on its own: hands that stop answering are still on the wrists (2026-10-29:
+    the left hand dropped off the network and the robot switched to the rubber-hand model while the Inspire hands
+    were fitted). With the dummy hands refitted, the agent's restart detects them."""
+    warned = False
     while True:
         time.sleep(CFG["end_effector"]["inspire"]["detect_s"])
         name = _detected()
-        if CFG["end_effector"]["detect"] == "auto" and name != config.hands() and not g1.arms.engaged:
+        if CFG["end_effector"]["detect"] != "auto" or name == config.hands():
+            warned = False
+            continue
+        if name == "inspire" and not g1.arms.engaged:
             config.use_hands(name)
             rebuild_gravity(g1.arms)
             log.info("hands detected: %s (gravity model %s)", name, CFG["robot"]["urdf"])
+        elif name == "dummy" and not warned:
+            warned = True
+            log.warning("the Inspire hands do not answer: keeping the Inspire model (restart the agent if they were removed)")
 
 
 def _get_end_effector_state(params):
     ee = CFG["end_effector"]
     name = config.hands()
-    out = {"type": name, "detected": name != "dummy", "detect": ee["detect"], "pending": _detected() != name}
+    out = {"type": name, "detected": name != "dummy", "detect": ee["detect"], "pending": _detected() == "inspire" != name}
     if name == "inspire" and hands is not None:
         out.update(model=ee["inspire"]["model"], hands=hands.state())
     return out
