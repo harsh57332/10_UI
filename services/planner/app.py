@@ -55,8 +55,40 @@ _checker = None             # cuRobo collision checker sharing the planner's wor
 NAT, PATH = P["natural"], P["path"]
 
 
+_planners = {}             # hand profile -> (MotionPlanner, RobotCollisionChecker); the request names its profile
+
+
 def _load():
-    global _planner, _mapper
+    """One planner per hand profile whose model is built (config hands), then the depth mapper."""
+    global _planner, _checker
+    active = config.hands()
+    for name, h in CFG["hands"].items():
+        if not config.path(h["planner_yml"]).exists():
+            log.warning("hands '%s': no planner model (%s): run scripts.build_planner_robot --hands %s",
+                        name, h["planner_yml"], name)
+            continue
+        config.use_hands(name)
+        _planners[name] = _load_planner()
+        log.info("hands '%s': planner model %s", name, h["planner_yml"])
+    config.use_hands(active if active in _planners else next(iter(_planners)))
+    _planner, _checker = _planners[config.hands()]
+    _load_mapper()
+
+
+def _select(name):
+    """Use the planner of this hand profile (the server sends the robot's detected hands with every request)."""
+    global _planner, _checker, _attached
+    if not name or name == config.hands():
+        return
+    if name not in _planners:
+        raise RuntimeError(f"no planner model for hands '{name}' (run scripts.build_planner_robot --hands {name})")
+    config.use_hands(name)
+    _planner, _checker = _planners[name]
+    _attached = None                            # that planner's attachment state is its own
+    log.info("hands '%s' selected", name)
+
+
+def _load_planner():
     import yaml
     from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
     robot = yaml.safe_load(open(config.path(P["robot_yml"])))
@@ -71,14 +103,18 @@ def _load():
                                    "voxel_size": M["esdf_voxel_m"]}},
         interpolation_dt=P["interpolation_dt"],
     )
-    _planner = MotionPlanner(cfg)
-    _planner.warmup(enable_graph=True, num_warmup_iterations=3)
-    global _checker
+    planner = MotionPlanner(cfg)
+    planner.warmup(enable_graph=True, num_warmup_iterations=3)
     from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
-    _checker = RobotCollisionChecker(RobotCollisionCheckerCfg.load_from_config(
-        robot_config=robot, scene_collision_checker=_planner.scene_collision_checker,
+    checker = RobotCollisionChecker(RobotCollisionCheckerCfg.load_from_config(
+        robot_config=robot, scene_collision_checker=planner.scene_collision_checker,
         collision_activation_distance=0.0, self_collision_activation_distance=0.0))
-    _checker.kinematics = _planner.kinematics    # the held box attached to the planner is checked too
+    checker.kinematics = planner.kinematics     # the held box attached to the planner is checked too
+    return planner, checker
+
+
+def _load_mapper():
+    global _mapper
     from curobo.perception import Mapper, MapperCfg
     cam = CFG["camera"]
     _mapper = Mapper(MapperCfg(
@@ -125,46 +161,54 @@ def _world(cuboids, use_map=None, margin=0.0):
 
 
 def build_map(p):
-    """Obstacle map from one depth frame (see the module docstring)."""
+    """Obstacle map from one depth frame or several ("frames": the task scene's views), fused into one grid. Each
+    frame: its depth, its camera pose in its own torso frame (robot filter and cut-outs), "integrate_pose" = its
+    camera pose in the map frame (the first view's torso), its joints and cut-out cuboids (own torso frame)."""
     global _map
     import base64
     import zlib
     import numpy as np
     from curobo.types import CameraObservation, Pose
-    h, w = p["shape"]
-    raw = np.frombuffer(zlib.decompress(base64.b64decode(p["depth"])), dtype=np.uint16).reshape(h, w)
-    depth = _t(raw.astype(np.float32) * float(p["depth_scale"]))
-    fx, fy, cx, cy = map(float, p["intrinsics"])
-    K = _t([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
-    pose = Pose.from_list(list(map(float, p["camera_pose"])))
-    n_raw = int((depth > 0).sum())
-    vs, us = torch.meshgrid(torch.arange(h, device="cuda"), torch.arange(w, device="cuda"), indexing="ij")
-    cam = torch.stack([(us - cx) * depth / fx, (vs - cy) * depth / fy, depth], dim=-1).view(-1, 3)
-    R = pose.get_rotation_matrix()[0]
-    pts = cam @ R.T + pose.position[0]                                  # torso frame
-    keep = depth.view(-1) > 0
-    # the robot's own arms: points within robot_filter_m of its collision spheres (same model as planning)
-    sph = _planner.kinematics.compute_kinematics(_state(p["q"])).robot_spheres.view(-1, 4)
-    sph = sph[sph[:, 3] > 0]
-    for chunk in torch.split(torch.arange(h * w, device="cuda"), 65536):
-        d = torch.cdist(pts[chunk], sph[:, :3]) - sph[:, 3]
-        keep[chunk] &= d.min(dim=1).values > M["robot_filter_m"]
-    n_robot = n_raw - int(keep.sum())
-    # cut out the handled object(s): points inside a (padded) exclude cuboid get no depth
-    for c in p.get("exclude") or []:
-        cp = Pose.from_list(list(map(float, c["pose"])))
-        local = (pts - cp.position[0]) @ cp.get_rotation_matrix()[0]
-        half = _t(c["dims"]) / 2 + M["exclude_pad_m"]
-        keep &= ~(local.abs() <= half).all(dim=-1)
-    depth = (depth.view(-1) * keep).view(h, w)
-    n_used = int((depth > 0).sum())
+    frames = p.get("frames") or [p]
     _mapper.reset()
-    _mapper.integrate(CameraObservation(
-        depth_image=depth.unsqueeze(0), rgb_image=torch.zeros((1, h, w, 3), dtype=torch.uint8, device="cuda"),
-        intrinsics=K.unsqueeze(0), pose=pose))
+    stats = {"depth": 0, "robot": 0, "used": 0}
+    for fr in frames:
+        h, w = fr["shape"]
+        raw = np.frombuffer(zlib.decompress(base64.b64decode(fr["depth"])), dtype=np.uint16).reshape(h, w)
+        depth = _t(raw.astype(np.float32) * float(fr["depth_scale"]))
+        fx, fy, cx, cy = map(float, fr["intrinsics"])
+        K = _t([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+        pose = Pose.from_list(list(map(float, fr["camera_pose"])))
+        n_raw = int((depth > 0).sum())
+        vs, us = torch.meshgrid(torch.arange(h, device="cuda"), torch.arange(w, device="cuda"), indexing="ij")
+        cam = torch.stack([(us - cx) * depth / fx, (vs - cy) * depth / fy, depth], dim=-1).view(-1, 3)
+        R = pose.get_rotation_matrix()[0]
+        pts = cam @ R.T + pose.position[0]                                  # its own torso frame
+        keep = depth.view(-1) > 0
+        # the robot's own arms: points within robot_filter_m of its collision spheres (same model as planning)
+        sph = _planner.kinematics.compute_kinematics(_state(fr["q"])).robot_spheres.view(-1, 4)
+        sph = sph[sph[:, 3] > 0]
+        for chunk in torch.split(torch.arange(h * w, device="cuda"), 65536):
+            d = torch.cdist(pts[chunk], sph[:, :3]) - sph[:, 3]
+            keep[chunk] &= d.min(dim=1).values > M["robot_filter_m"]
+        n_robot = n_raw - int(keep.sum())
+        # cut out the handled object(s): points inside a (padded) exclude cuboid get no depth
+        for c in fr.get("exclude") or []:
+            cp = Pose.from_list(list(map(float, c["pose"])))
+            local = (pts - cp.position[0]) @ cp.get_rotation_matrix()[0]
+            half = _t(c["dims"]) / 2 + M["exclude_pad_m"]
+            keep &= ~(local.abs() <= half).all(dim=-1)
+        depth = (depth.view(-1) * keep).view(h, w)
+        stats["depth"] += n_raw
+        stats["robot"] += n_robot
+        stats["used"] += int((depth > 0).sum())
+        ipose = Pose.from_list(list(map(float, fr.get("integrate_pose") or fr["camera_pose"])))
+        _mapper.integrate(CameraObservation(
+            depth_image=depth.unsqueeze(0), rgb_image=torch.zeros((1, h, w, 3), dtype=torch.uint8, device="cuda"),
+            intrinsics=K.unsqueeze(0), pose=ipose))
     _map = _mapper.compute_esdf()
     f = _map.feature_tensor
-    return {"pixels": {"depth": n_raw, "robot": n_robot, "used": n_used},
+    return {"pixels": stats, "frames": len(frames),
             "voxels_inside": int((f <= 0).sum()), "esdf_range": [float(f.min()), float(f.max())],
             "pose": [round(float(v), 3) for v in _map.pose], "dims": list(_map.dims), "voxel": _map.voxel_size}
 
@@ -470,6 +514,7 @@ def infer(req: Request):
     p = req.params
     try:
         with _lock:
+            _select(p.get("hands"))
             if req.action == "fk":
                 return envelope.done(req.id, fk(p["q"]), t0)
             if req.action in ("plan_pose", "plan_joint", "plan_line", "ik"):

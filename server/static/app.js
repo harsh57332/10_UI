@@ -284,6 +284,28 @@ function setupPlanning() {
   document.querySelectorAll("input[name=ai-mode]").forEach((r) => (r.onchange = () => post("/api/ai/mode", { text: "-", mode: r.value })));
 }
 
+function renderHands(ee) {
+  // section 5 follows what the robot detects on its wrists (dummy hands or the Inspire hands)
+  if (!ee) return;
+  const inspire = ee.type === "inspire";
+  $("ee-model").hidden = $("ee-hands").hidden = !inspire;
+  if (inspire) $("ee-model").textContent = ee.model || "Inspire";
+  const pending = ee.pending ? (inspire ? " The hands stopped answering: dummy hands from the next time the arms are released."
+    : " Inspire hands answer: they take over the next time the arms are released.") : "";
+  $("ee-hint").textContent = (inspire
+    ? "Open = every finger fully open; Close = the four fingers, then the thumb over them. Manual only: motion "
+      + "planning treats them as hands without fingers."
+    : "No end effector detected (dummy hands). This section activates by itself when the Inspire hands answer.") + pending;
+  if (!inspire || !ee.hands) return;
+  for (const side of ["left", "right"]) {
+    const h = ee.hands[side], el = $(`ee-${side}-stat`);
+    if (!h || !h.connected) { el.textContent = "not connected"; el.className = "pill bad"; el.title = h ? h.error || "" : ""; continue; }
+    el.textContent = h.moving ? `${h.moving === "close" ? "closing" : "opening"}…` : (h.pose || "—");
+    el.className = `pill ${h.moving ? "warn" : "ok"}`;
+    el.title = `finger angles (0 closed .. 1000 open): ${h.angles.join(", ")}`;
+  }
+}
+
 function renderPlan6(p) {
   if (!p) return;
   $("p6-state").textContent = p.state === "idle" ? "" : `${p.state}${p.current ? ` · ${p.current}` : ""}${p.duration_s ? ` · ${p.duration_s} s` : ""}`;
@@ -292,6 +314,15 @@ function renderPlan6(p) {
   $("p6-plan").innerHTML = p.llm_plan.map((n) => `<li><b>${esc(n.skill)}</b> ${short(n.params)}<span class="why">${esc(n.why || "")}</span></li>`).join("")
     + (steps.length ? `<li class="muted">${steps.length} arm steps: ${steps.map((x) => esc(x.label)).join(" → ")}</li>` : "")
     + (p.error ? `<li><span class="err">${esc(p.error)}</span></li>` : "");
+  // the task scene: what each name refers to, the margin check, and the straight view with the names on it
+  const sc = p.scene || {}, m = p.margin;
+  const objs = Object.entries(sc.objects || {}).map(([k, o]) =>
+    `<b>${esc(k)}</b>: ${o.stack > 1 ? `stack of ${o.stack}` : esc(o.shape || "")}, ${o.size_m.map((v) => Math.round(v * 100)).join("×")} cm at (${o.center_m[0].toFixed(2)}, ${o.center_m[1].toFixed(2)})`).join(" · ");
+  $("p6-scene").innerHTML = (objs ? `<div>${objs}${sc.views_deg ? ` <span class="muted">(views at ${sc.views_deg.join(", ")}°)</span>` : ""}</div>` : "")
+    + (m ? `<div class="${m.robust ? "" : "err"}">${m.robust ? "Margin: ROBUST (still plans with every object 2 cm off or turned 3°)"
+        : `Margin: MARGINAL, fails if the scene is ${m.failed.map(esc).join(", ")}: expect some runs to fail`}</div>` : "");
+  const img = $("p6-img");
+  if (sc.dir && img.dataset.dir !== sc.dir) { img.dataset.dir = sc.dir; img.src = `/api/plan6/scene.png?d=${encodeURIComponent(sc.dir)}`; img.hidden = false; }
 }
 
 function renderAI(a) {
@@ -332,6 +363,7 @@ async function poll() {
     gate("s4", state.mode === "manipulation", "· active only in Manipulation mode");
     gate("s6", state.mode === "manipulation", "· active only in Manipulation mode");
     gate("s7", state.mode === "manipulation", "· active only in Manipulation mode");
+    renderHands(state.end_effector);
     renderPlan6(s.plan6);
     renderAI(s.ai);
     const a = state.arms;
@@ -359,8 +391,8 @@ async function poll() {
   $("audio-max").textContent = UI.audio.file_max_mb;
   $("det-text").maxLength = UI.ui.detect_text_max;
   $("det-max").textContent = UI.ui.detect_text_max;
-  $("ee-hint").textContent = UI.end_effector.type === "dummy"
-    ? "No end effector detected (dummy hands). This section activates when one is fitted." : "";
+  document.querySelectorAll(".hand").forEach((card) => card.querySelectorAll("button[data-ee]").forEach((b) =>
+    b.addEventListener("click", () => cmd("set_end_effector_state", { side: card.dataset.side, state: b.dataset.ee }))));
   buildModes();
   buildJoints();
   setupLoco();

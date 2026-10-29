@@ -18,7 +18,7 @@ import zlib
 import numpy as np
 
 from common import config, joints
-from common.fk import FK, mat_to_quat, quat_to_mat
+from common.fk import FK, _rpy, mat_to_quat, quat_to_mat
 
 log = logging.getLogger("motion")
 
@@ -42,10 +42,24 @@ def cuboid(name, center, dims, yaw=0.0):
     return {"name": name, "dims": [float(max(d, 0.005)) for d in dims], "pose": [*map(float, center), *q]}
 
 
+class _HandsPlanner:
+    """The planner service, told with every request which hands the robot has (it keeps a model per hand profile)."""
+
+    def __init__(self, svc):
+        self.svc = svc
+
+    def call(self, action, params):
+        return self.svc.call(action, {**params, "hands": config.hands()})
+
+    def __getattr__(self, name):
+        return getattr(self.svc, name)
+
+
 class ArmMotion:
     def __init__(self, link, planner, processing):
         self.cfg = config.load()
-        self.link, self.planner, self.processing = link, planner, processing
+        self.link, self.processing = link, processing
+        self.planner = _HandsPlanner(planner) if planner is not None else None
         self.fk = FK(config.path(self.cfg["robot"]["urdf"]))
         self.tcp = config.tcp_frames()
         self.idx = {n + "_joint": i for i, n in enumerate(joints.NAMES)}
@@ -54,6 +68,12 @@ class ArmMotion:
         self.recovery = False                   # moves now are recovery moves (the agent runs them even after
                                                 # a hold in place: they unload the arms)
         self.grip = None                        # the live grip (grip_of) while an object is squeezed, else None
+
+    def hands_changed(self):
+        """The robot reported other hands (config.use_hands): kinematics and palm frames of the new ones."""
+        self.fk = FK(config.path(self.cfg["robot"]["urdf"]))
+        self.tcp = config.tcp_frames()
+        self.map_waist, self.grip = None, None
 
     @property
     def names(self):
@@ -100,9 +120,7 @@ class ArmMotion:
     def tool_quat_torso(self, q, name):
         """Current orientation (wxyz) of a palm frame relative to the torso."""
         qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
-        a = self.tcp[name]["rpy"][2]            # the palm frame is twisted about z on the hand (glove)
-        rz = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
-        return mat_to_quat(self.fk.pose(self.tcp[name]["parent"], qn)[:3, :3] @ rz)
+        return mat_to_quat(self.fk.pose(self.tcp[name]["parent"], qn)[:3, :3] @ _rpy(*self.tcp[name]["rpy"]))
 
     def palms(self, q):
         """Pelvis-frame palm contact points (left, right) for {motor index: rad} (waist included)."""
@@ -120,10 +138,8 @@ class ArmMotion:
         out = {}
         for name in ("left_tcp", "right_tcp"):
             t = self.tcp[name]
-            T = self.fk.pose(t["parent"], qn, base="pelvis")
-            a = t["rpy"][2]
-            rz = np.array([[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
-            out[name] = (T[:3, 3] + T[:3, :3] @ np.array(t["xyz"]), T[:3, :3] @ rz)
+            T = self.fk.pose(t["parent"], qn, base="pelvis")     # the contact frame's full orientation on the hand
+            out[name] = (T[:3, 3] + T[:3, :3] @ np.array(t["xyz"]), T[:3, :3] @ _rpy(*t["rpy"]))
         return out
 
     @staticmethod
@@ -191,6 +207,29 @@ class ArmMotion:
                 "q": [q[self.idx[n]] for n in self.names],
                 "exclude": [self.cuboid_to_torso(c, waist) for c in exclude]})
         self.map_waist = waist
+        return r
+
+    def build_map_views(self, views, geometry, exclude=()):
+        """One obstacle map fused from the task scene's views (scene.View: depth, joints, torso pose at capture).
+        The map frame is the first view's torso; exclude: pelvis-frame cuboids cut out of every view."""
+        ref = self.waist_of(views[0].q)
+        T_ref_inv = np.linalg.inv(self.torso_in_pelvis(ref))
+        frames = []
+        for v in views:
+            waist = self.waist_of(v.q)
+            T = T_ref_inv @ self.torso_in_pelvis(waist)
+            Rr, tr = T[:3, :3] @ geometry.R, T[:3, :3] @ geometry.t + T[:3, 3]
+            k = v.intrinsics
+            depth = base64.b64encode(zlib.compress(np.ascontiguousarray(v.depth, dtype=np.uint16).tobytes(), 1))
+            frames.append({"depth": depth.decode(), "shape": list(v.depth.shape), "depth_scale": v.depth_scale,
+                           "intrinsics": [k["fx"], k["fy"], k["ppx"], k["ppy"]],
+                           "camera_pose": [*map(float, geometry.t), *map(float, mat_to_quat(geometry.R))],
+                           "integrate_pose": [*map(float, tr), *map(float, mat_to_quat(Rr))],
+                           "q": [v.q[self.idx[n]] for n in self.names],
+                           "exclude": [self.cuboid_to_torso(c, waist) for c in exclude]})
+        with self.processing("curobo"):
+            r = self.planner.call("map", {"frames": frames})
+        self.map_waist = ref
         return r
 
     def map_pose(self, waist):

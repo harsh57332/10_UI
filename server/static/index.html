@@ -111,8 +111,18 @@
   </section>
 
   <section id="s5">
-    <h2><span class="num">5</span>End effectors</h2>
+    <h2><span class="num">5</span>End effectors <span class="pill ok" id="ee-model" hidden></span></h2>
     <p class="hint" id="ee-hint">—</p>
+    <div class="hands" id="ee-hands" hidden>
+      <div class="hand" data-side="left">
+        <h3>Left hand <span class="pill" id="ee-left-stat">—</span></h3>
+        <div class="row"><button data-ee="open">Open</button><button data-ee="close">Close</button></div>
+      </div>
+      <div class="hand" data-side="right">
+        <h3>Right hand <span class="pill" id="ee-right-stat">—</span></h3>
+        <div class="row"><button data-ee="open">Open</button><button data-ee="close">Close</button></div>
+      </div>
+    </div>
   </section>
   <section id="s6" class="gated">
     <h2><span class="num">6</span>Motion planning <span class="gate" id="s6-gate"></span></h2>
@@ -124,7 +134,10 @@
       <span class="muted" id="p6-state"></span>
     </div>
     <ol id="p6-plan" class="steps"></ol>
-    <p class="hint">cuRobo plans the 14 arm joints (7 per arm); the waist turns toward objects on its own (STANDARDS.md M3).</p>
+    <div id="p6-scene" class="muted"></div>
+    <img id="p6-img" hidden alt="task scene" style="max-width:100%;margin-top:6px;border-radius:6px">
+    <p class="hint">SAM 3 finds whole objects in a waist scan; cuRobo plans the 14 arm joints with a 2 cm margin check;
+      the place lines up camera to camera. The scene is forgotten after the task, once the hands are down (docs/PIPELINE.md).</p>
   </section>
 
   <section id="s7" class="gated">

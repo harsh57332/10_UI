@@ -88,3 +88,8 @@ section.gated.off { opacity: .6; }
 .log.small { max-height: 180px; margin-top: 8px; }
 textarea { width: 100%; }
 label.inline input[type=radio] { width: auto; }
+
+/* section 5: one card per hand */
+.hands { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.hand { border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); border-radius: 8px; padding: 10px; }
+.hand h3 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; }

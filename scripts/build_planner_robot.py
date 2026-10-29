@@ -1,6 +1,6 @@
 """Build the arms-only planning model for cuRobo.
 
-1. Cut the G1 URDF down to the torso subtree (torso, head, both arms with rubber hands), so the
+1. Cut the G1 URDF down to the torso subtree (torso, head, both arms with their hands), so the
    planner works in the torso frame with the waist fixed.
 2. Add the palm contact frames (left_tcp / right_tcp) on the glove surface (planner_model.tcp + glove).
 3. Copy the meshes it needs, fit collision spheres and the self-collision matrix with cuRobo's
@@ -9,8 +9,11 @@
 
 The sphere fit is random (GPU) even with a seed, so it runs only with --refit (or when the fit file is
 missing); changing the TCP, the glove sizes or the ignores keeps the arm model that was tested.
-Run (after changing the TCP offsets or the glove sizes; --refit after changing the URDF):
-  ~/miniconda3/envs/g1ui_curobo/bin/python -m scripts.build_planner_robot [--refit]
+Run (after changing the TCP offsets or the glove sizes; --refit after changing the URDF; --refit-hands PREV_FIT
+after changing only the hands: the fit of every other link and its self-collision pairs come from PREV_FIT, the
+arm model that was tested):
+  ~/miniconda3/envs/g1ui_curobo/bin/python -m scripts.build_planner_robot [--hands NAME] [--refit | --refit-hands PREV_FIT]
+Each hand profile (config hands: dummy, inspire) has its own model files (hands.<name>.planner_urdf / planner_yml).
 """
 import shutil
 import sys
@@ -91,7 +94,29 @@ def glove(spheres, tcp, normals, g):
         spheres[link] = out
 
 
+def keep_arm_fit(fit, prev, hands):
+    """The new fit keeps its hand links; every other link's spheres and the self-collision pairs between other
+    links come from the previous (tested) fit."""
+    import yaml
+    new, old = yaml.safe_load(open(fit)), yaml.safe_load(open(prev))
+    kn, ko = new["kinematics"], old["kinematics"]
+    for link in kn["collision_spheres"]:
+        if link not in hands and link in ko["collision_spheres"]:
+            kn["collision_spheres"][link] = ko["collision_spheres"][link]
+    ign = {}
+    for link, others in (kn.get("self_collision_ignore") or {}).items():   # pairs with a hand: the new fit's
+        ign[link] = [o for o in others if link in hands or o in hands]
+    for link, others in (ko.get("self_collision_ignore") or {}).items():   # pairs between other links: the old fit's
+        if link in kn["collision_spheres"]:
+            ign[link] = sorted(set(ign.get(link, [])) | {o for o in others if o in kn["collision_spheres"]})
+    kn["self_collision_ignore"] = {k: v for k, v in ign.items() if v}
+    yaml.safe_dump(new, open(fit, "w"), sort_keys=False)
+    print(f"kept the arm fit of {prev} (new spheres only for {sorted(hands)})")
+
+
 def main():
+    if "--hands" in sys.argv:                   # the hand profile to build (config hands); default: the configured one
+        config.use_hands(sys.argv[sys.argv.index("--hands") + 1])
     cfg = config.load()
     pm, pl = cfg["planner_model"], cfg["services"]["planner"]
     out_urdf = config.path(pl["urdf"])
@@ -99,13 +124,18 @@ def main():
     (out_dir / "meshes").mkdir(parents=True, exist_ok=True)
     tcp = config.tcp_frames()
     links, meshes = cut_urdf(config.path(pm["source_urdf"]), out_urdf, tcp)
-    for m in meshes:
-        shutil.copy(config.path(pm["source_meshes"]) / Path(m).name, out_dir / "meshes" / Path(m).name)
+    dirs = pm["source_meshes"] if isinstance(pm["source_meshes"], list) else [pm["source_meshes"]]
+    for m in meshes:                            # the first mesh folder that has it (unitree_ros, then our own)
+        src = next((config.path(d) / Path(m).name for d in dirs if (config.path(d) / Path(m).name).exists()), None)
+        if src is None:
+            raise SystemExit(f"mesh {m} not found in {dirs}")
+        shutil.copy(src, out_dir / "meshes" / Path(m).name)
     print(f"URDF: {out_urdf} ({len(links)} links, {len(meshes)} meshes)")
 
     yml = config.path(pl["robot_yml"])
     fit = yml.with_name(yml.stem + "_fit.yml")
-    if "--refit" in sys.argv or not fit.exists():
+    hands_only = "--refit-hands" in sys.argv
+    if "--refit" in sys.argv or hands_only or not fit.exists():
         import torch
         from curobo.robot_builder import RobotBuilder
         np.random.seed(pm["fit_seed"])
@@ -115,10 +145,13 @@ def main():
         builder.compute_collision_matrix(prune_collisions=True, num_samples=1000)
         builder.save(builder.build(), str(fit))
         print(f"sphere fit: {fit}")
+        if hands_only:
+            keep_arm_fit(fit, Path(sys.argv[sys.argv.index("--refit-hands") + 1]), {t["parent"] for t in tcp.values()})
     import yaml
     data = yaml.safe_load(open(fit))
     k = data["kinematics"]
-    glove(k["collision_spheres"], tcp, {n: t["normal"] for n, t in pm["tcp"].items()}, pm.get("glove", {}))
+    if pm.get("glove"):                         # the old rubber hands wore padded gloves; bare hands keep their fit
+        glove(k["collision_spheres"], tcp, {n: t["normal"] for n, t in pm["tcp"].items()}, pm["glove"])
     # a link for a held box (cuRobo fits spheres to it when attached), riding on the left palm frame
     for key in ("extra_links", "extra_collision_spheres", "self_collision_buffer"):
         k[key] = k.get(key) or {}
@@ -146,6 +179,7 @@ def main():
         k["cspace"]["default_joint_position"] = [math.radians(cs["default_deg"][side(n)[0].replace("_joint", "")] * side(n)[1])
                                                  for n in names]
         k["cspace"]["null_space_weight"] = [float(cs["null_space_weight"][side(n)[0].replace("_joint", "")]) for n in names]
+    k["urdf_path"], k["asset_root_path"] = str(out_urdf), str(out_dir)    # this profile's files (not the fit's)
     yaml.safe_dump(data, open(yml, "w"), sort_keys=False)
     n = sum(len(v) for v in k["collision_spheres"].values())
     print(f"robot yml: {yml} ({n} spheres, {sum(len(v) for v in ign.values())} ignore pairs)")

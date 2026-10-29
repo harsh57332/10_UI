@@ -23,7 +23,8 @@ from common import config, envelope, joints
 from common.config import mode_id, mode_name
 from common.envelope import Request
 
-from .g1 import G1
+from .g1 import G1, rebuild_gravity
+from .inspire import HandError, Hands, probe
 
 log = logging.getLogger("agent")
 CFG = config.load()
@@ -248,12 +249,43 @@ def _get_mode(params):
     return {"mode": mode_name(i), "fsm_id": i}
 
 
+hands = None                    # the Inspire hands' link (polled even when absent: they are detected when they answer)
+
+
+def _detected():
+    """The hand profile the wrists show: inspire when both Inspire hands answer, else dummy."""
+    return "inspire" if hands is not None and all(h["connected"] for h in hands.state().values()) else "dummy"
+
+
+def _watch_hands():
+    """Auto-detection: switch the hand profile (gravity model with it) when other hands answer, only while the arms
+    are released; until then the change is reported as pending."""
+    while True:
+        time.sleep(CFG["end_effector"]["inspire"]["detect_s"])
+        name = _detected()
+        if CFG["end_effector"]["detect"] == "auto" and name != config.hands() and not g1.arms.engaged:
+            config.use_hands(name)
+            rebuild_gravity(g1.arms)
+            log.info("hands detected: %s (gravity model %s)", name, CFG["robot"]["urdf"])
+
+
 def _get_end_effector_state(params):
-    return {"type": CFG["end_effector"]["type"], "detected": CFG["end_effector"]["type"] != "dummy"}
+    ee = CFG["end_effector"]
+    name = config.hands()
+    out = {"type": name, "detected": name != "dummy", "detect": ee["detect"], "pending": _detected() != name}
+    if name == "inspire" and hands is not None:
+        out.update(model=ee["inspire"]["model"], hands=hands.state())
+    return out
 
 
 def _set_end_effector_state(params):
-    raise Rejected("no end effector detected (dummy hands)")
+    """{"side": "left" | "right", "state": "open" | "close"} (UI section 5 only; skills never call it)."""
+    if hands is None or config.hands() != "inspire":
+        raise Rejected("no end effector detected (dummy hands)")
+    try:
+        return hands.command(str(params.get("side")), str(params.get("state")))
+    except HandError as e:
+        raise Rejected(str(e))
 
 
 def _arm_ff(params):
@@ -410,9 +442,15 @@ def state():
 
 
 def main():
-    global g1
+    global g1, hands
     logging.basicConfig(level=CFG["logging"]["level"], format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    ee = CFG["end_effector"]
+    if ee["detect"] == "auto":                  # before the arms' gravity model is built: it depends on the hands
+        config.use_hands("inspire" if probe(ee["inspire"]) else "dummy")
+    log.info("hands: %s (%s)", config.hands(), "detected" if ee["detect"] == "auto" else "configured")
     g1 = G1(CFG)
+    hands = Hands(ee["inspire"])
+    threading.Thread(target=_watch_hands, daemon=True, name="hands_watch").start()
     log.info("G1 ready, agent on :%s", CFG["agent"]["port"])
     uvicorn.run(app, host="0.0.0.0", port=CFG["agent"]["port"], log_level="warning")
 

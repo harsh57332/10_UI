@@ -98,6 +98,7 @@ class Arms:
             for j in g["joints"]:
                 self.kp[j], self.kd[j] = g["kp"], g["kd"]
         ff = cfg["gravity_ff"]
+        self._ff = ff
         self.gravity = Gravity(config.path(g1.cfg["robot"]["urdf"]), ff, config.tcp_frames())
         self.ff_enabled = bool(ff["enabled"])
         self.squeeze_target = 0.0 # N per hand; the feedforward ramps toward these
@@ -332,6 +333,11 @@ class Arms:
                 self.cmd.motor_cmd[29].q = self.weight
                 self.cmd.crc = self.crc.Crc(self.cmd)
                 self.pub.Write(self.cmd)
+
+
+def rebuild_gravity(arms):
+    """The hands changed (other hand profile): the feedforward's arm model (masses, palm points) with them."""
+    arms.gravity = Gravity(config.path(config.load()["robot"]["urdf"]), arms._ff, config.tcp_frames())
 
 
 class G1:

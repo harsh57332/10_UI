@@ -1,6 +1,8 @@
 """Run one section-6 task under supervision: Generate, Play, then follow it step by step (with timestamps) and
 collect the server's log lines from the run. The report is printed and saved to logs/runs/<time>.txt.
-Run: ~/miniconda3/envs/g1ui_server/bin/python -m scripts.supervised_run "pick up the right box ... left box"
+Run: ~/miniconda3/envs/g1ui_server/bin/python -m scripts.supervised_run [--gen] [--marginal-ok] "pick up the right box ..."
+  --gen          Generate only (scan, scene, plan, margin), do not play
+  --marginal-ok  play even if the margin check says MARGINAL (default: stop before playing)
 """
 import json
 import subprocess
@@ -15,7 +17,9 @@ from common import config
 
 cfg = config.load()
 url = f"http://127.0.0.1:{cfg['server']['port']}"
-text = " ".join(sys.argv[1:]) or "pick up right side box from both the hands and stack it upon left side box"
+flags = {a for a in sys.argv[1:] if a.startswith("--")}
+text = " ".join(a for a in sys.argv[1:] if not a.startswith("--")) or \
+    "pick up right side box from both the hands and stack it upon left side box"
 log_path = config.path("logs/server.log")
 out_dir = config.path("logs/runs")
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -57,6 +61,16 @@ else:
     g = r.json()
     say(f"generated in {time.time() - t0:.1f} s: {[(n['skill'], n['params']) for n in g['llm_plan']]}")
     say(f"   {len(g['steps'] or [])} steps, ~{g['duration_s']} s of motion, heat {g['heat']}")
+    sc, m = g.get("scene") or {}, g.get("margin") or {}
+    say(f"   scene {sc.get('dir')}: views {sc.get('views_deg')} deg")
+    for k, o in (sc.get("objects") or {}).items():
+        say(f"     {k}: {o}")
+    say(f"   margin: {'ROBUST' if m.get('robust') else 'MARGINAL'} ({m.get('seconds')} s) "
+        + "; ".join(f"{k}: {v[:120]}" for k, v in (m.get("cases") or {}).items() if v != "ok"))
+    if "--gen" in flags or (not m.get("robust") and "--marginal-ok" not in flags):
+        say("not playing (" + ("--gen" if "--gen" in flags else "MARGINAL plan; --marginal-ok to play it") + ")")
+        Path(out_dir / f"{time.strftime('%Y%m%d_%H%M%S')}.txt").write_text("\n".join(lines) + "\n")
+        sys.exit(0)
     recording.set()
     threading.Thread(target=record, daemon=True).start()
     r = httpx.post(f"{url}/api/plan6/play", timeout=30)

@@ -7,7 +7,11 @@ against the live blackboard; compulsory safety checks run before every node; ste
 "Next" before each node. A failed node triggers a bounded re-plan. Abort stops after the current
 node; the arms keep holding whatever they hold.
 """
+import copy
 import json
+import logging
+import math
+import os
 import threading
 import time
 
@@ -18,7 +22,13 @@ from common import config
 
 from .motion import ArmPlan, SkillError
 from . import heat
-from .skills import SKILLS, catalog, check_cool, check_hands, clean_params, execute, new_plan, rest, run_skill
+from . import skills as skills_mod
+from .scene import TaskScene, parse
+from .services import ServiceError
+from .skills import (SKILLS, SURFACE_WORDS, catalog, check_cool, check_hands, clean_params, execute, new_plan, rest,
+                     run_skill)
+
+log = logging.getLogger("ai")
 
 BRIEF = (
     "You control a Unitree G1 humanoid robot in a lab. It has two dummy hands without working fingers, so it "
@@ -135,6 +145,81 @@ def hoist_finds(plan):
     return out
 
 
+def sync_hands(ctx, name, plan6=None):
+    """The robot reports which hands it has (end-effector detection): switch the server's hand profile while
+    nothing runs; the next Generate plans with the new hands and a plan made for the old ones is dropped."""
+    if not name or name == config.hands() or not Busy.lock.acquire(blocking=False):
+        return
+    try:
+        config.use_hands(name)
+        ctx.motion.hands_changed()
+        skills_mod._GLOVE.clear()
+        heat._GRAVITY = None
+        if plan6 is not None and plan6.plan is not None:
+            plan6.plan, plan6.state, plan6.error = None, "idle", f"the hands changed to '{name}': generate again"
+        log.info("hands: %s (robot model %s)", name, config.load()["robot"]["urdf"])
+    finally:
+        Busy.lock.release()
+
+
+def _try(fn):
+    try:
+        fn()
+    except Exception as e:                      # handed to the caller's thread
+        return e
+    return None
+
+
+def plan_task(ctx, steps):
+    """Plan the skill steps from the robot's live pose. Generate and its offline replay (scripts/replay_task.py)
+    run exactly this, so a recorded task re-plans identically."""
+    plan = new_plan(ctx)
+    for n in steps:
+        s = SKILLS[n["skill"]]
+        if s["kind"] == "perceive":
+            n["result"] = s["fn"](ctx, **n["params"])
+        else:
+            check_hands(n["skill"], plan.state["hand"])
+            n["result"] = s["fn"](ctx, plan, **n["params"])
+    return plan
+
+
+def margin_check(ctx, steps):
+    """The plan must not sit at the edge of what is possible: re-plan the arm steps with every found object shifted
+    scene.margin_shift_m (4 directions) and the whole scene turned scene.margin_turn_deg about the robot (2). Robust =
+    all hold; marginal = it works only near the measured spot (it would fail on a small error)."""
+    S = ctx.cfg["scene"]
+    d, a = S["margin_shift_m"], math.radians(S["margin_turn_deg"])
+    cm, dg = round(100 * d), S["margin_turn_deg"]
+    cases = [(f"{cm} cm further", d, 0, 0), (f"{cm} cm nearer", -d, 0, 0), (f"{cm} cm left", 0, d, 0),
+             (f"{cm} cm right", 0, -d, 0), (f"turned {dg} deg left", 0, 0, a), (f"turned {dg} deg right", 0, 0, -a)]
+    arm = [n for n in steps if SKILLS[n["skill"]]["kind"] != "perceive"]
+    saved = copy.deepcopy(ctx.bb["objects"])
+    out, t0 = {}, time.time()
+    try:
+        for name, dx, dy, da in cases:
+            objs = copy.deepcopy(saved)
+            for v in objs.values():
+                x, y = v["center"][0], v["center"][1]
+                nx, ny = math.cos(da) * x - math.sin(da) * y + dx, math.sin(da) * x + math.cos(da) * y + dy
+                for key in ("front_x", "support_front_x"):
+                    if key in v:
+                        v[key] += nx - x
+                v["center"] = [nx, ny, *v["center"][2:]]
+                v["yaw"] = v.get("yaw", 0.0) + da
+            ctx.bb["objects"] = objs
+            try:
+                plan_task(ctx, [dict(n) for n in arm])
+                out[name] = "ok"
+            except SkillError as e:
+                out[name] = str(e)[:200]
+            log.info("margin check, scene %s: %s", name, out[name])
+    finally:
+        ctx.bb["objects"] = saved
+    bad = [k for k, v in out.items() if v != "ok"]
+    return {"robust": not bad, "failed": bad, "cases": out, "seconds": round(time.time() - t0, 1)}
+
+
 # ==================================================================== section 6
 class MotionPlanning:
     KINDS = ("perceive", "arm")
@@ -143,32 +228,52 @@ class MotionPlanning:
         self.ctx, self.llm = ctx, llm
         self.state, self.error, self.llm_steps, self.plan, self.current = "idle", None, [], None, None
         self.heat = None                        # predicted motor peaks of the generated plan (or why it is refused)
+        self.margin, self.scene_dir = None, None    # margin check of the plan; the task scene's record folder
 
     def generate(self, text):
         if not Busy.lock.acquire(blocking=False):
             raise SkillError(f"robot is busy ({Busy.owner})")
         Busy.owner = "motion planning"
+        ctx = self.ctx
         try:
-            self.state, self.error, self.plan = "generating", None, None
-            self.ctx.forget_positions()           # people move things between tasks: always find again
-            self.llm_steps, _ = llm_plan(self.ctx, self.llm, text, self.KINDS,
-                                         " The robot stands still at the table: do not walk or turn.")
-            plan = new_plan(self.ctx)
-            for n in self.llm_steps:
-                s = SKILLS[n["skill"]]
-                if s["kind"] == "perceive":
-                    n["result"] = s["fn"](self.ctx, **n["params"])
-                else:
-                    check_hands(n["skill"], plan.state["hand"])
-                    n["result"] = s["fn"](self.ctx, plan, **n["params"])
+            self.state, self.error, self.plan, self.margin = "generating", None, None, None
+            if ctx.scene is not None:               # a new task: the last one's scene is over
+                ctx.scene.forget(ctx)
+            ctx.forget_positions()                 # people move things between tasks: always look again
+            ctx.bb.pop("calib", None)
+            scene = ctx.scene = TaskScene(ctx, text)
+            self.scene_dir = scene.run_dir
+            # the straight view is taken while the LLM chooses the skills (both take a few seconds)
+            box = {}
+            th = threading.Thread(target=lambda: box.update(err=_try(lambda: scene.capture(ctx, 0.0))), daemon=True)
+            th.start()
+            try:
+                self.llm_steps, _ = llm_plan(ctx, self.llm, text, self.KINDS,
+                                             " The robot stands still at the table: do not walk or turn.")
+            finally:
+                th.join()
+            if box.get("err"):
+                raise box["err"]
+            nouns = sorted({parse(n["params"]["object"])[0] for n in self.llm_steps if n["skill"] == "find"
+                            and not any(w in n["params"]["object"].lower() for w in SURFACE_WORDS)})
+            views = scene.scan(ctx, nouns)
+            scene.note(llm_steps=[{k: n.get(k) for k in ("skill", "params", "why")} for n in self.llm_steps],
+                       nouns=nouns, start_state=ctx.link.state())
+            plan = plan_task(ctx, self.llm_steps)
+            self.margin = margin_check(ctx, self.llm_steps)
             self.plan, self.state = plan, "ready"
             try:
-                self.heat = {"peaks_c": heat.check(self.ctx, plan)}
+                self.heat = {"peaks_c": heat.check(ctx, plan)}
             except SkillError as e:
                 self.heat = {"refused": str(e)}
+            scene.note(views_deg=views, plan=plan.summary(), margin=self.margin, heat=self.heat)
             return self.status()
-        except (SkillError, TypeError) as e:
+        except (SkillError, TypeError, ServiceError) as e:
             self.state, self.error = "failed", str(e)
+            if ctx.scene is not None:               # nothing was played: the hands are where they were
+                ctx.scene.note(error=str(e))
+                ctx.scene.forget(ctx)
+                ctx.scene = None
             raise SkillError(str(e))
         finally:
             Busy.owner = None
@@ -188,25 +293,53 @@ class MotionPlanning:
         Busy.owner = "motion planning"
         plan, self.plan = self.plan, None          # a plan is played once (its start state is now stale)
         self.state, self.error = "playing", None
+        ctx = self.ctx
 
         def worker():
+            scene = ctx.scene
             try:
-                execute(self.ctx, plan, on_step=lambda i, label: setattr(self, "current", f"{i + 1}/{len(plan.steps)} {label}"))
+                if scene is not None:              # closed loop: the scene must still be the one planned for
+                    self.current = "check the scene is unchanged"
+                    scene.check_unchanged(ctx)
+                def on_step(i, label):                 # logged: a stop can be placed exactly afterwards
+                    self.current = f"{i + 1}/{len(plan.steps)} {label}"
+                    log.info("play step %s", self.current)
+                execute(ctx, plan, on_step=on_step)
                 self.state = "done"
-            except SkillError as e:
+            except (SkillError, ServiceError) as e:
                 self.state, self.error = "failed", str(e)
+                log.warning("play failed at %s: %s", self.current, e)
             finally:
+                released = False
                 try:
-                    rest(self.ctx)                 # arms back to their normal position after every task
+                    released = rest(ctx)           # arms back to their normal position after every task
                 except Exception as e:
                     self.error = f"{self.error or ''} (arms not released: {e})"
+                try:                               # the task is over; once the hands are down, forget its scene
+                    down = released or not ctx.link.state()["arms"]["engaged"]
+                    if scene is not None:
+                        scene.note(result=self.state, error=self.error, hands_down=down)
+                        if down and ctx.bb["hand"] == "EMPTY":
+                            scene.forget(ctx)
+                            ctx.scene = None
+                except Exception as e:
+                    log.warning("after the task: %s", e)
                 self.current, Busy.owner = None, None
                 Busy.lock.release()
         threading.Thread(target=worker, daemon=True, name="plan6").start()
         return self.status()
 
+    def scene_info(self):
+        sc = self.ctx.scene
+        if sc is None:
+            return {"dir": self.scene_dir and os.path.basename(self.scene_dir)}
+        return {"dir": sc.run_dir and os.path.basename(sc.run_dir), "views_deg": [round(v.yaw_deg) for v in sc.views],
+                "objects": {k: {"center_m": [round(x, 3) for x in v["center"]], "size_m": [round(x, 3) for x in v["dims"]],
+                                "shape": v.get("shape"), "stack": v.get("stack_n", 1)} for k, v in sc.used.items()}}
+
     def status(self):
-        return {"state": self.state, "error": self.error, "current": self.current,
+        return {"state": self.state, "error": self.error, "current": self.current, "margin": self.margin,
+                "scene": self.scene_info(),
                 "llm_plan": [{k: n.get(k) for k in ("skill", "params", "why")} for n in self.llm_steps],
                 "steps": self.plan.summary() if self.plan else None, "heat": self.heat,
                 "duration_s": round(sum(s["duration"] or 0 for s in self.plan.summary()), 1) if self.plan else None}

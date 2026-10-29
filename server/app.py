@@ -4,6 +4,7 @@ Run: scripts/run_server.sh
 """
 import base64
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ from pydantic import BaseModel
 
 from common import config, joints
 
-from .ai import AIControl, MotionPlanning
+from .ai import AIControl, MotionPlanning, sync_hands
 from .geometry import Geometry
 from .image_client import ImageClient
 from .llm import LLM
@@ -121,8 +122,10 @@ def status():
     if not link.host:
         return {"connected": False}
     try:
-        return {"connected": True, "host": link.host, "state": link.state(), "camera": camera.status(),
-                "tracking": tracking.status(), "plan6": plan6.status(), "ai": ai.status()}
+        state = link.state()
+        sync_hands(ctx, (state.get("end_effector") or {}).get("type"), plan6)   # follow the detected hands
+        return {"connected": True, "host": link.host, "state": state, "camera": camera.status(),
+                "tracking": tracking.status(), "plan6": plan6.status(), "ai": ai.status(), "hands": config.hands()}
     except (httpx.HTTPError, ValueError) as e:
         return {"connected": True, "host": link.host, "state": None, "camera": camera.status(),
                 "tracking": tracking.status(), "error": str(e)}
@@ -181,6 +184,16 @@ def plan6_generate(t: Text):
         return plan6.generate(t.text)
     except (SkillError, ServiceError) as e:
         raise HTTPException(409, str(e))
+
+
+@app.get("/api/plan6/scene.png")
+def plan6_scene(d: str = ""):
+    """The task scene's straight view with the found names on it (logs/runs/<d>/scene.png)."""
+    runs = os.path.realpath(os.path.join(config.path(CFG["logging"]["dir"]), "runs"))
+    f = os.path.realpath(os.path.join(runs, os.path.basename(d), "scene.png"))
+    if not f.startswith(runs + os.sep) or not os.path.isfile(f):
+        raise HTTPException(404)
+    return FileResponse(f, media_type="image/png")
 
 
 @app.post("/api/plan6/play")

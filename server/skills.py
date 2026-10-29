@@ -61,6 +61,7 @@ class Ctx:
         self.geometry, self.motion, self.processing = geometry, motion, processing
         self.bb = {"objects": {}, "surfaces": {}, "holding": None,   # blackboard
                    "hand": "EMPTY", "grasp": None, "grip": None}
+        self.scene = None       # the task scene (server/scene.py) while a section 6 task is planned or played
 
     def summary(self):
         """Short world state for LLM prompts."""
@@ -269,8 +270,10 @@ def _hand_rects(ctx, frame, q, T):
     qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
     for side in ("left", "right"):
         pts = []
-        Th = ctx.motion.fk.pose(f"{side}_rubber_hand", qn, base="pelvis")
-        for xyz in ([0.0, 0.0, 0.0], [0.07, 0.0, 0.0], [0.13, 0.0, 0.0]):     # wrist, palm, fingertips
+        t = config.load()["planner_model"]["tcp"][f"{side}_tcp"]
+        Th = ctx.motion.fk.pose(t["parent"], qn, base="pelvis")
+        axis = np.array(t.get("axis", [1.0, 0.0, 0.0]), float)
+        for xyz in (0.0 * axis, 0.12 * axis, 0.24 * axis):     # wrist, palm, fingertips
             p = Tinv[:3, :3] @ (Th[:3, 3] + Th[:3, :3] @ np.array(xyz)) + Tinv[:3, 3]     # torso frame
             c = ctx.geometry.R.T @ (p - ctx.geometry.t)                                    # camera optical frame
             if c[2] > 0.05:
@@ -389,6 +392,11 @@ def _choose(cands, quals):
        "after walking or turning, so find again afterwards.",
        "perceive")
 def find(ctx, object, precision="fine"):
+    if ctx.scene is not None and precision != "coarse":    # a task scene was scanned at Generate: look it up there
+        base = _parse(object)[0]
+        if any(w in base for w in SURFACE_WORDS):
+            return ctx.scene.surface(ctx, object)
+        return ctx.scene.find(ctx, object)
     check_waist_lock(ctx)                       # the side look turns the waist
     base, quals = _parse(object)
     P = ctx.cfg["perception"]
@@ -635,22 +643,23 @@ _GLOVE = {}
 
 
 def _glove():
-    """The gloved hand's size from the planner's own collision model (so these rules and the planner agree):
-    thickness from its palm contact plane to its back (along the palm normal), and how far it reaches below the
-    palm point (the hand is upright at a grasp)."""
+    """The hand's size from the planner's own collision model (so these rules and the planner agree): thickness
+    from its palm contact plane to its back (along the palm normal), and how far it reaches below the contact point
+    (toward the little finger: the hand is upright at a grasp). (Named for the gloves the rubber hands wore.)"""
     if not _GLOVE:
         import yaml
+        from common.fk import _rpy
         robot = yaml.safe_load(open(config.path(config.load()["services"]["planner"]["robot_yml"])))
         spheres = robot["kinematics"]["collision_spheres"]
         thick, below = [], []
         for name, t in config.tcp_frames().items():
-            a, sign = t["rpy"][2], (-1.0 if name.startswith("left") else 1.0)
-            n = np.array([-math.sin(a), math.cos(a), 0.0]) * sign
+            R = _rpy(*t["rpy"])                 # contact frame in the hand link: x fingers, z thumb side
+            n = R[:, 1] * (-1.0 if name.startswith("left") else 1.0)     # palm normal, out of the palm
             c = np.array([sp["center"] for sp in spheres[t["parent"]]])
             r = np.array([sp["radius"] for sp in spheres[t["parent"]]])
             d = (c - np.array(t["xyz"])) @ n
             thick.append(float((d + r).max() - (d - r).min()))
-            below.append(float((t["xyz"][2] - c[:, 2] + r).max()))
+            below.append(float(((np.array(t["xyz"]) - c) @ R[:, 2] + r).max()))
         _GLOVE.update(thickness=max(thick), below=max(below))
     return _GLOVE
 
@@ -702,15 +711,18 @@ def _obj_xy(ctx, name):
     return ctx.bb["objects"][name]["center"][:2]
 
 
-def _grasp_geometry(ctx, object):
+def _grasp_geometry(ctx, object, toward=0.0):
     """Squeeze grasp of a found object: its centre, the width across the robot's left-right (the palms
-    close on those two faces), the grasp height and the cuboids around it."""
+    close on those two faces), the grasp height and the cuboids around it. toward: the grip moved this far toward
+    the robot from the object's centre (a glove in a narrow slot keeps its bulkier wrist in front of the slot)."""
     M = ctx.cfg["manipulation"]
     _rebase_objects(ctx)
     b = ctx.bb["objects"].get(object)
     if b is None:
         raise SkillError(f"'{object}' has not been found yet")
     (cx, cy, cz), (dx, dy, dz) = b["center"], b["dims"]
+    if b.get("stack_n", 1) > 1:
+        raise SkillError(f"'{object}' is a stack of {b['stack_n']} objects: name the one to pick (e.g. the top one)")
     if not M["min_box_width_m"] <= dy <= M["max_box_width_m"]:
         raise SkillError(f"STANDARDS M4.3: '{object}' is {dy * 100:.1f} cm wide between its squeeze faces; the gloves "
                          f"hold {M['min_box_width_m'] * 100:.0f}-{M['max_box_width_m'] * 100:.0f} cm")
@@ -726,7 +738,7 @@ def _grasp_geometry(ctx, object):
     # M5.1: each glove comes straight down beside its face: in the middle of the slot when an object stands
     # beside it (the same clearance on both sides of the glove), else free_side_off_m off the face
     thick = _glove_thickness()
-    off = {}
+    off, slot = {}, set()
     for side, sign in (("left", 1), ("right", -1)):
         gap, near = None, None
         for k, v in ctx.bb["objects"].items():
@@ -748,12 +760,15 @@ def _grasp_geometry(ctx, object):
                              f"(its {side} side); a glove is {thick * 100:.1f} cm thick and needs "
                              f"{(thick + 2 * M['slot_clear_min_m']) * 100:.1f} cm: move them apart")
         off[side] = o
+        if gap is not None and gap < M["slot_wrist_room_m"]:
+            slot.add(near)                      # a narrow slot: planned with the slot margin (touch-checked descent)
         off[side + "_free"] = gap is None
         off[side + "_mid"] = o if gap is None else min(M["free_side_off_m"], (gap - thick) / 2)   # centred fallback
     byaw = b.get("yaw", 0.0)
     if abs(byaw) > math.radians(M["max_trusted_box_yaw_deg"]):
         byaw = 0.0                              # a large estimated angle is more likely a mis-fit than real
-    others = [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items() if k != object]
+    others = [_slot_margin(ctx, cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)), k in slot)
+              for k, v in ctx.bb["objects"].items() if k != object]
     # the lift clears the support and the objects right next to it; the place raises the object over anything
     # further away only for the last part of the way (holding high costs ~11 Nm per shoulder pitch, low ~8.5)
     gap = lambda v: max(abs(v["center"][0] - cx) - (v["dims"][0] + dx) / 2, abs(v["center"][1] - cy) - (v["dims"][1] + dy) / 2)
@@ -764,8 +779,7 @@ def _grasp_geometry(ctx, object):
     # along the object: the hand's two contacts (wrist curve and middle fingertip) centred on the object's centre,
     # so the squeeze holds it at its centre of mass ("whenever told to lift anything, find its centre"). Run 18:
     # fingertips at the far corner put the grip 2.6 cm ahead of the centre and the box swung down in the gloves
-    span = config.load()["planner_model"]["glove"]["contact_span_x_m"]
-    shift = config.tcp_frames()["left_tcp"]["xyz"][0] - sum(span) / 2   # the palm frame ahead of the contacts' middle
+    shift = config.load()["planner_model"]["contact_ahead_m"] - toward    # contact frame vs the grip's centre
     gx, gy = cx + shift * math.cos(byaw), cy + shift * math.sin(byaw)
     return {"object": object, "cx": gx, "cy": gy, "cz": cz, "zg": zg, "half": dy / 2, "width": dy, "grip_shift": -shift,
             "center": list(b["center"]),
@@ -773,10 +787,19 @@ def _grasp_geometry(ctx, object):
             "mid_l": off["left_mid"], "mid_r": off["right_mid"], "z_above": max(z_above, zg), "clear": M["release_open_m"][-1],
             "note": note,
             "dims": list(b["dims"]), "byaw": byaw, "support_z": b["support_z"], "top_z": b["top_z"],
-            "box": cuboid(object, b["center"], b["dims"], byaw), "others": others, "cut": _support_cut(ctx, b),
+            "box": _slot_margin(ctx, cuboid(object, b["center"], b["dims"], byaw), bool(slot)), "others": others,
+            "slot": sorted(slot), "toward": toward, "cut": _support_cut(ctx, b),
             "table": _table(ctx, b["support_z"], b.get("support_front_x", b["front_x"] - 0.10), cy),
             "squeeze": min(M["squeeze_m"], max(0.0, (dy - M["min_squeeze_gap_m"]) / 2)),
             "lift": max(M["lift_m"], tallest - b["support_z"] + M["carry_clear_m"])}
+
+
+def _slot_margin(ctx, c, narrow):
+    """A cuboid beside a glove in a narrow slot is planned with the slot margin: the 5.0 cm glove goes into a 6 cm
+    gap (the user, 2026-10-26: 6 cm is the safe cutoff), which a 1 cm margin on each side never allows."""
+    if narrow:
+        c["margin"] = ctx.cfg["manipulation"]["slot_margin_m"]
+    return c
 
 
 def _check_lines(plan, moves):
@@ -799,6 +822,23 @@ def _check_lines(plan, moves):
 def pre_grasp(ctx, plan, object):
     M = ctx.cfg["manipulation"]
     g = _grasp_geometry(ctx, object)
+    if not g["slot"]:
+        return _pre_grasp_at(ctx, plan, object, g)
+    last = None
+    for toward in M["slot_grip_toward_m"]:      # the grip nearest the object's centre that plans
+        try:
+            r = _pre_grasp_at(ctx, plan, object, g if not toward else _grasp_geometry(ctx, object, toward))
+            if toward:
+                log.info("pre_grasp '%s': grip %.0f cm toward the robot (wrist in front of the slot beside %s)",
+                         object, 100 * toward, g["slot"])
+            return r
+        except SkillError as e:
+            last = e
+    raise last
+
+
+def _pre_grasp_at(ctx, plan, object, g):
+    M = ctx.cfg["manipulation"]
     cx, cy, zg, half, sq = g["cx"], g["cy"], g["zg"], g["half"], g["squeeze"]
     hl, hr, za = half + g["off_l"], half + g["off_r"], g["z_above"]
     _map_scene(ctx, [g["box"]] + g["others"] + [g["cut"]])   # depth obstacle map first: even the move to ready
@@ -1054,6 +1094,8 @@ def _map_scene(ctx, exclude):
     """Depth obstacle map for this skill from a fresh frame (live robot only; offline checks plan with the
     fitted cuboids alone). exclude: every found object (each is planned around as its fitted cuboid, which
     is tighter than the map's surfaces); the map covers everything else (the support, its rim, unknowns)."""
+    if ctx.scene is not None:                   # the task's map: built once from every view of the scene
+        return ctx.scene.ensure_map(ctx, [_support_cut(ctx, v) for v in ctx.bb["objects"].values()])
     if ctx.camera is None or ctx.geometry is None:
         return None
     # the support around every found object is cut out too (it is the table slab, with its own small margin): the
@@ -1265,8 +1307,8 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
 def _calibrated(ctx, plan, x, y):
     """Correct a camera-measured target by the offset found when the palms gripped the held box. In a
     pre-built plan the offset is only known at run time, so the place steps re-read it live."""
-    if not ctx.cfg["manipulation"]["use_grasp_calibration"]:
-        return x, y
+    if not ctx.cfg["manipulation"]["use_grasp_calibration"] or ctx.scene is not None:
+        return x, y                             # task scene: the line-up measures camera to camera instead
     plan.state["use_calib"] = True
     off = ctx.bb.get("calib", {}).get("offset_xy", [0.0, 0.0])
     return x + off[0], y + off[1]
@@ -1299,6 +1341,43 @@ def _align_over(ctx, live_xy, z, yaw, h, world, corr):
     _, meas, _ = _palm_mids(ctx)
     return {"error_m": round(float(np.linalg.norm(np.array(live_xy()) - meas[:2])), 4),
             "correction_m": [round(float(v), 4) for v in corr["xy"]]}
+
+
+def _align_by_camera(ctx, target_xy, z, yaw, h, world, corr, above_z):
+    """Closed loop, camera to camera: move until the held object's centre AS THE CAMERA SEES IT is over the target's
+    centre as the camera measured it. One sensor for both, so the camera-arm calibration and where the object sits
+    in the grip cancel out (run 40 and 2026-10-26 16:02: placed 3-4 cm off with the arm-model line-up). Returns
+    None if the camera cannot see the held object (the caller lines up with the arm model)."""
+    S = ctx.cfg["scene"]
+    noun = ctx.bb["objects"].get(h["object"], {}).get("noun") or h["object"]
+    err = None
+    for it in range(S["align_iters"] + 1):
+        cmd, meas, _ = _palm_mids(ctx)
+        held = ctx.scene.measure_held(ctx, noun, meas, above_z)
+        if held is None:
+            log.warning("line up: the camera does not see '%s' clearly; lining up with the arm model", h["object"])
+            return None
+        tgt = np.array(target_xy())
+        err = tgt - held
+        log.info("line up (camera) %d: held '%s' at (%.3f, %.3f), target (%.3f, %.3f): %.1f cm off", it, h["object"],
+                 held[0], held[1], tgt[0], tgt[1], 100 * float(np.linalg.norm(err)))
+        if np.linalg.norm(err) > S["align_max_m"]:
+            raise SkillError(f"line up: the camera sees the held object {100 * float(np.linalg.norm(err)):.1f} cm from the "
+                             f"target (more than {100 * S['align_max_m']:.0f}): not placing on a wrong measurement")
+        if np.linalg.norm(err) < S["align_tol_m"] or it == S["align_iters"]:
+            break
+        p = _contact_plan(ctx.motion)
+        try:
+            _line_or_free(p, "line up", _held(ctx.motion, h, yaw)(*(cmd[:2] + err), z), world, free=False)
+        except SkillError as e:
+            if np.linalg.norm(err) > S["align_accept_m"]:
+                raise SkillError(f"line up: {100 * float(np.linalg.norm(err)):.1f} cm off and no correction plannable: {e}")
+            log.warning("line up: %.1f cm off, correction not plannable (%s): lowering from here", 100 * float(np.linalg.norm(err)), e)
+            break
+        ctx.motion.execute(p.steps[-1]["traj"], holding=True)
+    cmd, meas, _ = _palm_mids(ctx)
+    corr["cmd_xy"] = cmd[:2].copy()             # the lowering keeps the hands where the line-up left them
+    return {"error_m": round(float(np.linalg.norm(err)), 4), "camera": True}
 
 
 def _contact_plan(m):
@@ -1686,7 +1765,7 @@ def place(ctx, plan, on):
                + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()])
     last, base, aligned = None, plan.mark(), False
     leans = [math.radians(d) for d in M["place_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
-    for align in (True, False):                 # squared to the target at ANY waist turn before keeping the grip
+    for align in (True,):                       # squared to the target only: an unsquared box overhangs and falls
         for frac, lean in [(f, ln) for f in _face_fractions(ctx) for ln in leans]:   # angle (run 36: placed turned)
             plan.restore(base)
             try:
@@ -1721,7 +1800,12 @@ def place(ctx, plan, on):
     plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_of"](), f"'{h['object']}' slipped while moving"))
     corr = {"xy": np.zeros(2)}                  # commanded - measured palm midpoint (tracking error under load)
     def line_up():
-        r = _align_over(ctx, live_xy, above, yaw, h, world, corr)
+        r = None
+        if ctx.scene is not None and on in ctx.bb["objects"]:   # camera to camera: held object over the target
+            r = _align_by_camera(ctx, lambda: _obj_xy(ctx, on), above, yaw, h, world, corr,
+                                 ctx.bb["objects"][on]["top_z"] + 0.01)
+        if r is None:
+            r = _align_over(ctx, live_xy, above, yaw, h, world, corr)
         log.info("line up over '%s': %.1f cm off after aligning (tracking correction %s cm)", on,
                  100 * r["error_m"], [round(100 * v, 1) for v in r["correction_m"]])
         return r
@@ -1729,7 +1813,8 @@ def place(ctx, plan, on):
     z_touch = z_s + h["grasp_above_bottom"]     # hands' height once the object sits on the target
     below = [w for w in world if w["name"] != on]   # the object comes down onto the target
     plan.call("lower until it sits on the target", lambda: _lower_until_contact(
-        ctx, lambda: np.array(live_xy()) + corr["xy"], z_touch - M["land_overrun_m"], _held(ctx.motion, h, yaw),
+        ctx, lambda: corr["cmd_xy"] if "cmd_xy" in corr else np.array(live_xy()) + corr["xy"],
+        z_touch - M["land_overrun_m"], _held(ctx.motion, h, yaw),
         below, proven=lower["traj"]))
     plan.steps.append(lower)                    # planned only so the steps after it start from the set-down pose
     plan.call("let go", lambda: _take_off(ctx, world))

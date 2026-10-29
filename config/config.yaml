@@ -10,7 +10,7 @@ robot:
   conda_dir: /home/unitree/miniforge3
   conda_env: g1ui_robot
   deps_dir: /home/unitree/g1ui/deps
-  urdf: assets/robot/g1_29dof_rev_1_0.urdf   # mode_machine 5, no hands
+  urdf: assets/robot/g1_29dof_rev_1_0.urdf   # mode_machine 5; set by the detected hands (hands.<name>.urdf)
   mode_machine: 5
 
 agent:
@@ -127,7 +127,59 @@ headlight:
   blink_period_s: 0.5
 
 end_effector:
-  type: dummy                    # dummy | dex1 | dex3 | inspire
+  detect: auto                   # auto: the agent probes the Inspire hands (both answer -> inspire, else dummy);
+                                 # or force one profile of `hands` (dummy | inspire)
+  default: dummy                 # until the robot reports what it detected
+  inspire:                       # UI section 5 only (open / close); skills and the LLM treat them as dummy hands
+    model: Inspire RH56DFTP (FTP, tactile)
+    hands:                       # Unitree's G1 wiring (inspire_hand_ws): Modbus TCP on the robot's 192.168.123.x
+      left: {ip: 192.168.123.210}
+      right: {ip: 192.168.123.211}
+    port: 6000
+    unit: 1
+    timeout_s: 0.5
+    poll_hz: 2                   # finger angles read for the UI
+    detect_s: 3                  # absent hands are looked for this often (detection of hands powered later)
+    speed: 800                   # SPEED_SET 0..1000 for open/close
+    force: 500                   # FORCE_SET 0..1000: closing stops at this finger force
+    thumb_delay_s: 0.6           # close: the four fingers first, then the thumb over them
+    at_tolerance: 30             # 'open' = every finger within this of 1000
+    closed_max: 200              # 'closed' = every finger at or below this (the thumb stops on the fingers)
+
+# What is on the wrists: one profile per hand type, picked by the end-effector detection (never edited by hand when
+# hands are swapped). Everything hand-specific lives here; the rest of the config is shared. "$left_hand" /
+# "$right_hand" in planner_model lists stand for the profile's hand links.
+hands:
+  dummy:                         # rubber hands in padded work gloves (used until 2026-10-29; their tuning is kept)
+    urdf: assets/robot/g1_29dof_rev_1_0.urdf
+    planner_urdf: assets/planner/g1_arms.urdf
+    planner_yml: assets/planner/g1_arms.yml
+    links: [left_rubber_hand, right_rubber_hand]
+    tcp:
+      left_tcp:  {parent: left_rubber_hand,  xyz: [0.075, -0.030, 0.010], normal: [0, -1, 0]}
+      right_tcp: {parent: right_rubber_hand, xyz: [0.075, 0.030, 0.010], normal: [0, 1, 0]}
+    contact_ahead_m: 0.025       # palm frame (x 7.5 cm) ahead of the grip centre (the rubber palm centre, x 5 cm)
+    palm_below_m: 0.05           # rubber palm below the palm point (mesh: 5.3 cm)
+    glove:
+      contact_m: 0.005           # innermost glove point (the curled fingertips) beyond the bare TCP
+      fingertip_contact_x_m: 0.13
+      palm_twist_deg: 3.4        # contact line from the wrist curve to the gloved middle fingertip (user, 2026-10-24)
+      pad_m: 0.009               # glove fabric/padding all round, measured 2026-10-23 (gloved hand 5.0 cm thick)
+      thickness_m: 0.050         # palm surface to back
+      finger_extra_m: 0.02       # glove fingertips beyond the rubber fingertips (estimate)
+  inspire:                       # Inspire RH56DFTP (fitted 2026-10-29), open, no gloves; scripts.make_inspire_urdf
+    urdf: assets/robot/g1_29dof_rev_1_0_inspire_ftp.urdf
+    planner_urdf: assets/planner/inspire/g1_arms.urdf
+    planner_yml: assets/planner/inspire/g1_arms.yml
+    links: [left_inspire_hand, right_inspire_hand]
+    tcp:                         # hand frame: z along the fingers, +y out of the palm, thumb +x (left) / -x (right). Open,
+      # the thumb stands 2.3 cm proud of the palm (y 0.053 at z 0.12) and touches a box face first: the contact plane
+      left_tcp:  {parent: left_inspire_hand,  xyz: [0.0, 0.053, 0.10], normal: [0, 1, 0], axis: [0, 0, 1]}
+      right_tcp: {parent: right_inspire_hand, xyz: [0.0, 0.053, 0.10], normal: [0, 1, 0], axis: [0, 0, 1]}
+    contact_ahead_m: 0.0
+    palm_below_m: 0.045          # palm edge (little-finger side) below the contact frame (mesh: 4.5 cm)
+    glove:                       # no gloves: only trims the fitted hand spheres to the real hand,
+      thickness_m: 0.088         # contact plane (thumb, y 0.053) to the back of the hand (y -0.035), from the mesh
 
 # Robot-side image server (D435i): RGB jpeg + aligned raw 16-bit depth (lossless PNG) over ZMQ PUB.
 camera:
@@ -174,6 +226,10 @@ services:
     dtype: float32
     prompt: "a photo of a {}"     # OWLv2 text query template
     threshold: 0.15
+    sam3_model: facebook/sam3    # manipulation: whole-object masks (2026-10-26: OWLv2 boxes gave a box's printed
+    sam3_dtype: bfloat16         #   top face as a separate 'box' -> wrong place target in 7 of 9 runs)
+    sam3_threshold: 0.4
+    sam3_mask_threshold: 0.5
     timeout_s: 30
 
   planner:
@@ -238,42 +294,14 @@ services:
     env:                                         # FlashInfer's sampler JIT fails on sm_120 with the system nvcc
       VLLM_USE_FLASHINFER_SAMPLER: "0"
 
-# Arms-only planning model: torso-rooted, waist fixed at 0, palm contact frames on the rubber hands.
+# Arms-only planning model: torso-rooted, waist fixed at 0, palm contact frames on the hands (hands.<name>).
 planner_model:
-  source_urdf: assets/robot/g1_29dof_rev_1_0.urdf
-  source_meshes: third_party/unitree_ros/robots/g1_description/meshes
-  # palm contact point in each rubber-hand frame (x along fingers, palms face each other at zero pose)
-  # (bare rubber hand; `normal` points out of the palm toward the other hand)
-  tcp:
-    left_tcp:  {parent: left_rubber_hand,  xyz: [0.075, -0.030, 0.010], normal: [0, -1, 0]}
-    right_tcp: {parent: right_rubber_hand, xyz: [0.075, 0.030, 0.010], normal: [0, 1, 0]}
-  # padded work gloves over the rubber hands: the contact point moves out to the glove surface along
-  # the palm normal, the hand collision spheres grow by the padding and the fingertips reach further
-  glove:
-    contact_m: 0.005             # innermost glove point (the curled fingertips) beyond the bare TCP, 3.5 cm
-                                 # from the hand axis: two photo-checked reaches (gloves 9/3 cm short)
-    fingertip_contact_x_m: 0.13  # ...that innermost point is this far along the hand (the fingertips)
-    contact_span_x_m: [0.05, 0.05]      # the grip centres the PALM CENTRE (rubber palm, x 5 cm) on the object's centre (user
-                                 # 2026-10-24: squeeze with the palm centre, arms/shoulders only)
-    palm_twist_deg: 3.4            # the glove's contact line runs from the curled fingertips (3.5 cm out) to the  # 2026-10-24 user's definition (Media 51/52): the WRIST CURVE (2.7 cm from the hand axis, x -0.6 cm) and the gloved
-                                 # MIDDLE FINGERTIP (3.5 cm, x 13 cm) both touch the face, near its two corners: the contact plane runs
-                                 # through both -> atan(0.8/13.6) = 3.4 deg (8 deg put the wrist 1.1 cm ahead: the box pivoted on it)
-                                 # palm heel (~1.8 cm: 1.3 rubber + thin glove) over 13 cm. The contact frame
-                                 # lies in it, so grasps twist the hand until heel and fingertips both touch
-                                 # (square hands touched with the fingertips only: slips)
-    pad_m: 0.009                 # glove fabric/padding all round (grows the hand collision spheres): measured
-                                 # 2026-10-23 with the head camera, gloved hand 5.0 cm palm to back over a 3.2 cm
-                                 # rubber palm -> ~0.9 cm a side (the earlier 2.5 cm estimate squeezed short boxes
-                                 # 2.5 cm too high: the user's correction on the robot)
-    thickness_m: 0.050           # palm surface to back (the same measurement)
-    finger_extra_m: 0.02         # glove fingertips beyond the rubber fingertips (estimate)
-  # extra self-collision ignores: the shoulder joint housings always touch the torso spheres,
-  # and the two rubber hands: when squeezing, the box sits between them (soft rubber, slow squeeze)
+  source_meshes: [third_party/unitree_ros/robots/g1_description/meshes, assets/robot/meshes]
   self_collision_ignore: {left_shoulder_roll_link: [torso_link, logo_link], right_shoulder_roll_link: [torso_link, logo_link],
                           left_shoulder_yaw_link: [logo_link], right_shoulder_yaw_link: [logo_link],
-                          left_rubber_hand: [right_rubber_hand, right_wrist_yaw_link, right_wrist_pitch_link,
+                          $left_hand: [$right_hand, right_wrist_yaw_link, right_wrist_pitch_link,
                                              right_wrist_roll_link],
-                          right_rubber_hand: [left_rubber_hand, left_wrist_yaw_link, left_wrist_pitch_link,
+                          $right_hand: [$left_hand, left_wrist_yaw_link, left_wrist_pitch_link,
                                               left_wrist_roll_link],
                           left_wrist_yaw_link: [right_wrist_yaw_link, right_wrist_pitch_link, right_wrist_roll_link],
                           left_wrist_pitch_link: [right_wrist_yaw_link, right_wrist_pitch_link, right_wrist_roll_link],
@@ -299,7 +327,7 @@ planner_model:
   self_collision_buffer: {left_shoulder_yaw_link: -0.004, right_shoulder_yaw_link: -0.004}
   fit_seed: 7                   # sphere fitting is random; a fixed seed keeps rebuilds identical
   held_object_spheres: 40        # sphere slots for a held box (planner avoids collisions with it)
-  held_object_ignore: [left_rubber_hand, right_rubber_hand, left_wrist_yaw_link, right_wrist_yaw_link,
+  held_object_ignore: [$left_hand, $right_hand, left_wrist_yaw_link, right_wrist_yaw_link,
                        left_wrist_pitch_link, right_wrist_pitch_link, left_wrist_roll_link, right_wrist_roll_link,
                        left_elbow_link, right_elbow_link]
 
@@ -317,6 +345,35 @@ scene_map:
   exclude_pad_m: 0.02            # the cut-out around the handled object is this much bigger than its cuboid
   support_cut_above_m: 0.02      # the support surface around found objects is cut out of the map up to here (the
                                  # table slab models it); 0.005 left the real top's voxels in the gap between boxes
+
+# The task scene (server/scene.py, docs/PIPELINE.md): built when Generate is pressed, forgotten after the task once
+# the hands are down. SAM 3 masks -> 3D points -> whole objects -> stacks -> the entity a word names.
+scene:
+  scan_side_deg: 25              # a side view (waist yaw only) where an object of the task is cut off at that side
+  scan_frames: 10                # fine depth per view: per-pixel median over this many frames
+  depth_max_m: 1.2
+  mask_erode_px: 3               # mask edges mix object and background depth
+  edge_bias_m: 0.005             # added to footprints (all faces' points; the top-face-only fit needed 1.5 cm): the
+                                 # 18.0 x 13.9 cm boxes measured 17.5 x 13.6 without it (2026-10-26)
+  point_step_px: 2
+  edge_px: 6                     # a mask this close to the image side is cut off there
+  min_points: 60
+  voxel_m: 0.015                 # 3D overlap tests between masks
+  inside_ratio: 0.6              # a mask this much inside one other = its fragment; holding 2+ others = a group
+  same_object_overlap: 0.3       # two views' masks overlapping this much (of the smaller) are one object
+  support_ring_m: 0.12           # the support is measured in this ring around an object
+  stack_gap_m: 0.03              # an object rests on another: its bottom within this of the other's top...
+  stack_pad_m: 0.03              # ...and the other's points under its footprint (+ this pad)...
+  stack_inside: 0.6              # ...for at least this share
+  moved_tol_m: 0.015             # before playing: an object moved more than this since Generate -> Generate again
+  align_frames: 5                # place line-up: fine frames per camera measurement of the held object
+  align_tol_m: 0.005             # held object's centre over the target's centre within this (camera vs camera)
+  align_iters: 3
+  align_accept_m: 0.02           # ...and if a correction cannot be planned, lowering goes ahead only below this
+  align_max_m: 0.06              # a camera line-up error above this is a wrong measurement: refuse, never place on it
+  margin_shift_m: 0.02           # margin check: the plan must also hold with every object 2 cm off (4 directions)...
+  margin_turn_deg: 3             # ...and the scene turned 3 deg about the robot (2 directions)
+  record: true                   # every task's views + plan go to logs/runs/<time>_task/ (scripts/replay_task.py)
 
 # Head camera mount. Depth is aligned to the RGB camera; points come out in its optical frame.
 camera_mount:
@@ -354,6 +411,11 @@ manipulation:
   slot_palm_max_m: 0.035         # ...but at most this (a wide gap put it 5.6 cm off: no grasp pose, run 40)
   slot_palm_share: 0.55          # in a slot the palm side gets this share of the free space, the back the rest
   slot_back_clear_m: 0.035      # in a slot the glove's back keeps this from the neighbour; the palm side gets the rest
+  slot_wrist_room_m: 0.10        # a slot narrower than this has no room for the wrist (7.3 cm model + margins): planned
+                                 # with slot_margin_m, the grip moving toward the robot so the wrist stays in front of it
+                                 # (the user's demonstration: glove in a 5.6 cm gap, wrist in front of the boxes)
+  slot_margin_m: 0.004           # planning margin to the object and its slot neighbour (5 cm glove in a 6 cm gap)
+  slot_grip_toward_m: [0.0, 0.02, 0.04]   # grip positions tried in a narrow slot, nearest the object's centre first
   slot_clear_min_m: 0.003        # in a slot, at least this on each side of the glove (else refused: too tight; the
                                  # user's demonstration fitted the 5.0 cm glove into a 5.6 cm gap)
   descent_margin_m: 0.01         # planning margin of the straight descent (touch-checked when it runs)
@@ -399,7 +461,7 @@ manipulation:
   support_clear_m: 0.003         # gloves' lowest point (from the planner's glove model) above the support at grasp
                                  # height (the descent is touch-checked: touching down at the bottom is accepted)
   support_margin_m: 0.002        # planning keeps at most this far from the support (the table cuboid; < support_clear_m)
-  palm_below_m: 0.05
+  # palm_below_m: per hand type (hands.<name>.palm_below_m)
   min_palm_contact_m: 0.04
   table_block_m: 1.0             # the support is a solid block from its top down to the floor (a 10 cm slab let the
                                  # hands pass through the case's front face where they hang: the user's photo 2026-10-24)
