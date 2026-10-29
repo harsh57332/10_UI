@@ -193,6 +193,8 @@ camera:
     fine: 0.0002                 # 1 mm steps spoiled the manipulation frame), still 13 m of 16-bit range
     coarse: 0.001
   switch_skip_frames: 3          # after a preset/units switch, drop frames captured with the old units
+  emitter:                       # the IR projector: always on at this power after every preset switch (D435i 0..360 mW)
+    laser_power: 150
   width: 640
   height: 480
   fps: 20                        # sent rate (the D435i has no 20 fps mode, so capture runs faster)
@@ -353,6 +355,7 @@ scene:
   scan_frames: 10                # fine depth per view: per-pixel median over this many frames
   depth_max_m: 1.2
   mask_erode_px: 3               # mask edges mix object and background depth
+  above_top_m: 0.01              # points this far above an object's top face are depth noise (dropped before fitting)
   edge_bias_m: 0.005             # added to footprints (all faces' points; the top-face-only fit needed 1.5 cm): the
                                  # 18.0 x 13.9 cm boxes measured 17.5 x 13.6 without it (2026-10-26)
   point_step_px: 2
@@ -362,7 +365,8 @@ scene:
   inside_ratio: 0.6              # a mask this much inside one other = its fragment; holding 2+ others = a group
   same_object_overlap: 0.3       # two views' masks overlapping this much (of the smaller) are one object
   support_ring_m: 0.12           # the support is measured in this ring around an object
-  stack_gap_m: 0.03              # an object rests on another: its bottom within this of the other's top...
+  stack_gap_m: 0.06              # an object rests on another: its seen bottom within this of the other's top (an
+                                 # upper box's mask can stop 4 cm above the seam, 2026-10-29)...
   stack_pad_m: 0.03              # ...and the other's points under its footprint (+ this pad)...
   stack_inside: 0.6              # ...for at least this share
   moved_tol_m: 0.015             # before playing: an object moved more than this since Generate -> Generate again

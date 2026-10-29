@@ -32,9 +32,17 @@ QUALS = {"left", "right", "nearest", "closest", "farthest", "middle", "center", 
 
 
 def parse(label):
-    """'right side box' -> ('side box', ['right']): SAM 3 sees the noun, code applies the position words."""
+    """'right side boxes' -> ('side box', ['right']): SAM 3 sees the noun (singular: 'side boxes' and 'side box'
+    are one noun, 2026-10-29: the plural got only a whole-stack mask), code applies the position words."""
     words = label.lower().split()
-    return " ".join(w for w in words if w not in QUALS) or label, [w for w in words if w in QUALS]
+    noun = [w for w in words if w not in QUALS] or words
+    return " ".join(noun[:-1] + [_singular(noun[-1])]), [w for w in words if w in QUALS]
+
+
+def _singular(w):
+    if len(w) > 3 and w.endswith("es") and w[-3] in "xsz" or w.endswith(("ches", "shes")):
+        return w[:-2]
+    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
 
 
 class View:
@@ -199,9 +207,11 @@ class TaskScene:
         for c in inst:
             inner = [i for i in inst if i is not c and len(i["vox"]) < len(c["vox"]) and self._inside(i, c) > S["inside_ratio"]]
             if any(apart(a, b) for n, a in enumerate(inner) for b in inner[n + 1:]):
-                groups.add(c["id"])
+                groups.add((c["noun"], c["view"], c["id"]))
+                for i in inner:                 # what the group was called applies to what it holds
+                    i.setdefault("also", set()).add(c["noun"])
                 log.info("'%s' %s holds %d separate others: a group, dropped", noun, c["id"], len(inner))
-        inst = [i for i in inst if i["id"] not in groups]
+        inst = [i for i in inst if (i["noun"], i["view"], i["id"]) not in groups]
         parent = list(range(len(inst)))
 
         def root(i):
@@ -225,14 +235,49 @@ class TaskScene:
                     best[i["view"]] = i
             o = {"pts": np.vstack([i["pts"] for i in best.values()]), "score": max(i["score"] for i in members),
                  "ids": [f"{i['noun']}:{i['id']}" for i in members], "views": {}, "cut": {},
-                 "nouns": {i["noun"] for i in members}}
+                 "nouns": {i["noun"] for i in members} | set().union(*(i.get("also", set()) for i in members))}
             for i in sorted(members, key=lambda i: len(i["pts"])):     # per view: its largest mask
                 o["views"][i["view"]], o["cut"][i["view"]] = i, i["cut"]
             if len(members) > 1:
                 log.info("'%s': %s are one object", noun, o["ids"])
-            o.update(self._fit(o["pts"], bg))
+            o.update(self._fit(o["pts"], bg, self._best_view(o)))
             objs.append(o)
-        return objs
+        return self._join_slivers(objs, bg)
+
+    def _best_view(self, o):
+        """The points of the view that sees the object whole and nearest the image centre (None: all views)."""
+        W = self.views[0].depth.shape[1]
+        whole = [i for k, i in o["views"].items() if o["cut"][k] == 0]
+        if not whole:
+            return None
+        return min(whole, key=lambda i: abs((i["box"][0] + i["box"][2]) / 2 - W / 2))["pts"]
+
+    def _join_slivers(self, objs, bg):
+        """An object seen only cut off at an image side (a sliver of a face) belongs to the object whose footprint
+        (grown by stack_pad_m) holds most of its points, if one does."""
+        S, out = self.S, []
+        whole = [o for o in objs if any(c == 0 for c in o["cut"].values())]
+        for o in objs:
+            if any(o is w for w in whole):
+                out.append(o)
+                continue
+            best, share = None, 0.0
+            for w in whole:
+                c, s_ = math.cos(-w["yaw"]), math.sin(-w["yaw"])
+                rel = (o["pts"][:, :2] - w["center"][:2]) @ np.array([[c, s_], [-s_, c]]).T
+                f = float(np.mean((np.abs(rel[:, 0]) <= w["dims"][0] / 2 + S["stack_pad_m"])
+                                  & (np.abs(rel[:, 1]) <= w["dims"][1] / 2 + S["stack_pad_m"])))
+                if f > share:
+                    best, share = w, f
+            if best is not None and share > S["inside_ratio"]:
+                log.info("%s (cut off at the image side) is part of %s", o["ids"], best["ids"])
+                best["pts"] = np.vstack([best["pts"], o["pts"]])
+                best["ids"] += o["ids"]
+                best["nouns"] |= o["nouns"]
+                best.update(self._fit(best["pts"], bg, self._best_view(best)))
+            else:
+                out.append(o)
+        return out
 
     def _background(self, ctx):
         """Depth points of every view outside every object mask (the support, rails, unknown things)."""
@@ -251,12 +296,19 @@ class TaskScene:
         self._bg, self._bg_n = bg[bg[:, 2] > self.cfg["perception"]["floor_below_m"]], len(self.views)
         return self._bg
 
-    def _fit(self, pts, bg):
-        """Oriented box of an object's points: footprint = minimum-area rectangle of all its points seen from above
-        (top and side faces project inside it), top = 97th percentile, support = the surface around it."""
+    def _fit(self, pts, bg, foot=None):
+        """Oriented box of an object's points: top = 97th percentile, support = the surface around it, footprint =
+        minimum-area rectangle seen from above of `foot` (its best single view: views disagree by 1-2 cm, and their
+        union smeared a 14 cm box to 21 cm, 2026-10-29)."""
         from .geometry import Geometry
-        top = float(np.percentile(pts[:, 2], 97))
-        xy = pts[:, :2]
+        z = pts[:, 2]
+        top = Geometry.plane_height(z[z > np.percentile(z, 30)])  # its top face: the densest slab of its upper part (a dark,
+        if top is None:                                   # glossy top threw ~10 % of its points up to 2.5 cm above it,
+            top = float(np.percentile(z, 97))             # 2026-10-29: 9.1 cm box read 12.5 cm tall and 18 cm wide)
+        cap = top + self.S["above_top_m"]
+        pts = pts[pts[:, 2] <= cap]
+        foot = pts if foot is None else foot[foot[:, 2] <= cap]
+        xy = foot[:, :2]
         lo, hi = np.percentile(xy, 1, axis=0), np.percentile(xy, 99, axis=0)
         xy = xy[np.all((xy >= lo) & (xy <= hi), axis=1)]
         (mx, my), (a, b_), ang = cv2.minAreaRect((xy * 1000).astype(np.float32))

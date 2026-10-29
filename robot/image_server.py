@@ -43,6 +43,15 @@ def set_preset(profile, value, units):
         sensor.set_option(rs.option.visual_preset, float(value))
     if sensor.supports(rs.option.depth_units):
         sensor.set_option(rs.option.depth_units, float(units))
+    # the IR projector on at a fixed power, never left to the preset: after the hardware resets of 2026-10-29 only
+    # 66 % of the pixels had depth (85 % before), the dark case and box tops worst
+    em = config.load()["camera"]["emitter"]
+    if sensor.supports(rs.option.emitter_enabled):
+        sensor.set_option(rs.option.emitter_enabled, 1.0)
+    if sensor.supports(rs.option.laser_power):
+        rng = sensor.get_option_range(rs.option.laser_power)
+        sensor.set_option(rs.option.laser_power, float(min(rng.max, max(rng.min, em["laser_power"]))))
+        log.info("emitter on, laser power %.0f (range %.0f..%.0f)", sensor.get_option(rs.option.laser_power), rng.min, rng.max)
     return sensor.get_depth_scale()
 
 
