@@ -72,7 +72,14 @@ def level_normal(geo):
     t0 = time.time()
     while cam.latest() is None and time.time() - t0 < 20:
         time.sleep(0.2)
-    f = cam.fine(10)
+    for attempt in range(8):                     # the camera service restarts after the accelerometer read
+        try:
+            f = cam.fine(10)
+            break
+        except RuntimeError:
+            if attempt == 7:
+                raise
+            time.sleep(4)
     cam.stop()
     k = f.intrinsics
     vs, us = np.mgrid[0:f.depth.shape[0]:2, 0:f.depth.shape[1]:2]

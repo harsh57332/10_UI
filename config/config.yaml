@@ -394,7 +394,7 @@ camera_mount:
   # the camera's real angle in its mount relative to the URDF's d435_joint, as a rotation of the optical frame
   # (rpy, deg; x right = pitch). Measured with the camera's own accelerometer + torso IMU: scripts/camera_tilt.py
   # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
-  optical_fix_rpy_deg: [-12.03, -0.72, 0.83]
+  optical_fix_rpy_deg: [-4.60, -0.75, 0.73]
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:
