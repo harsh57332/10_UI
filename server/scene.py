@@ -45,9 +45,28 @@ def _singular(w):
     return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
 
 
+def clean_depth(depth, scale, S):
+    """Flying pixels: at a depth jump (a box edge, the case's edge 80 cm above the floor) the camera returns
+    in-between depths, thin lines in mid air that the Default preset keeps (2026-10-29: a 18 x 14 cm box fitted
+    29 x 20 cm, and the lines were obstacles in the map). A pixel whose 5 x 5 neighbourhood spans more than
+    max(jump_m, jump_rel * its depth) is dropped; surfaces seen up to ~75 deg off-normal keep their pixels."""
+    d = depth.astype(np.float32) * scale
+    valid = d > 0
+    k = np.ones((5, 5), np.uint8)
+    lo = cv2.erode(np.where(valid, d, 1e3).astype(np.float32), k)
+    hi = cv2.dilate(np.where(valid, d, 0.0).astype(np.float32), k)
+    bad = valid & ((hi - lo) > np.maximum(S["jump_m"], S["jump_rel"] * d))
+    out = depth.copy()
+    out[bad] = 0
+    return out
+
+
 class View:
-    def __init__(self, rgb, depth, depth_scale, intrinsics, q, T, imu_yaw):
-        self.rgb, self.depth, self.depth_scale, self.intrinsics = rgb, depth, depth_scale, intrinsics
+    def __init__(self, rgb, depth, depth_scale, intrinsics, q, T, imu_yaw, clean=True):
+        """depth: as the camera gave it (kept as raw, recorded); the scene and the map use it without flying pixels
+        (clean=False: recordings made before 2026-10-29 16:00, replayed as they ran)."""
+        self.rgb, self.raw, self.depth_scale, self.intrinsics = rgb, depth, depth_scale, intrinsics
+        self.depth = clean_depth(depth, depth_scale, config.load()["scene"]) if clean else depth
         self.q, self.T, self.imu_yaw = q, T, imu_yaw       # joints (rad), torso in pelvis at capture, IMU yaw (rad)
 
     @property
@@ -69,7 +88,7 @@ class TaskScene:
         if self.run_dir:
             os.makedirs(self.run_dir, exist_ok=True)
         self.record = {"text": text, "views": [], "found": {}, "t": time.time(),
-                       "camera": ctx.geometry.mount() if ctx.geometry is not None else None}
+                       "camera": ctx.geometry.mount() if ctx.geometry is not None else None, "depth_clean": True}
 
     # ---------------------------------------------------------------- views
     def capture(self, ctx, yaw_deg):
@@ -93,7 +112,7 @@ class TaskScene:
         k = len(self.views)
         self.views.append(v)
         if self.run_dir:
-            np.savez_compressed(os.path.join(self.run_dir, f"view_{k}.npz"), rgb=v.rgb, depth=v.depth)
+            np.savez_compressed(os.path.join(self.run_dir, f"view_{k}.npz"), rgb=v.rgb, depth=v.raw)
         self.record["views"].append({"file": f"view_{k}.npz", "depth_scale": v.depth_scale, "intrinsics": v.intrinsics,
                                      "q": {str(i): float(a) for i, a in v.q.items()}, "T": v.T.tolist(),
                                      "imu_yaw": v.imu_yaw})
@@ -154,7 +173,7 @@ class TaskScene:
             # image left = robot's left: an object touching the left edge continues to the left (+yaw)
             cut = 1 if x1 <= S["edge_px"] else (-1 if x2 >= W - S["edge_px"] else 0)
             i = {"noun": noun, "view": k, "score": r["score"], "box": r["box"], "mask": mask, "pts": pts, "cut": cut,
-                 "far_cut": y1 <= S["edge_px"], "id": f"{k}.{j}"}   # image top = its far side (the camera looks down)
+                 "far_cut": y1 <= S["top_edge_px"], "id": f"{k}.{j}"}   # touches the image top = its far side
             i["ok"], i["why"] = self._usable(i)
             if i["ok"]:
                 i["vox"] = self._vox(pts)
@@ -296,7 +315,7 @@ class TaskScene:
         vs, us = np.nonzero(band)
         P = self._pixels_to_pelvis(ctx, v, us, vs)
         sup, top = o["support_z"], o["top_z"]
-        lo = sup + max(S["body_above_support_m"], 0.15 * (top - sup))
+        lo = sup + max(S["body_above_support_m"], S["body_above_frac"] * (top - sup))
         P = P[(P[:, 2] > lo) & (P[:, 2] <= top + S["above_top_m"])]
         body = o["pts"][(o["pts"][:, 2] > lo) & (o["pts"][:, 2] <= top + S["above_top_m"])]
         if not len(P) or not len(body):
@@ -406,8 +425,8 @@ class TaskScene:
         cx, cy, dx, dy, yaw, a, b_ = self._footprint(foot[:, :2])
         support = self._support(bg, cx, cy, dx, dy, top, pts)
         # the mask's spill onto what the object stands on (a case rail, the table edge) is not the object: its
-        # footprint is what stands above the support (2026-10-29: a rail strip 6 cm beside a box made it 18 cm wide)
-        body = foot[foot[:, 2] > support + max(self.S["body_above_support_m"], 0.15 * (top - support))]
+        # footprint is its body above the support (2026-10-29: a case rail 2.5 cm high beside a box made it 18-27 cm wide)
+        body = foot[foot[:, 2] > support + max(self.S["body_above_support_m"], self.S["body_above_frac"] * (top - support))]
         if len(body) >= self.S["min_points"]:
             cx, cy, dx, dy, yaw, a, b_ = self._footprint(body[:, :2])
             support = self._support(bg, cx, cy, dx, dy, top, pts)
@@ -501,7 +520,14 @@ class TaskScene:
             where = ", ".join(f"({e['center'][0]:.2f}, {e['center'][1]:+.2f})" for e in cands)
             raise SkillError(f"'{label}' matches {len(cands)} objects at {where} m: say which one "
                              f"(left / right / nearest / farthest / middle)")
-        unseen = [o for o in pick["objs"] if all(i["far_cut"] for i in o["views"].values())]
+        def far(o, k):                                   # a real mask of it in view k (not a stray sliver) touches the top
+            ms = [m for m in o["members"] if m["view"] == k]
+            return any(m["far_cut"] and len(m["pts"]) >= 0.25 * max(len(x["pts"]) for x in ms) for m in ms)
+        # seen to its far side: in a view that has it whole sideways (else in any view: never whole), no mask of it
+        # touches the top (2026-10-29: a sliver of a stack at an image side passed, the stack's far 3 cm stayed an
+        # obstacle under the place)
+        unseen = [o for o in pick["objs"]
+                  if all(far(o, k) for k in ([k for k in o["views"] if o["cut"][k] == 0] or list(o["views"])))]
         if unseen:                                       # its far part is above the top of every view: size unknown
             raise SkillError(f"the camera cannot see the far side of '{label}' (it runs out of the top of every view, "
                              f"top {max(o['top_z'] for o in unseen):.2f} m): it is too tall for the head camera's view (if the "
@@ -652,7 +678,8 @@ class TaskScene:
         for v in rec["views"]:
             z = np.load(os.path.join(run_dir, v["file"]))
             s.views.append(View(z["rgb"], z["depth"], v["depth_scale"], v["intrinsics"],
-                                {int(i): a for i, a in v["q"].items()}, np.array(v["T"]), v["imu_yaw"]))
+                                {int(i): a for i, a in v["q"].items()}, np.array(v["T"]), v["imu_yaw"],
+                                clean=rec.get("depth_clean", False)))
         s.recorded = rec
         return s
 

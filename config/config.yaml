@@ -360,10 +360,14 @@ scene:
   above_top_m: 0.01              # points this far above an object's top face are depth noise (dropped before fitting)
   edge_bias_m: 0.005             # added to footprints (all faces' points; the top-face-only fit needed 1.5 cm): the
                                  # 18.0 x 13.9 cm boxes measured 17.5 x 13.6 without it (2026-10-26)
-  body_above_support_m: 0.01     # an object's footprint = its points at least max(this, 15 % of its height) above its support
+  body_above_support_m: 0.01     # an object's footprint = its points at least max(this, body_above_frac x its height)
+  body_above_frac: 0.3           # above its support (the rails of a case stand 2.5 cm above its lid)
   grow_m: 0.025                  # an object also owns the depth points this close outside its mask (a mask edge stops short)
+  jump_m: 0.02                   # flying pixels: a 5x5 neighbourhood spanning more than max(jump_m, jump_rel * depth)
+  jump_rel: 0.04
   point_step_px: 2
   edge_px: 6                     # a mask this close to the image side is cut off there
+  top_edge_px: 2                 # a mask touching the image top runs out of view on its far side
   min_points: 60
   voxel_m: 0.015                 # 3D overlap tests between masks
   inside_ratio: 0.6              # a mask this much inside one other = its fragment; holding 2+ others = a group
