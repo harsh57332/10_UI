@@ -647,6 +647,26 @@ class TaskScene:
         (mx, my), _, _ = cv2.minAreaRect((top * 1000).astype(np.float32))
         return np.array([mx / 1000, my / 1000])
 
+    def held_top(self, ctx, noun, palms_mid):
+        """Top height of the object between the palms as the camera sees it now (None if not seen): whether a held
+        object really rose does not depend on how the hands deform (2026-10-29: Inspire hands lifted a box while
+        their palm points closed 1.7 cm on its flexing walls, read as a slip)."""
+        from .geometry import Geometry
+        from .skills import _pelvis_yaw
+        f = ctx.camera.fine(self.S["align_frames"])
+        q = ctx.motion.q_now(commanded=False)
+        probe = TaskScene(ctx, self.text, record=False)
+        probe.views.append(View(f.rgb, f.depth, f.depth_scale, f.intrinsics, q,
+                                ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q)), _pelvis_yaw(ctx)))
+        inst = [i for i in probe._segment(ctx, noun, 0) if i["ok"]]
+        near = lambda i: float(np.hypot(*(np.median(i["pts"][:, :2], axis=0) - np.asarray(palms_mid[:2]))))
+        inst = [i for i in inst if near(i) < self.S["held_near_m"]]
+        if not inst:
+            return None
+        z = min(inst, key=near)["pts"][:, 2]
+        top = Geometry.plane_height(z[z > np.percentile(z, 30)])
+        return float(np.percentile(z, 97)) if top is None else float(top)
+
     # ---------------------------------------------------------------- record, replay, forget
     def note(self, **kw):
         self.record.update(kw)

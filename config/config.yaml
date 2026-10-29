@@ -180,6 +180,9 @@ hands:
     palm_below_m: 0.045          # palm edge (little-finger side) below the contact frame (mesh: 4.5 cm)
     glove:                       # no gloves: only trims the fitted hand spheres to the real hand,
       thickness_m: 0.088         # contact plane (thumb, y 0.053) to the back of the hand (y -0.035), from the mesh
+    manipulation:                # this hand's own values over `manipulation`
+      slot_back_extra_m: 0.008   # run 1 2026-10-29: the left hand's back touched the stack 2-3 mm; the user: give 7-8 mm
+      drop_gap_m: 0.04           # hard palms on a flexing box close ~1.7 cm while holding it (run 1); a drop closes ~14 cm
 
 # Robot-side image server (D435i): RGB jpeg + aligned raw 16-bit depth (lossless PNG) over ZMQ PUB.
 camera:
@@ -384,6 +387,7 @@ scene:
   align_iters: 3
   align_accept_m: 0.02           # ...and if a correction cannot be planned, lowering goes ahead only below this
   align_max_m: 0.06              # a camera line-up error above this is a wrong measurement: refuse, never place on it
+  held_near_m: 0.08               # the held object: the camera's instance this close to the palms' midpoint
   margin_shift_m: 0.02           # margin check: the plan must also hold with every object 2 cm off (4 directions)...
   margin_turn_deg: 3             # ...and the scene turned 3 deg about the robot (2 directions)
   record: true                   # every task's views + plan go to logs/runs/<time>_task/ (scripts/replay_task.py)
@@ -428,6 +432,7 @@ manipulation:
   slot_palm_max_m: 0.035         # ...but at most this (a wide gap put it 5.6 cm off: no grasp pose, run 40)
   slot_palm_share: 0.55          # in a slot the palm side gets this share of the free space, the back the rest
   slot_back_clear_m: 0.035      # in a slot the glove's back keeps this from the neighbour; the palm side gets the rest
+  slot_back_extra_m: 0.0         # in a slot the hand moves this much toward the object it grips, away from the neighbour
   slot_wrist_room_m: 0.10        # a slot narrower than this has no room for the wrist (7.3 cm model + margins): planned
                                  # with slot_margin_m, the grip moving toward the robot so the wrist stays in front of it
                                  # (the user's demonstration: glove in a 5.6 cm gap, wrist in front of the boxes)

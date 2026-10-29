@@ -754,7 +754,8 @@ def _grasp_geometry(ctx, object, toward=0.0):
             raise SkillError(f"STANDARDS M5.1: only {gap * 100:.1f} cm between '{object}' and '{near}' (its {side} side); "
                              f"a glove needs {M['slot_min_gap_m'] * 100:.0f} cm to come down between them (runs 14-33: "
                              f"at 12-13 cm it touched one box or the other): move them apart")
-        o = M["free_side_off_m"] if gap is None else min(M["slot_palm_max_m"], (gap - thick) * M["slot_palm_share"])
+        o = M["free_side_off_m"] if gap is None else \
+            max(M["slot_clear_min_m"], min(M["slot_palm_max_m"], (gap - thick) * M["slot_palm_share"]) - M["slot_back_extra_m"])
         if o < M["slot_clear_min_m"]:
             raise SkillError(f"STANDARDS M5.1: only {max(gap, 0) * 100:.1f} cm free between '{object}' and '{near}' "
                              f"(its {side} side); a glove is {thick * 100:.1f} cm thick and needs "
@@ -763,7 +764,8 @@ def _grasp_geometry(ctx, object, toward=0.0):
         if gap is not None and gap < M["slot_wrist_room_m"]:
             slot.add(near)                      # a narrow slot: planned with the slot margin (touch-checked descent)
         off[side + "_free"] = gap is None
-        off[side + "_mid"] = o if gap is None else min(M["free_side_off_m"], (gap - thick) / 2)   # centred fallback
+        off[side + "_mid"] = o if gap is None else \
+            max(M["slot_clear_min_m"], min(M["free_side_off_m"], (gap - thick) / 2) - M["slot_back_extra_m"])   # centred fallback
     byaw = b.get("yaw", 0.0)
     if abs(byaw) > math.radians(M["max_trusted_box_yaw_deg"]):
         byaw = 0.0                              # a large estimated angle is more likely a mis-fit than real
@@ -907,7 +909,7 @@ def grasp(ctx, plan):
     cx, cy, zg, half, sq, yaw, pitch = (g[k] for k in ("cx", "cy", "zg", "half", "squeeze", "yaw", "pitch"))
     free = [g["table"]] + g["others"]
     grip = {"extra": 0.0, "dx": 0.0, "dy": 0.0, "gap": None, "force": 0.0,  # filled in by _press
-            "lines": g.get("lines")}
+            "lines": g.get("lines"), "object": g["object"]}
     _to_state(ctx, plan, "GRIPPING", grip=grip)
     plan.call("close until contact", lambda: _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, free, grip))
     # planned only so later steps (lift) start from a squeeze pose; the call above does the real closing
@@ -1264,7 +1266,10 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
     m = ctx.motion
     lm, rm = m.palms(m.q_now(commanded=False))
     z0 = float(lm[2] + rm[2]) / 2               # where the hands really are (resting gloves sit above the plan)
+    noun = (ctx.bb["objects"].get(grip.get("object") or "", {}) or {}).get("noun")
+    seen = lambda: ctx.scene.held_top(ctx, noun, (lm + rm) / 2) if ctx.scene is not None and noun else None
     while True:
+        top0 = seen()                           # the object's top before the test lift (camera), if it is seen
         gx, gy = cx + grip["dx"], cy + grip["dy"]
         _grip_force(ctx, payload_kg=M["payload_kg"])
         p = _contact_plan(m)
@@ -1277,8 +1282,13 @@ def _secure_grip(ctx, cx, cy, zg, half, squeeze, yaw, pitch, world, grip):
         gap, z = float(np.linalg.norm(left - right)), float(left[2] + right[2]) / 2
         ok_gap = grip["gap"] - gap < M["test_slip_m"]   # the palms closing in at all = it starts to slip
         ok_z = z >= z0 + M["test_lift_m"] / 2    # the hands (and the object between them) really came up
-        log.info("test lift at %.0f N: hands up %.1f cm (of %.1f), palms %.1f cm apart (gripped at %.1f)", grip["force"],
-                 100 * (z - z0), 100 * M["test_lift_m"], 100 * gap, 100 * grip["gap"])
+        top1 = seen() if top0 is not None else None
+        rose = None if top1 is None else top1 - top0
+        if rose is not None:                     # the camera saw the object itself: that decides (palm points move
+            ok_gap = rose >= M["test_lift_m"] / 2   # with the hands' deformation; the object rising is the grip)
+        log.info("test lift at %.0f N: hands up %.1f cm (of %.1f), palms %.1f cm apart (gripped at %.1f), object rose %s",
+                 grip["force"], 100 * (z - z0), 100 * M["test_lift_m"], 100 * gap, 100 * grip["gap"],
+                 "unseen" if rose is None else f"{100 * rose:.1f} cm (camera)")
         if ok_gap and ok_z:
             # self-calibration: the gripping palms are centred on the box, so their midpoint (from joint
             # angles) minus the camera's box centre is the camera-to-arm offset along the squeeze axis

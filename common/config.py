@@ -19,6 +19,7 @@ def load() -> dict:
         cfg = yaml.safe_load(f)
     pm = cfg["planner_model"]
     cfg["_hand_lists"] = {k: copy.deepcopy(pm[k]) for k in ("self_collision_ignore", "held_object_ignore")}
+    cfg["_manipulation"] = copy.deepcopy(cfg["manipulation"])     # before any hand profile's overrides
     ee = cfg["end_effector"]
     _apply_hands(cfg, ee["detect"] if ee["detect"] in cfg["hands"] else ee["default"])
     return cfg
@@ -47,6 +48,8 @@ def _apply_hands(cfg, name):
     cfg["robot"]["urdf"] = h["urdf"]
     cfg["services"]["planner"]["urdf"], cfg["services"]["planner"]["robot_yml"] = h["planner_urdf"], h["planner_yml"]
     pm.update(source_urdf=h["urdf"], tcp=h["tcp"], glove=h.get("glove") or {}, contact_ahead_m=h["contact_ahead_m"])
+    cfg["manipulation"].clear()                 # the shared values, then this hand's own (profile `manipulation`)
+    cfg["manipulation"].update(copy.deepcopy(cfg["_manipulation"]), **copy.deepcopy(h.get("manipulation") or {}))
     cfg["manipulation"]["palm_below_m"] = h["palm_below_m"]
     names = {"$left_hand": h["links"][0], "$right_hand": h["links"][1]}
     sub = lambda v: names.get(v, v)
