@@ -68,7 +68,8 @@ class TaskScene:
                                         time.strftime("%Y%m%d_%H%M%S") + "_task")
         if self.run_dir:
             os.makedirs(self.run_dir, exist_ok=True)
-        self.record = {"text": text, "views": [], "found": {}, "t": time.time()}
+        self.record = {"text": text, "views": [], "found": {}, "t": time.time(),
+                       "camera": ctx.geometry.mount() if ctx.geometry is not None else None}
 
     # ---------------------------------------------------------------- views
     def capture(self, ctx, yaw_deg):
@@ -153,7 +154,7 @@ class TaskScene:
             # image left = robot's left: an object touching the left edge continues to the left (+yaw)
             cut = 1 if x1 <= S["edge_px"] else (-1 if x2 >= W - S["edge_px"] else 0)
             i = {"noun": noun, "view": k, "score": r["score"], "box": r["box"], "mask": mask, "pts": pts, "cut": cut,
-                 "id": f"{k}.{j}"}
+                 "far_cut": y1 <= S["edge_px"], "id": f"{k}.{j}"}   # image top = its far side (the camera looks down)
             i["ok"], i["why"] = self._usable(i)
             if i["ok"]:
                 i["vox"] = self._vox(pts)
@@ -212,6 +213,7 @@ class TaskScene:
                     i.setdefault("also", set()).add(c["noun"])
                 log.info("'%s' %s holds %d separate others: a group, dropped", noun, c["id"], len(inner))
         inst = [i for i in inst if (i["noun"], i["view"], i["id"]) not in groups]
+        self._groups = groups
         parent = list(range(len(inst)))
 
         def root(i):
@@ -240,17 +242,83 @@ class TaskScene:
                 o["views"][i["view"]], o["cut"][i["view"]] = i, i["cut"]
             if len(members) > 1:
                 log.info("'%s': %s are one object", noun, o["ids"])
+            o["members"] = members
             o.update(self._fit(o["pts"], bg, self._best_view(o)))
+            extra = self._grow(ctx, o)
+            if len(extra):
+                o["pts"], o["extra"] = np.vstack([o["pts"], extra]), extra
+                o.update(self._fit(o["pts"], bg, self._best_view(o)))
             objs.append(o)
         return self._join_slivers(objs, bg)
 
-    def _best_view(self, o):
-        """The points of the view that sees the object whole and nearest the image centre (None: all views)."""
+    def _best_inst(self, o):
+        """The mask of the view that sees the object whole and nearest the image centre (None: never whole)."""
         W = self.views[0].depth.shape[1]
-        whole = [i for k, i in o["views"].items() if o["cut"][k] == 0]
+        whole = [i for k, i in o["views"].items() if o["cut"][k] == 0 and not i["far_cut"]] or \
+                [i for k, i in o["views"].items() if o["cut"][k] == 0]
         if not whole:
             return None
-        return min(whole, key=lambda i: abs((i["box"][0] + i["box"][2]) / 2 - W / 2))["pts"]
+        return min(whole, key=lambda i: abs((i["box"][0] + i["box"][2]) / 2 - W / 2))
+
+    def _best_view(self, o):
+        """The points of the best view (with what _grow added there), or None: all views."""
+        i = self._best_inst(o)
+        if i is None:
+            return None
+        return i["pts"] if o.get("extra") is None else np.vstack([i["pts"], o["extra"]])
+
+    def _grow(self, ctx, o):
+        """A mask edge can stop short of the object (2026-10-29: SAM left out the 2 cm dark rim of a box top, the box
+        read 12.1 cm wide instead of 14 and the rim, outside every mask, became an obstacle where the glove goes).
+        Depth points in a band of grow_m around the best view's mask are the object's too if they stand above its
+        support (not the surface it is on), not above its top, within grow_m of its points and in no other object's
+        mask."""
+        S = self.S
+        i = self._best_inst(o)
+        if i is None:
+            return np.zeros((0, 3))
+        k, v = i["view"], self.views[i["view"]]
+        mask = np.zeros(v.depth.shape, bool)
+        for m in o["members"]:
+            if m["view"] == k:
+                mask |= m["mask"]
+        others = np.zeros(v.depth.shape, bool)
+        for (noun, kk), insts in self.inst.items():
+            for j in insts if kk == k else []:
+                if j["ok"] and not any(j is m for m in o["members"]) and (j["noun"], j["view"], j["id"]) not in self._groups:
+                    others |= j["mask"]
+        d = v.depth[mask & (v.depth > 0)]
+        if d.size == 0:
+            return np.zeros((0, 3))
+        r = int(math.ceil(v.intrinsics["fx"] * S["grow_m"] / (float(np.median(d)) * v.depth_scale)))
+        band = (cv2.dilate(mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) > 0) \
+            & ~mask & ~others & (v.depth > 0)
+        vs, us = np.nonzero(band)
+        P = self._pixels_to_pelvis(ctx, v, us, vs)
+        sup, top = o["support_z"], o["top_z"]
+        lo = sup + max(S["body_above_support_m"], 0.15 * (top - sup))
+        P = P[(P[:, 2] > lo) & (P[:, 2] <= top + S["above_top_m"])]
+        body = o["pts"][(o["pts"][:, 2] > lo) & (o["pts"][:, 2] <= top + S["above_top_m"])]
+        if not len(P) or not len(body):
+            return np.zeros((0, 3))
+        # connected to the object: within grow_m of its points seen from above (5 mm grid)
+        g = 0.005
+        x0, y0 = body[:, :2].min(axis=0) - S["grow_m"] - g
+        cell = lambda q: np.floor((q[:, :2] - [x0, y0]) / g).astype(int)
+        cb = cell(body)
+        n = int(math.ceil(S["grow_m"] / g))
+        H, W = cb.max(axis=0) + n + 2
+        grid = np.zeros((H, W), np.uint8)
+        grid[cb[:, 0], cb[:, 1]] = 1
+        grid = cv2.dilate(grid, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * n + 1, 2 * n + 1)))
+        cp = cell(P)
+        inside = (cp[:, 0] >= 0) & (cp[:, 1] >= 0) & (cp[:, 0] < H) & (cp[:, 1] < W)
+        keep = np.zeros(len(P), bool)
+        keep[inside] = grid[cp[inside, 0], cp[inside, 1]] > 0
+        if keep.sum() >= 10:
+            log.info("%s: %d depth points just outside its mask are its edge (grown)", o["ids"], int(keep.sum()))
+            return P[keep]
+        return np.zeros((0, 3))
 
     def _join_slivers(self, objs, bg):
         """An object seen only cut off at an image side (a sliver of a face) belongs to the object whose footprint
@@ -296,6 +364,33 @@ class TaskScene:
         self._bg, self._bg_n = bg[bg[:, 2] > self.cfg["perception"]["floor_below_m"]], len(self.views)
         return self._bg
 
+    def _footprint(self, xy):
+        """Minimum-area rectangle of points seen from above (p1-p99 trimmed), axes named so y (the squeeze axis) is
+        the one closest to left-right: (cx, cy, dx, dy, yaw, raw a, raw b) in metres / radians / mm."""
+        lo, hi = np.percentile(xy, 1, axis=0), np.percentile(xy, 99, axis=0)
+        xy = xy[np.all((xy >= lo) & (xy <= hi), axis=1)]
+        (mx, my), (a, b_), ang = cv2.minAreaRect((xy * 1000).astype(np.float32))
+        yaw = math.radians(ang)
+        ex = np.array([math.cos(yaw), math.sin(yaw)])
+        if abs(ex[1]) > abs(ex[0]):
+            yaw += math.pi / 2
+            a, b_ = b_, a
+        yaw = (yaw + math.pi / 2) % math.pi - math.pi / 2
+        if yaw > math.pi / 4:
+            yaw, a, b_ = yaw - math.pi / 2, b_, a
+        elif yaw < -math.pi / 4:
+            yaw, a, b_ = yaw + math.pi / 2, b_, a
+        return mx / 1000, my / 1000, a / 1000 + self.S["edge_bias_m"], b_ / 1000 + self.S["edge_bias_m"], yaw, a, b_
+
+    def _support(self, bg, cx, cy, dx, dy, top, pts):
+        """Height of the surface in a ring around the footprint, below the top (else the object's lowest points)."""
+        from .geometry import Geometry
+        r = math.hypot(dx, dy) / 2
+        d = np.hypot(bg[:, 0] - cx, bg[:, 1] - cy) if len(bg) else np.zeros(0)
+        ring = bg[(d > r + 0.01) & (d < r + self.S["support_ring_m"]) & (bg[:, 2] < top - 0.02)] if len(bg) else bg
+        support = Geometry.plane_height(ring[:, 2]) if len(ring) else None
+        return float(np.percentile(pts[:, 2], 3)) if support is None else support
+
     def _fit(self, pts, bg, foot=None):
         """Oriented box of an object's points: top = 97th percentile, support = the surface around it, footprint =
         minimum-area rectangle seen from above of `foot` (its best single view: views disagree by 1-2 cm, and their
@@ -308,29 +403,14 @@ class TaskScene:
         cap = top + self.S["above_top_m"]
         pts = pts[pts[:, 2] <= cap]
         foot = pts if foot is None else foot[foot[:, 2] <= cap]
-        xy = foot[:, :2]
-        lo, hi = np.percentile(xy, 1, axis=0), np.percentile(xy, 99, axis=0)
-        xy = xy[np.all((xy >= lo) & (xy <= hi), axis=1)]
-        (mx, my), (a, b_), ang = cv2.minAreaRect((xy * 1000).astype(np.float32))
-        yaw = math.radians(ang)
-        ex = np.array([math.cos(yaw), math.sin(yaw)])
-        if abs(ex[1]) > abs(ex[0]):                      # name the axes: y (squeeze axis) closest to left-right
-            yaw += math.pi / 2
-            a, b_ = b_, a
-        yaw = (yaw + math.pi / 2) % math.pi - math.pi / 2
-        if yaw > math.pi / 4:
-            yaw, a, b_ = yaw - math.pi / 2, b_, a
-        elif yaw < -math.pi / 4:
-            yaw, a, b_ = yaw + math.pi / 2, b_, a
-        dx, dy = a / 1000 + self.S["edge_bias_m"], b_ / 1000 + self.S["edge_bias_m"]
-        cx, cy = mx / 1000, my / 1000
-        # the support: the surface in a ring around the footprint, below the top
-        r = math.hypot(dx, dy) / 2
-        d = np.hypot(bg[:, 0] - cx, bg[:, 1] - cy) if len(bg) else np.zeros(0)
-        ring = bg[(d > r + 0.01) & (d < r + self.S["support_ring_m"]) & (bg[:, 2] < top - 0.02)] if len(bg) else bg
-        support = Geometry.plane_height(ring[:, 2]) if len(ring) else None
-        if support is None:
-            support = float(np.percentile(pts[:, 2], 3))
+        cx, cy, dx, dy, yaw, a, b_ = self._footprint(foot[:, :2])
+        support = self._support(bg, cx, cy, dx, dy, top, pts)
+        # the mask's spill onto what the object stands on (a case rail, the table edge) is not the object: its
+        # footprint is what stands above the support (2026-10-29: a rail strip 6 cm beside a box made it 18 cm wide)
+        body = foot[foot[:, 2] > support + max(self.S["body_above_support_m"], 0.15 * (top - support))]
+        if len(body) >= self.S["min_points"]:
+            cx, cy, dx, dy, yaw, a, b_ = self._footprint(body[:, :2])
+            support = self._support(bg, cx, cy, dx, dy, top, pts)
         # the shape: a box's top face fills its rectangle, a cylinder's ~79 %
         tp = pts[pts[:, 2] > top - 0.02, :2]
         fill = 0.0
@@ -421,6 +501,11 @@ class TaskScene:
             where = ", ".join(f"({e['center'][0]:.2f}, {e['center'][1]:+.2f})" for e in cands)
             raise SkillError(f"'{label}' matches {len(cands)} objects at {where} m: say which one "
                              f"(left / right / nearest / farthest / middle)")
+        unseen = [o for o in pick["objs"] if all(i["far_cut"] for i in o["views"].values())]
+        if unseen:                                       # its far part is above the top of every view: size unknown
+            raise SkillError(f"the camera cannot see the far side of '{label}' (it runs out of the top of every view, "
+                             f"top {max(o['top_z'] for o in unseen):.2f} m): it is too tall for the head camera's view (if the "
+                             f"camera points further down than it should, scripts/camera_tilt.py shows by how much)")
         for k, v in ctx.bb["objects"].items():          # two names must not be one object
             if k != label and math.hypot(v["center"][0] - pick["center"][0], v["center"][1] - pick["center"][1]) < 0.05:
                 raise SkillError(f"'{label}' is the same object as '{k}'")
@@ -561,6 +646,8 @@ class TaskScene:
     def load(cls, ctx, run_dir):
         """A recorded task scene (offline replay): the same views, so the same instances, objects and map."""
         rec = json.load(open(os.path.join(run_dir, "scene.json")))
+        from .geometry import Geometry                  # the camera pose used live (before 2026-10-29: the URDF's)
+        ctx.geometry.use_mount(rec.get("camera") or Geometry(fix=False).mount())
         s = cls(ctx, rec["text"], run_dir=os.path.join(run_dir, "replay"))
         for v in rec["views"]:
             z = np.load(os.path.join(run_dir, v["file"]))

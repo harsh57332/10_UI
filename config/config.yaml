@@ -187,7 +187,9 @@ camera:
   zmq_port: 5555
   control_port: 5556             # REQ/REP: {"preset": "fine" | "coarse"}
   presets:                       # D400 visual_preset per precision mode
-    fine: 3                      # High Accuracy (manipulation)
+    fine: 1                      # Default (manipulation; units below). 2026-10-29: High Accuracy left a varying
+                                 # 1-3 cm strip of a box top without depth (box 11.4-12.5 cm wide, real 14); Default
+                                 # covered 100 % of it, top face equally flat (1.7 vs 1.5 mm rms)
     coarse: 1                    # Default (walking)
   depth_units_m:                 # raw depth unit per mode: fine = 1 mm / k (k = 5; the user asked to try k 3..7:
     fine: 0.0002                 # 1 mm steps spoiled the manipulation frame), still 13 m of 16-bit range
@@ -358,6 +360,8 @@ scene:
   above_top_m: 0.01              # points this far above an object's top face are depth noise (dropped before fitting)
   edge_bias_m: 0.005             # added to footprints (all faces' points; the top-face-only fit needed 1.5 cm): the
                                  # 18.0 x 13.9 cm boxes measured 17.5 x 13.6 without it (2026-10-26)
+  body_above_support_m: 0.01     # an object's footprint = its points at least max(this, 15 % of its height) above its support
+  grow_m: 0.025                  # an object also owns the depth points this close outside its mask (a mask edge stops short)
   point_step_px: 2
   edge_px: 6                     # a mask this close to the image side is cut off there
   min_points: 60
@@ -387,6 +391,10 @@ camera_mount:
   # torso-frame correction of measured points so they match the arms: the photo-checked reach found the
   # box 3 cm further left than the camera put it
   calib_offset_m: [0.0, 0.03, 0.0]
+  # the camera's real angle in its mount relative to the URDF's d435_joint, as a rotation of the optical frame
+  # (rpy, deg; x right = pitch). Measured with the camera's own accelerometer + torso IMU: scripts/camera_tilt.py
+  # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
+  optical_fix_rpy_deg: [-12.03, -0.72, 0.83]
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:

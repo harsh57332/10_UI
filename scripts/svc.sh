@@ -25,8 +25,13 @@ start() {
   echo $! > "$LOGS/$1.pid"
   echo "$1 started (pid $!, log logs/$1.log)"
 }
-stop() {
-  if running "$1"; then kill -- -"$(cat "$LOGS/$1.pid")" 2>/dev/null || kill "$(cat "$LOGS/$1.pid")"; echo "$1 stopped"; fi
+stop() {   # TERM, then KILL after 5 s (the server can hang in shutdown and keep its port: two servers, 2026-10-29)
+  if running "$1"; then
+    local pid; pid=$(cat "$LOGS/$1.pid")
+    kill -- -"$pid" 2>/dev/null || kill "$pid"
+    for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    if kill -0 "$pid" 2>/dev/null; then kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid"; echo "$1 killed (did not stop)"; else echo "$1 stopped"; fi
+  fi
   rm -f "$LOGS/$1.pid"
 }
 status() { if running "$1"; then echo "$1: running (pid $(cat "$LOGS/$1.pid"))"; else echo "$1: stopped"; fi; }

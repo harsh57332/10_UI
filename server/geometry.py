@@ -10,21 +10,32 @@ import cv2
 import numpy as np
 
 from common import config
-from common.fk import FK
+from common.fk import FK, _rpy
 
 # columns = optical x (right), y (down), z (forward) expressed in the camera link frame (x fwd, y left, z up)
 R_LINK_OPTICAL = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
 
 
 class Geometry:
-    def __init__(self):
+    def __init__(self, fix=True):
+        """fix: apply camera_mount.optical_fix_rpy_deg (the camera's real angle in its mount, measured with its own
+        accelerometer by scripts/camera_tilt.py); False = the URDF mount only (recordings made before the fix)."""
         cfg = config.load()
         self.cfg = cfg
         self.fk = FK(config.path(cfg["robot"]["urdf"]))
         T_link = self.fk.pose(cfg["camera_mount"]["link"])
-        self.R = T_link[:3, :3] @ R_LINK_OPTICAL
+        self.R_urdf = T_link[:3, :3] @ R_LINK_OPTICAL
+        f = cfg["camera_mount"].get("optical_fix_rpy_deg") if fix else None
+        self.R = self.R_urdf @ (_rpy(*np.radians(f)) if f else np.eye(3))
         self.t = (T_link[:3, 3] + T_link[:3, :3] @ np.array(cfg["camera_mount"]["rgb_offset_m"])
                   + np.array(cfg["camera_mount"].get("calib_offset_m", [0.0, 0.0, 0.0])))
+
+    def mount(self):
+        """The camera pose in the torso frame now in use (recorded with every task scene)."""
+        return {"R": self.R.tolist(), "t": self.t.tolist()}
+
+    def use_mount(self, m):
+        self.R, self.t = np.array(m["R"], float), np.array(m["t"], float)
 
     def torso_in_pelvis(self, waist):
         """4x4 pose of the torso in the pelvis frame for waist angles [yaw, roll, pitch] (rad)."""
