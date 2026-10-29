@@ -375,6 +375,7 @@ scene:
   min_points: 60
   voxel_m: 0.015                 # 3D overlap tests between masks
   inside_ratio: 0.6              # a mask this much inside one other = its fragment; holding 2+ others = a group
+  fragment_top_tol_m: 0.03       # a mask inside another is its fragment only if its top is not higher than this above
   same_object_overlap: 0.3       # two views' masks overlapping this much (of the smaller) are one object
   support_ring_m: 0.12           # the support is measured in this ring around an object
   stack_gap_m: 0.06              # an object rests on another: its seen bottom within this of the other's top (an

@@ -188,6 +188,10 @@ class TaskScene:
             i["ok"], i["why"] = self._usable(i)
             if i["ok"]:
                 i["vox"] = self._vox(pts)
+                from .geometry import Geometry
+                z = pts[:, 2]
+                t = Geometry.plane_height(z[z > np.percentile(z, 30)])
+                i["top"] = float(np.percentile(z, 97)) if t is None else float(t)
             out.append(i)
             log.info("view %d '%s' #%d: score %.2f, %d points%s", k, noun, j, r["score"], len(pts),
                      "" if i["ok"] else f" (not an object: {i['why']})")
@@ -242,6 +246,15 @@ class TaskScene:
                 for i in inner:                 # what the group was called applies to what it holds
                     i.setdefault("also", set()).add(c["noun"])
                 log.info("'%s' %s holds %d separate others: a group, dropped", noun, c["id"], len(inner))
+        tol = S["fragment_top_tol_m"]
+        for c in inst:                          # a mask with something standing higher inside it is what things stand
+            if (c["noun"], c["view"], c["id"]) in groups:      # on (2026-10-29: SAM called the case a box; through
+                continue                        # a sliver its mask chained the stack into the case): not an object
+            above = [i for i in inst if i is not c and len(i["vox"]) < len(c["vox"]) and i["top"] > c["top"] + tol
+                     and self._inside(i, c) > S["inside_ratio"]]
+            if above:
+                groups.add((c["noun"], c["view"], c["id"]))
+                log.info("'%s' %s has %d things standing on it: a support, dropped", noun, c["id"], len(above))
         inst = [i for i in inst if (i["noun"], i["view"], i["id"]) not in groups]
         self._groups = groups
         parent = list(range(len(inst)))
@@ -250,12 +263,21 @@ class TaskScene:
             while parent[i] != i:
                 i = parent[i]
             return i
+        # the same object seen twice (both ways, same top) is joined; a fragment (mostly inside, not standing higher)
+        # joins only the one object it lies most inside: a sliver at the foot of a stack lay inside both the stack and
+        # the case under it and chained the two into one (2026-10-29)
+        ins = {(x, y): self._inside(inst[x], inst[y]) for x in range(len(inst)) for y in range(len(inst)) if x != y}
+        same = lambda x, y: abs(inst[x]["top"] - inst[y]["top"]) <= tol and (
+            min(ins[x, y], ins[y, x]) > S["same_object_overlap"] or min(ins[x, y], ins[y, x]) > S["inside_ratio"])
         for x in range(len(inst)):
             for y in range(x + 1, len(inst)):
-                a, b = inst[x], inst[y]
-                if max(self._inside(a, b), self._inside(b, a)) > S["inside_ratio"] or \
-                        min(self._inside(a, b), self._inside(b, a)) > S["same_object_overlap"]:
+                if same(x, y):
                     parent[root(x)] = root(y)
+        for x in range(len(inst)):
+            hosts = [y for y in range(len(inst)) if y != x and not same(x, y) and ins[x, y] > S["inside_ratio"]
+                     and inst[x]["top"] <= inst[y]["top"] + tol and len(inst[y]["vox"]) >= len(inst[x]["vox"])]
+            if hosts:
+                parent[root(x)] = root(max(hosts, key=lambda y: (ins[x, y], -len(inst[y]["vox"]))))
         comps = {}
         for x in range(len(inst)):
             comps.setdefault(root(x), []).append(inst[x])
