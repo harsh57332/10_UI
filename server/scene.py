@@ -31,11 +31,15 @@ log = logging.getLogger("scene")
 QUALS = {"left", "right", "nearest", "closest", "farthest", "middle", "center", "centre"}
 
 
+FILLER = {"side", "hand", "the", "a", "an"}   # 'right side', 'left-hand side': position, not the object's name
+
+
 def parse(label):
-    """'right side boxes' -> ('side box', ['right']): SAM 3 sees the noun (singular: 'side boxes' and 'side box'
-    are one noun, 2026-10-29: the plural got only a whole-stack mask), code applies the position words."""
-    words = label.lower().split()
-    noun = [w for w in words if w not in QUALS] or words
+    """'right side boxes' -> ('box', ['right']): SAM 3 sees the noun (singular: 'boxes' and 'box' are one noun,
+    2026-10-29: the plural got only a whole-stack mask; 'side box' found no stack at all in one view), code applies
+    the position words."""
+    words = label.lower().replace("-", " ").split()
+    noun = [w for w in words if w not in QUALS and w not in FILLER] or words
     return " ".join(noun[:-1] + [_singular(noun[-1])]), [w for w in words if w in QUALS]
 
 
@@ -45,7 +49,7 @@ def _singular(w):
     return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
 
 
-def clean_depth(depth, scale, S):
+def clean_depth(depth, scale, S, fx):
     """Flying pixels: at a depth jump (a box edge, the case's edge 80 cm above the floor) the camera returns
     in-between depths, thin lines in mid air that the Default preset keeps (2026-10-29: a 18 x 14 cm box fitted
     29 x 20 cm, and the lines were obstacles in the map). A pixel whose 5 x 5 neighbourhood spans more than
@@ -56,8 +60,15 @@ def clean_depth(depth, scale, S):
     lo = cv2.erode(np.where(valid, d, 1e3).astype(np.float32), k)
     hi = cv2.dilate(np.where(valid, d, 0.0).astype(np.float32), k)
     bad = valid & ((hi - lo) > np.maximum(S["jump_m"], S["jump_rel"] * d))
+    # speckles: with the jumps cut, a small isolated patch is a false stereo match (2026-10-29: blobs on the bare
+    # floor read 0.2 m instead of 1.2 m and blocked the arm in the map), not an object
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((valid & ~bad).astype(np.uint8), connectivity=8)
+    area = stats[:, cv2.CC_STAT_AREA].astype(np.float64)
+    mean_d = np.bincount(lab.ravel(), weights=d.ravel(), minlength=n) / np.maximum(area, 1)
+    small = area * (mean_d / fx) ** 2 < S["min_blob_m2"]     # its size in the world, not in pixels
+    small[0] = False                                    # label 0 = no depth
     out = depth.copy()
-    out[bad] = 0
+    out[bad | small[lab]] = 0
     return out
 
 
@@ -66,7 +77,7 @@ class View:
         """depth: as the camera gave it (kept as raw, recorded); the scene and the map use it without flying pixels
         (clean=False: recordings made before 2026-10-29 16:00, replayed as they ran)."""
         self.rgb, self.raw, self.depth_scale, self.intrinsics = rgb, depth, depth_scale, intrinsics
-        self.depth = clean_depth(depth, depth_scale, config.load()["scene"]) if clean else depth
+        self.depth = clean_depth(depth, depth_scale, config.load()["scene"], intrinsics["fx"]) if clean else depth
         self.q, self.T, self.imu_yaw = q, T, imu_yaw       # joints (rad), torso in pelvis at capture, IMU yaw (rad)
 
     @property
@@ -523,11 +534,12 @@ class TaskScene:
         def far(o, k):                                   # a real mask of it in view k (not a stray sliver) touches the top
             ms = [m for m in o["members"] if m["view"] == k]
             return any(m["far_cut"] and len(m["pts"]) >= 0.25 * max(len(x["pts"]) for x in ms) for m in ms)
-        # seen to its far side: in a view that has it whole sideways (else in any view: never whole), no mask of it
-        # touches the top (2026-10-29: a sliver of a stack at an image side passed, the stack's far 3 cm stayed an
-        # obstacle under the place)
+        # seen to its far side: in a view showing a good part of it (half the points of its best view; 2026-10-29: a
+        # sliver of a stack at an image side passed and the stack's unseen far 3 cm stayed an obstacle under the
+        # place) no mask of it touches the top
+        size = lambda o, k: sum(len(m["pts"]) for m in o["members"] if m["view"] == k)
         unseen = [o for o in pick["objs"]
-                  if all(far(o, k) for k in ([k for k in o["views"] if o["cut"][k] == 0] or list(o["views"])))]
+                  if not any(not far(o, k) and size(o, k) >= 0.5 * max(size(o, j) for j in o["views"]) for k in o["views"])]
         if unseen:                                       # its far part is above the top of every view: size unknown
             raise SkillError(f"the camera cannot see the far side of '{label}' (it runs out of the top of every view, "
                              f"top {max(o['top_z'] for o in unseen):.2f} m): it is too tall for the head camera's view (if the "

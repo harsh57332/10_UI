@@ -9,7 +9,7 @@ Robot standing still. The camera service is stopped for ~10 s (the accelerometer
   python -m scripts.camera_tilt --write    also put the fix into config.yaml (camera_mount.optical_fix_rpy_deg)
 Then restart the server (it reads the camera mount at start).
 The D435i accelerometer is not factory calibrated (~1-2 deg). The fix is then refined on the level surfaces in view
-(floor, table, box tops; the large flat ones that agree within 0.6 deg): their normal must be the IMU's up. The
+(floor, table, box tops; the large flat ones that agree within 1 deg): their normal must be the IMU's up. The
 same check afterwards tells how far the camera model is off (expect < 0.5 deg)."""
 import math
 import re
@@ -113,7 +113,7 @@ def level_normal(geo):
     if not planes:
         return None, []
     ref = planes[0][1]
-    agree = [p for p in planes if math.degrees(math.acos(min(1.0, float(p[1] @ ref)))) < 0.6]
+    agree = [p for p in planes if math.degrees(math.acos(min(1.0, float(p[1] @ ref)))) < 1.0]
     if len(agree) < 2:
         return None, planes
     n = sum(c * p for c, p, _ in agree)

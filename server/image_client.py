@@ -116,7 +116,9 @@ class ImageClient:
         sock.connect(f"tcp://{self.host}:{self.cfg['camera']['control_port']}")
         try:
             sock.send_json({"preset": mode})
-            sock.recv_json()
+            r = sock.recv_json()
+            if r.get("error"):
+                raise RuntimeError(f"camera could not switch to {mode}: {r['error']}")
             self.preset = mode
         except zmq.Again:
             raise RuntimeError("camera did not answer the precision switch")

@@ -365,6 +365,7 @@ scene:
   grow_m: 0.025                  # an object also owns the depth points this close outside its mask (a mask edge stops short)
   jump_m: 0.02                   # flying pixels: a 5x5 neighbourhood spanning more than max(jump_m, jump_rel * depth)
   jump_rel: 0.04
+  min_blob_m2: 0.0004            # a depth patch (cut off by jumps) smaller than 2 x 2 cm is a false match, dropped
   point_step_px: 2
   edge_px: 6                     # a mask this close to the image side is cut off there
   top_edge_px: 2                 # a mask touching the image top runs out of view on its far side
@@ -398,7 +399,7 @@ camera_mount:
   # the camera's real angle in its mount relative to the URDF's d435_joint, as a rotation of the optical frame
   # (rpy, deg; x right = pitch). Measured with the camera's own accelerometer + torso IMU: scripts/camera_tilt.py
   # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
-  optical_fix_rpy_deg: [-4.60, -0.75, 0.73]
+  optical_fix_rpy_deg: [-2.22, -0.63, 0.57]
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:

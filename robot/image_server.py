@@ -36,22 +36,35 @@ def hardware_reset():
         d.hardware_reset()
 
 
+def _set(sensor, opt, value, tries=10):
+    """set_option, retried: the D435i's USB control transfer fails now and then ('get_xu(ctrl=1) failed ...
+    Resource temporarily unavailable', 2026-10-29); a hardware reset for each made the camera loop for minutes."""
+    for k in range(tries):
+        try:
+            sensor.set_option(opt, value)
+            return
+        except RuntimeError as e:
+            if k == tries - 1:
+                raise
+            log.warning("camera option %s: %s (retry %d)", opt, e, k + 1)
+            time.sleep(0.3)
+
+
 def set_preset(profile, value, units):
     """Visual preset and depth units (m per raw unit) for a precision mode; returns the depth scale now in use."""
     sensor = profile.get_device().first_depth_sensor()
     if sensor.supports(rs.option.visual_preset):
-        sensor.set_option(rs.option.visual_preset, float(value))
+        _set(sensor, rs.option.visual_preset, float(value))
     if sensor.supports(rs.option.depth_units):
-        sensor.set_option(rs.option.depth_units, float(units))
+        _set(sensor, rs.option.depth_units, float(units))
     # the IR projector on at a fixed power, never left to the preset: after the hardware resets of 2026-10-29 only
     # 66 % of the pixels had depth (85 % before), the dark case and box tops worst
     em = config.load()["camera"]["emitter"]
     if sensor.supports(rs.option.emitter_enabled):
-        sensor.set_option(rs.option.emitter_enabled, 1.0)
+        _set(sensor, rs.option.emitter_enabled, 1.0)
     if sensor.supports(rs.option.laser_power):
-        rng = sensor.get_option_range(rs.option.laser_power)
-        sensor.set_option(rs.option.laser_power, float(min(rng.max, max(rng.min, em["laser_power"]))))
-        log.info("emitter on, laser power %.0f (range %.0f..%.0f)", sensor.get_option(rs.option.laser_power), rng.min, rng.max)
+        _set(sensor, rs.option.laser_power, float(em["laser_power"]))     # D435i range 0..360
+        log.info("emitter on, laser power %.0f", em["laser_power"])
     return sensor.get_depth_scale()
 
 
@@ -82,13 +95,18 @@ def main():
                 frames = pipe.wait_for_frames(c["frame_timeout_ms"])
                 try:                                 # precision switch from the server (non-blocking)
                     req = ctl.recv_json(flags=zmq.NOBLOCK)
-                    if req.get("preset") in c["presets"]:
-                        mode = req["preset"]
-                        scale = set_preset(profile, c["presets"][mode], c["depth_units_m"][mode])
-                        skip = c["switch_skip_frames"]   # frames already captured carry the old depth units
-                    ctl.send_json({"preset": mode})
                 except zmq.Again:
-                    pass
+                    req = None
+                if req is not None:                  # a REP socket must answer every request, even a failed one:
+                    try:                             # unanswered, every later recv failed ('Operation cannot be
+                        if req.get("preset") in c["presets"]:   # accomplished in current state') -> reset loop
+                            mode = req["preset"]
+                            scale = set_preset(profile, c["presets"][mode], c["depth_units_m"][mode])
+                            skip = c["switch_skip_frames"]   # frames already captured carry the old depth units
+                        ctl.send_json({"preset": mode})
+                    except Exception as e:
+                        ctl.send_json({"error": str(e)})
+                        raise
                 if skip:
                     skip -= 1
                     continue
