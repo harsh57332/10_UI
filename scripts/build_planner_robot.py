@@ -64,6 +64,7 @@ def glove(spheres, tcp, normals, g):
     curl in further than the gloved palm, so those spheres are pushed back to it. Nothing reaches further
     back than the measured glove thickness (palm surface to back) either."""
     pad, extra, thick = g.get("pad_m", 0.0), g.get("finger_extra_m", 0.0), g.get("thickness_m")
+    keep_thumb = g.get("keep_thumb_m")          # Inspire: the thumb (to the thumb side) stays proud of the palm
     for name, t in tcp.items():
         a = t["rpy"][2]                         # the palm surface is twisted about z (see config.tcp_frames)
         rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
@@ -77,6 +78,9 @@ def glove(spheres, tcp, normals, g):
         for c in sp + tips:
             ctr, r = np.array(c["center"], float), c["radius"] + pad
             excess = (ctr - p0) @ n + r             # how far it reaches past the glove's palm surface
+            thumb_side = 1.0 if name.startswith("left") else -1.0      # thumb +x (left hand) / -x (right hand)
+            if keep_thumb is not None and thumb_side * ctr[0] >= keep_thumb:
+                excess = 0.0                        # the thumb: kept as fitted
             if excess > 0:                          # trim its palm side to the surface: shrink by half the
                 ctr -= excess / 2 * n               # excess and move back by half, so its back edge (the
                 r -= excess / 2                     # glove's back padding) stays where it was

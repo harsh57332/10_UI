@@ -694,7 +694,10 @@ def _glove():
             c = np.array([sp["center"] for sp in spheres[t["parent"]]])
             r = np.array([sp["radius"] for sp in spheres[t["parent"]]])
             d = (c - np.array(t["xyz"])) @ n
-            thick.append(float((d + r).max() - (d - r).min()))
+            keep = (config.load()["planner_model"].get("glove") or {}).get("keep_thumb_m")
+            beside = (c - np.array(t["xyz"])) @ R[:, 2] < keep if keep is not None else np.ones(len(c), bool)
+            # the thumb that stands out over a gripped box (Inspire) is above it, not between it and a neighbour
+            thick.append(float((d[beside] + r[beside]).max() - (d - r).min()))
             below.append(float(((np.array(t["xyz"]) - c) @ R[:, 2] + r).max()))
         _GLOVE.update(thickness=max(thick), below=max(below))
     return _GLOVE

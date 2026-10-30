@@ -172,18 +172,21 @@ hands:
     planner_urdf: assets/planner/inspire/g1_arms.urdf
     planner_yml: assets/planner/inspire/g1_arms.yml
     links: [left_inspire_hand, right_inspire_hand]
-    tcp:                         # hand frame: z along the fingers, +y out of the palm, thumb +x (left) / -x (right). Open,
-      # the thumb stands 2.3 cm proud of the palm (y 0.053 at z 0.12) and touches a box face first: the contact plane
-      left_tcp:  {parent: left_inspire_hand,  xyz: [0.0, 0.053, 0.10], normal: [0, 1, 0], axis: [0, 0, 1]}
-      right_tcp: {parent: right_inspire_hand, xyz: [0.0, 0.053, 0.10], normal: [0, 1, 0], axis: [0, 0, 1]}
+    tcp:                         # hand frame: z along the fingers, +y out of the palm, thumb +x (left) / -x (right).
+      # The contact plane is the palm's heel (y 0.030, z 4-8 cm: the flattest part standing out); the open thumb stands
+      # 2.3 cm prouder but 4-12 cm to the thumb side (above a gripped box's top). Run 1 (2026-10-29) squeezed the box
+      # 2.6 cm behind the old thumb-plane frame (y 0.053): the box sat on the heel.
+      left_tcp:  {parent: left_inspire_hand,  xyz: [0.0, 0.030, 0.10], normal: [0, 1, 0], axis: [0, 0, 1]}
+      right_tcp: {parent: right_inspire_hand, xyz: [0.0, 0.030, 0.10], normal: [0, 1, 0], axis: [0, 0, 1]}
     contact_ahead_m: 0.0
     palm_below_m: 0.045          # palm edge (little-finger side) below the contact frame (mesh: 4.5 cm)
     glove:                       # no gloves: only trims the fitted hand spheres to the real hand,
-      thickness_m: 0.088         # contact plane (thumb, y 0.053) to the back of the hand (y -0.035), from the mesh
+      thickness_m: 0.065         # contact plane (heel, y 0.030) to the back of the hand (y -0.035), from the mesh
+      keep_thumb_m: 0.06         # spheres this far to the thumb side stay proud of the contact plane (the outer thumb, above a box gripped at mid-height; its base yields: run 1)
     manipulation:                # this hand's own values over `manipulation`
       slot_back_extra_m: 0.008   # run 1 2026-10-29: the left hand's back touched the stack 2-3 mm; the user: give 7-8 mm
       drop_gap_m: 0.04           # hard palms on a flexing box close ~1.7 cm while holding it (run 1); a drop closes ~14 cm
-      slot_min_gap_m: 0.115      # the open hand is 8.8 cm thick: 10.2 cm gaps never planned, 11.5 and 13.1 did (29-30 Oct)
+      slot_min_gap_m: 0.085      # the hand at a box's height is 6.5 cm (heel to back; the thumb is above the box) + clearances
 
 # Robot-side image server (D435i): RGB jpeg + aligned raw 16-bit depth (lossless PNG) over ZMQ PUB.
 camera:
