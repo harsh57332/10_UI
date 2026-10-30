@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--hold", type=float, default=20.0)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--plan-only", action="store_true")
+    ap.add_argument("--scene", action="store_true", help="find with the task scene (scan, SAM 3 objects, map) as Generate does")
     ap.add_argument("--all-at-once", action="store_true",
                     help="plan every action first (arms resting), then run them as one continuous sequence")
     a = ap.parse_args()
@@ -46,11 +47,19 @@ def main():
     t = time.monotonic()
     while cam.latest() is None and time.monotonic() - t < 10:
         time.sleep(0.1)
+    hands = (link.state().get("end_effector") or {}).get("type")
+    if hands:
+        config.use_hands(hands)                 # the hands the robot reports (as the server does)
     ctx = Ctx(link, cam, Service("vision"), Geometry(), ArmMotion(link, Service("planner"), lambda s: nullcontext()),
               lambda s: nullcontext())
     try:
         if not a.plan_only:
             check_cool(ctx)
+        if a.scene:
+            from server.scene import TaskScene, parse as label_noun
+            ctx.scene = TaskScene(ctx, "practice: " + a.actions)
+            nouns = sorted({label_noun(n.strip())[0] for n in a.find.split(",") if n.strip()})
+            print("scene views at waist", ctx.scene.scan(ctx, nouns), "deg (hands:", config.hands() + ")")
         for name in filter(None, (x.strip() for x in a.find.split(","))):
             print("find:", run_skill(ctx, "find", {"object": name}))
         if a.plan_only or a.all_at_once:

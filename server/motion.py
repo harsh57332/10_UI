@@ -132,6 +132,15 @@ class ArmMotion:
             out.append(T[:3, 3] + T[:3, :3] @ np.array(t["xyz"]))
         return out
 
+    def hand_points(self, q, local):
+        """Pelvis-frame points given in each hand link's frame: {name: [points]} -> {name: [points]}."""
+        qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}
+        out = {}
+        for name, pts in local.items():
+            T = self.fk.pose(self.tcp[name]["parent"], qn, base="pelvis")
+            out[name] = [T[:3, 3] + T[:3, :3] @ np.asarray(p, float) for p in pts]
+        return out
+
     def palm_frames(self, q):
         """Pelvis-frame palm frames {name: (position, 3x3 rotation)} (the goal convention: twisted on the hand)."""
         qn = {joints.NAMES[i] + "_joint": v for i, v in q.items()}

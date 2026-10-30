@@ -821,6 +821,10 @@ def _grasp_geometry(ctx, object, toward=0.0):
     # so the squeeze holds it at its centre of mass ("whenever told to lift anything, find its centre"). Run 18:
     # fingertips at the far corner put the grip 2.6 cm ahead of the centre and the box swung down in the gloves
     shift = config.load()["planner_model"]["contact_ahead_m"] - toward    # contact frame vs the grip's centre
+    if M.get("grip_base_behind_m") is not None:  # flat hands: the hand's base just behind the near face, the whole
+        t = config.load()["planner_model"]["tcp"]["left_tcp"]     # palm along the side (the user, 2026-10-30)
+        along = float(np.dot(t["xyz"], t["axis"]) / np.linalg.norm(t["axis"]))   # contact frame from the hand base
+        shift = along - dx / 2 - M["grip_base_behind_m"] - toward
     gx, gy = cx + shift * math.cos(byaw), cy + shift * math.sin(byaw)
     return {"object": object, "cx": gx, "cy": gy, "cz": cz, "zg": zg, "half": dy / 2, "width": dy, "grip_shift": -shift,
             "center": list(b["center"]),
@@ -1265,18 +1269,37 @@ def _hold_here(ctx):
                                  "recovery": ctx.motion.recovery}, timeout=15)
 
 
-def _close_wrists(ctx):
+def _close_wrists(ctx, yaw=None):
     """The second half of the squeeze: with the hard wrist housings on the object, the wrist yaws turn the fingers
     in (left -, right +: 5 deg = 1.5 cm at the fingertips) so the fingertips press the far corners (the user's pick-up
     pose, Media 53). Commanded past the contact by wrist_close_deg: the wrist spring keeps them pressing."""
-    d = ctx.cfg["manipulation"]["wrist_close_deg"]
-    if not d:                                   # off: the arms alone squeeze (the user, 2026-10-24)
+    M = ctx.cfg["manipulation"]
+    d, toe = M["wrist_close_deg"], M.get("palm_toe_in_deg")
+    if not d and (toe is None or yaw is None):  # off: the arms alone squeeze (the user, 2026-10-24)
         return
     s = ctx.link.state()
     cmd = s["arms"].get("q_cmd_deg")
     q = {str(15 + k): round(v, 2) for k, v in enumerate(cmd[3:17])} if cmd else \
         {str(j["index"]): round(j["deg"], 2) for j in s["joints"] if 15 <= j["index"] <= 28}
-    q["21"], q["28"] = q["21"] - d, q["28"] + d
+    if toe is not None and yaw is not None:
+        # flat palms (Inspire): each hand turned to lie along the box's side, its fingertip end toe_in degrees in, so
+        # the whole palm presses (run 10-30 11:59: the right hand stood 6 deg open toward the front, only the back
+        # corners were pressed and the front of the box swung down - the user)
+        axis = np.array([-math.sin(yaw), math.cos(yaw)])
+        line = M["palm_line"]
+        pts = ctx.motion.hand_points(ctx.motion.q_now(commanded=False),
+                                     {"left_tcp": [line["heel"], line["tip"]], "right_tcp": [line["heel"], line["tip"]]})
+        turn = {}
+        for name, joint, sign, out in (("left_tcp", "21", -1.0, 1.0), ("right_tcp", "28", 1.0, -1.0)):
+            heel, tip = pts[name]
+            along = float(np.linalg.norm((tip - heel)[:2]))
+            opened = math.degrees(math.atan2(out * float(np.dot((tip - heel)[:2], axis)), along))   # >0: tip further out
+            delta = max(-M["palm_turn_max_deg"], min(M["palm_turn_max_deg"], opened + toe))
+            q[joint] = round(q[joint] + sign * delta, 2)
+            turn[name[:-4]] = (round(opened, 1), round(delta, 1))
+        log.info("palms along the box: (open deg, wrist turn deg) %s", turn)
+    else:
+        q["21"], q["28"] = q["21"] - d, q["28"] + d
     ctx.agent("play_upperbody", {"keyframes": [{"t": 0.6, "q": q}], "interp": "linear",
                                  "recovery": ctx.motion.recovery}, timeout=15)
     time.sleep(ctx.cfg["manipulation"]["press_settle_s"])
@@ -1305,7 +1328,7 @@ def _press(ctx, cx, cy, half, sq, yaw, grip, force):
     shift = mid - np.array([cx, cy])
     grip.update(dx=float(shift[0]), dy=float(shift[1]), extra=(half - sq) - gap / 2,
                 gap=float(np.linalg.norm(lm - rm)), force=force)
-    _close_wrists(ctx)                          # ...and the fingers: squeezing is both ways (user, Media 53)
+    _close_wrists(ctx, yaw)                     # ...and the fingers: squeezing is both ways (user, Media 53)
     lw, rw = m.palms(m.q_now(commanded=False))  # the slip reference AFTER the wrists close: turning the hands moves
     grip["gap"] = float(np.linalg.norm(lw - rw))   # the palm points ~3 cm closer (run 31 read that as a slip)
     qc = m.q_now(commanded=True)                # = where the hands are (the command follows them), wrists closed
