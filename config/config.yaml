@@ -187,8 +187,9 @@ hands:
       slot_back_extra_m: 0.008   # run 1 2026-10-29: the left hand's back touched the stack 2-3 mm; the user: give 7-8 mm
       drop_gap_m: 0.04           # hard palms on a flexing box close ~1.7 cm while holding it (run 1); a drop closes ~14 cm
       slot_min_gap_m: 0.085      # the hand at a box's height is 6.5 cm (heel to back; the thumb is above the box) + clearances
-      grip_base_behind_m: 0.015  # the hand's base this far behind the box's near face, palm along its side (user 10-30)
-      palm_toe_in_deg: 2.0       # after the squeeze each wrist turns its hand along the box side + this toe-in (whole palm)
+      grip_base_behind_m: 0.04   # the hand's base this far behind the box's near face, palm along its side (user 10-30: 1.5 cm, then 2.5 cm more toward the robot)
+      palm_toe_in_deg: 3.0       # after the squeeze each wrist turns its hand along the box side + this toe-in (whole palm; user: press a little)
+      squeeze_n: 22              # 18 N let the box's front swing down (user 10-30: press a little)
       palm_turn_max_deg: 10.0    # ...at most this much
       palm_line: {heel: [0.0, 0.030, 0.06], tip: [0.0, 0.015, 0.20]}   # hand frame: palm heel and fingertip pads
 
@@ -549,6 +550,7 @@ manipulation:
                                  # 1.5 cm refused a good grip (14.7 on a box measured 12.5). The test lift decides
   close_slowdown: 1.5            # closing on the object plays this slow, in arms.chunk_s pieces, until a hand touches...
   contact_lag_m: 0.006           # ...until both hands lag their command by this much (touching)
+  contact_lag_min_m: 0.002       # at the end of a close-in: held back at least min(contact_lag_m, max(this, half the overrun))
   close_settle_s: 0.3
   close_lift_m: 0.003            # closing in: each hand at its measured height + this (a hand resting on something slides)
   close_raise_m: 0.01            # ...and at least this above the planned grasp height (lowest points ~1.3 cm over the support)

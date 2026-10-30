@@ -1244,7 +1244,10 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
     if not m.execute(p.steps[-1]["traj"], holding=True, slowdown=M["close_slowdown"], stop=touch) and not touch():
         time.sleep(M["close_settle_s"])        # the move ended: a hand still held back from its command is against it
         _, _, lag_l, lag_r, _, _ = state()
-        if max(lag_l - base_l, lag_r - base_r) < M["contact_lag_m"]:
+        # the close aims only sq past the measured faces, so a hand the box stops lags at most ~sq: contact_lag_m
+        # (6 mm) against a 5 mm overrun failed a good grip (practice 10-30: "perfect position, it just touched and
+        # retreated" - user); half the overrun counts, and the force squeeze then checks the gap against the width
+        if max(lag_l - base_l, lag_r - base_r) < min(M["contact_lag_m"], max(M["contact_lag_min_m"], 0.5 * sq)):
             raise SkillError("closed past the measured faces without touching: the object is not where the camera put it")
     return _press(ctx, cx, cy, half, sq, yaw, grip, M["squeeze_n"])
 
