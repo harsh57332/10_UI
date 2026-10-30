@@ -40,6 +40,32 @@ class Gravity:
         self.payload_kg = 0.0
         self.squeeze_n = 0.0
 
+    def waist_pitch(self, q):
+        """Gravity torque (Nm) the waist pitch motor holds at upper-body angles q (rad, motor 12..28), with the payload
+        on the palms: everything above it. For the heat forecast only (never sent to the robot: the waist pitch is
+        the balance joint). Matched the measured 7-9 Nm (ready pose) and 18.6 Nm (Inspire hands over a box), 2026-10-30."""
+        qn = {joints.NAMES[j] + "_joint": float(v) for j, v in zip(joints.UPPER_BODY, q)}
+        g = self.fk.pose("torso_link", qn, base="pelvis")[:3, :3].T @ np.array([0.0, 0.0, -9.81])   # torso frame
+        T = {"torso_link": np.eye(4)}
+        for link in self.order[1:]:
+            j = self.fk.joints[link]
+            M = T[j["parent"]] @ j["T"]
+            if j["type"] in ("revolute", "continuous"):
+                R = np.eye(4)
+                R[:3, :3] = _axis_angle(j["axis"], qn.get(j["name"], 0.0))
+                M = M @ R
+            T[link] = M
+        s = np.zeros(3)
+        for link in self.order:
+            mk, c = self.mass.get(link, (0.0, np.zeros(3)))
+            if link in self.hands:
+                mk += self.glove_kg
+            s = s + mk * (T[link][:3, :3] @ c + T[link][:3, 3])
+        for link, p in self.palms:
+            s = s + self.payload_kg / 2 * (T[link][:3, :3] @ p + T[link][:3, 3])
+        axis = np.asarray(self.fk.joints["torso_link"]["axis"], float)   # the waist pitch joint, at the torso origin
+        return -float(axis @ np.cross(s, g))
+
     def torques(self, q):
         """{motor index: Nm} for the 14 arm joints at upper-body angles q (rad, motor 12..28)."""
         qn = {joints.NAMES[j] + "_joint": float(v) for j, v in zip(joints.UPPER_BODY, q)}

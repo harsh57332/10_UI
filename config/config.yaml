@@ -562,6 +562,7 @@ manipulation:
 # shoulder pitch: +1.5 C/s, settling ~94 C. For long holds keep the shoulder pitch at or below ~6 Nm (~74 C).
 thermal:
   torque_scale: 1.0              # (1.2 over-predicted the passing UI stack: 88 vs 76 C real)
+  waist_torque_scale: 1.2        # measured / modelled waist pitch torque (median 1.19-1.20 over 546 samples, both hands)
   start_ok_c: 60                 # a task starting with every arm motor <= this runs even if the peak is predicted
                                  # over the limit (user 2026-10-26); the agent still warns at 92 and holds at 95 C
   margin_c: 2                    # (whole-run replays: within ~5 C; it over-predicted the stack that passed, 89 vs 85 C)
@@ -572,13 +573,14 @@ thermal:
     "16": {a: 0.0175, b: 0.0236, amb: 54.4}   # left shoulder roll
     "22": {a: 0.0205, b: 0.0415, amb: 55.6}   # right shoulder pitch
     "23": {a: 0.0148, b: 0.0199, amb: 51.0}   # right shoulder roll
+    "14": {a: 0.00463, b: 0.0265, amb: 45.0}  # waist pitch (fitted 2026-10-30 on 126 windows of 24 + 29 Oct runs, measured tau)
   call_s:                        # how long the live (call) steps of a plan usually take, s
     default: 1.0
-    "close until contact": 3.0
-    "come down beside the object (touch-checked)": 3.0
-    "secure the grip (test lift)": 3.0
-    "line up over the target": 2.0
-    "lower until it sits on the target": 3.0
+    "close until contact": 8.0                       # measured (runs 24 + 29 Oct): 6-9 s
+    "come down beside the object (touch-checked)": 10.0   # 9-10.4 s (it was 3: the forecast missed ~7 s of arms out)
+    "secure the grip (test lift)": 5.0               # 2.3 s + the camera's before/after look
+    "line up over the target": 3.5                   # 2.3-3.6 s
+    "lower until it sits on the target": 4.0         # 2.9-4.2 s
     "let go": 3.0
     "set down until it sits on something": 4.0
   squeeze_on: ["close until contact"]                       # the squeeze force starts here...
