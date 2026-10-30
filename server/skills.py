@@ -1161,8 +1161,8 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
         return (float(np.dot(lc[:2] - c, axis)), float(-np.dot(rc[:2] - c, axis)),
                 float(np.dot(lm[:2] - lc[:2], axis)), float(np.dot(rc[:2] - rm[:2], axis)), lm, rm)
 
-    def goals(hl, hr, centre, z=zg):
-        left, right = _hands(centre[0], centre[1], z, hl, yaw, pitch), _hands(centre[0], centre[1], z, hr, yaw, pitch)
+    def goals(hl, hr, centre, z=zg, zr=None):
+        left, right = _hands(centre[0], centre[1], z, hl, yaw, pitch), _hands(centre[0], centre[1], z if zr is None else zr, hr, yaw, pitch)
         return {"left_tcp": left["left_tcp"], "right_tcp": right["right_tcp"]}
 
     def stalled(name, palm, side):              # a hand stopped well outside the face: not the object
@@ -1188,22 +1188,35 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
     else:
         # not where the plan expected (e.g. the gloves came to rest on the support a little above the planned
         # height): close in sideways at the height the hands are at, not back down to the planned one
-        lc, rc = m.palms(m.q_now(commanded=True))
-        z_live, last = float(lc[2] + rc[2]) / 2, None
-        # sideways only, so not into the support below: a descent ending 1 mm low put the hands inside its 2 mm
-        # margin and every close-in 'started in collision' (runs 2026-10-29 16:47 and 10-30 11:51); the
-        # neighbours stay in the check
-        beside = [w for w in world if w["name"] != "table"]
-        for z in ([z_live, zg] if abs(z_live - zg) > 0.005 else [zg]):
-            try:
-                _line_or_free(p, "close in", goals(half - sq, half - sq, c, z), beside)
-                break
-            except SkillError as e:
-                last = e
-        else:
-            raise last
-        log.info("close in from the live pose at %.1f cm %s the planned height", 100 * abs(z_live - zg),
-                 "above" if z_live > zg else "below")
+        # Each hand first straight up to its closing height: the planned grasp height, and at least close_lift_m
+        # above where it really is (run 10-30 11:53: one hand rested 1.4 cm high, the other hung past the case's
+        # edge and sagged 1.2 cm low, below the lid; closing in from there pushed it into the case's edge). Up
+        # only, so planned without the support (a descent ending 1 mm low is inside its 2 mm margin: 10-29 16:47,
+        # 10-30 11:51); then sideways in with the support and the neighbours checked.
+        lm_, rm_ = m.palms(m.q_now(commanded=False))
+        lift = M["close_lift_m"]
+        zl, zr = max(float(lm_[2]), zg + M["close_raise_m"]) + lift, max(float(rm_[2]), zg + M["close_raise_m"]) + lift
+        # straight up from where each palm is, its angle kept (turning it on the way up left no line in); the
+        # support then stays >= close_raise_m below the hands' lowest points by construction, so both moves are
+        # checked against the neighbours only (the support's block also caught the elbows in front of the case)
+        up = {"left_tcp": {"position": [float(lm_[0]), float(lm_[1]), zl], "quaternion": None},
+              "right_tcp": {"position": [float(rm_[0]), float(rm_[1]), zr], "quaternion": None}}
+        beside, last = [w for w in world if w["name"] != "table"], None
+        try:
+            _line_or_free(p, "hands to the closing height", up, beside)
+            _line_or_free(p, "close in", goals(half - sq, half - sq, c, zl, zr), beside)
+        except SkillError as e:
+            last = e
+            log.warning("close in at the closing height: %s; from the planned height", e)
+            p = _contact_plan(m)
+            _line_or_free(p, "close in", goals(half - sq, half - sq, c, zg, zg), beside)
+        if last is None:                       # the up move first (not touch-watched), then the close-in below
+            m.execute(p.steps[0]["traj"], holding=True)
+            p.steps = p.steps[1:]
+            time.sleep(M["close_settle_s"])     # the touch baselines from where the hands are now
+            hl, hr, base_l, base_r, lm, rm = state()
+        log.info("close in at %.1f / %.1f cm above the planned height (hands were %+.1f / %+.1f)", 100 * (zl - zg),
+                 100 * (zr - zg), 100 * (float(lm_[2]) - zg), 100 * (float(rm_[2]) - zg))
     touched, count = {}, {"left": 0, "right": 0}
     last = {"left": (hl, float(np.dot(lm[:2] - c, axis))), "right": (hr, float(-np.dot(rm[:2] - c, axis)))}
 
