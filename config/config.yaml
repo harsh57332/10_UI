@@ -183,6 +183,7 @@ hands:
     manipulation:                # this hand's own values over `manipulation`
       slot_back_extra_m: 0.008   # run 1 2026-10-29: the left hand's back touched the stack 2-3 mm; the user: give 7-8 mm
       drop_gap_m: 0.04           # hard palms on a flexing box close ~1.7 cm while holding it (run 1); a drop closes ~14 cm
+      slot_min_gap_m: 0.115      # the open hand is 8.8 cm thick: 10.2 cm gaps never planned, 11.5 and 13.1 did (29-30 Oct)
 
 # Robot-side image server (D435i): RGB jpeg + aligned raw 16-bit depth (lossless PNG) over ZMQ PUB.
 camera:
@@ -404,7 +405,7 @@ camera_mount:
   # the camera's real angle in its mount relative to the URDF's d435_joint, as a rotation of the optical frame
   # (rpy, deg; x right = pitch). Measured with the camera's own accelerometer + torso IMU: scripts/camera_tilt.py
   # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
-  optical_fix_rpy_deg: [-2.22, -0.63, 0.57]
+  optical_fix_rpy_deg: [-1.76, -0.80, 0.74]
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:

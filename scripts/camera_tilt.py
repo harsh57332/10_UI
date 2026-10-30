@@ -57,7 +57,7 @@ def accel(cfg):
     if not line:
         raise SystemExit(f"no accelerometer data: {r.stdout[-300:]} {r.stderr[-300:]}")
     v = [float(x) for x in line[0].split()[1:]]
-    if v[3] > 0.5:
+    if v[3] > 1.5:
         raise SystemExit(f"the camera was moving (accelerometer std {v[3]:.2f} m/s^2): stand still and retry")
     return np.array(v[:3])
 
