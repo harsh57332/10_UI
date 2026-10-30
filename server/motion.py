@@ -384,13 +384,14 @@ class ArmPlan:
                            "margin": margin})
         self.q = self.m.end_q(self.q, traj)
 
-    def line(self, label, goals, world, goals_fn=None, margin=0.0, traj=None):
+    def line(self, label, goals, world, goals_fn=None, margin=0.0, traj=None, use_map=True):
         """Straight-line move of the palms (contact moves): no free re-planning, so no arm flips. `traj`: a line
-        already proven from this same pose (its IK is seeded randomly, so near a limit a re-plan can fail)."""
+        already proven from this same pose (its IK is seeded randomly, so near a limit a re-plan can fail).
+        use_map=False: only the given cuboids (an escape that starts touching what the map holds)."""
         g, wld = self._torso(goals, world)
         try:
             if traj is None:
-                traj = self.m.plan_line(self.q, g, wld, self.attached, self._map(), margin)
+                traj = self.m.plan_line(self.q, g, wld, self.attached, self._map() if use_map else None, margin)
         except RuntimeError as e:
             raise SkillError(f"{label}: {e}")
         self.m.check_swing(traj, label)

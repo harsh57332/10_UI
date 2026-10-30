@@ -67,10 +67,10 @@ locomotion:
 arms:
   rate_hz: 50
   max_speed_dps: 45              # joint speed used to time set_upperbody moves
-  playback_slowdown: 1.5         # planned trajectories play this many times slower (1.0 = as planned; slower = less body
+  playback_slowdown: 1.0         # planned trajectories play this many times slower (1.0 = as planned; slower = less body
                                  # sway, but heat grows with time under load: 2.5 kept the arms out ~35-40 s per stack)
   chunk_s: 0.3                   # moves that may end early (lowering until contact) play in pieces this long
-  playback_slowdown_holding: 1.5 # ...and this much slower while holding a box (3.0 kept the shoulders loaded too
+  playback_slowdown_holding: 1.0 # ...and this much slower while holding a box (3.0 kept the shoulders loaded too
                                  # long: holding a box out costs ~8 Nm of shoulder pitch, ~1.7 C/s)
   max_arm_turn_deg: 300          # refuse a planned move whose joints of one arm turn more than this in
                                  # total: cuRobo accepts any collision-free IK, incl. arms wrapped over the
@@ -442,7 +442,7 @@ manipulation:
   slot_clear_min_m: 0.003        # in a slot, at least this on each side of the glove (else refused: too tight; the
                                  # user's demonstration fitted the 5.0 cm glove into a 5.6 cm gap)
   descent_margin_m: 0.01         # planning margin of the straight descent (touch-checked when it runs)
-  descent_slowdown: 2.0          # it plays this slow, in short pieces, stopping if a glove meets an edge
+  descent_slowdown: 1.0          # it plays this slow, in short pieces, stopping if a glove meets an edge
   descent_follow_min: 0.3        # a glove is blocked when it lags (land_lag_m) and went down less than this part of the
   descent_block_lag_m: 0.025     #   commanded drop in the last piece (rubbing a face only slows it), or lags this much
   rest_high_max_m: 0.03          # a glove stopped this close above the grasp height (on a rail, the case edge) with
@@ -519,6 +519,8 @@ manipulation:
                                        # 5 cm first: the wrist presses the face too, see planner_model.glove.contact_span_x_m)
   retreat_open_m: 0.03           # retreat: gloves open straight out this far before moving up and away
   retreat_clear_m: 0.03          # ...and move up until their lowest point is this far above every object top around them
+  escape_up_extra_m: [0.0, 0.01, 0.03]   # the last-resort escape: up to the clearance, else this much higher
+  escape_back_m: 0.12            # ...then this far back toward the body before going down by the sides
   last_resort_open_deg: 10       # nothing plannable: shoulder rolls outward this much to free the gloves, then stow
   test_hold_s: 0.6
   squeeze_n: 18                  # grip by FORCE: each palm pushes toward the other this hard (agent feedforward
@@ -537,7 +539,7 @@ manipulation:
                                  # each further in than the palm, run 9: 16.3 on a box measured 12.3). The camera's width varies by
                                  # ~1.5 cm (one box: 12.5 / 13.6 / 14.3 cm) and the glove surface is modelled ~1 cm off;
                                  # 1.5 cm refused a good grip (14.7 on a box measured 12.5). The test lift decides
-  close_slowdown: 3.0            # closing on the object plays this slow, in arms.chunk_s pieces, until a hand touches...
+  close_slowdown: 1.5            # closing on the object plays this slow, in arms.chunk_s pieces, until a hand touches...
   contact_lag_m: 0.006           # ...until both hands lag their command by this much (touching)
   close_settle_s: 0.3
   contact_early_m: 0.035         # a hand "touching" further than this outside the measured face is stopped by
@@ -575,12 +577,12 @@ thermal:
     "23": {a: 0.0148, b: 0.0199, amb: 51.0}   # right shoulder roll
     "14": {a: 0.00463, b: 0.0265, amb: 45.0}  # waist pitch (fitted 2026-10-30 on 126 windows of 24 + 29 Oct runs, measured tau)
   call_s:                        # how long the live (call) steps of a plan usually take, s
-    default: 1.0
-    "close until contact": 8.0                       # measured (runs 24 + 29 Oct): 6-9 s
-    "come down beside the object (touch-checked)": 10.0   # 9-10.4 s (it was 3: the forecast missed ~7 s of arms out)
-    "secure the grip (test lift)": 5.0               # 2.3 s + the camera's before/after look
-    "line up over the target": 3.5                   # 2.3-3.6 s
-    "lower until it sits on the target": 4.0         # 2.9-4.2 s
+    default: 0.3                                     # state changes and checks: ~0.3 s measured
+    "close until contact": 4.0                       # at close_slowdown 1.5 (was 6-9 s at 3.0)
+    "come down beside the object (touch-checked)": 5.0   # at descent_slowdown 1.0 (was 9-10.4 s at 2.0)
+    "secure the grip (test lift)": 4.0               # 2 s + the camera's before/after look
+    "line up over the target": 3.0                   # 2.3-3.6 s
+    "lower until it sits on the target": 3.0         # 2.9-4.2 s at the old speed
     "let go": 3.0
     "set down until it sits on something": 4.0
   squeeze_on: ["close until contact"]                       # the squeeze force starts here...

@@ -155,28 +155,64 @@ def recover(ctx):
         ctx.motion.recovery = False
 
 
-def _last_resort(ctx):
-    """Nothing else could be planned: stop squeezing, then only collision-checked moves with everything still
-    known (the world stays until the arms are down): straight up clear of every object, down by the sides,
-    waist straight, release. If even that cannot be planned the arms stay held: never blind joint moves (run 37:
-    the old direct stow swept the just-made stack off)."""
-    M, a = ctx.cfg["manipulation"], ctx.cfg["arms"]
-    _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0)
+def _escape_plan(ctx):
+    """The way out when nothing else plans, typically because the hands touch the object (every plan then 'starts in
+    collision', 2026-10-29: the arms stayed held beside a box and the waist pitch reached 98 C). Straight up until
+    the hands' lowest point clears every object top, checked against everything but the object the hands touch
+    (that one would block any plan from contact; the neighbours must not be swept), then down by the sides with
+    everything known (normal margin and map, else the objects' exact boxes). A height that does not plan is tried
+    higher. Returns the plan (not run). Tested on the stuck pose of 2026-10-29 16:47."""
+    M = ctx.cfg["manipulation"]
     world = _scene_world(ctx)
+    touched = (ctx.bb.get("grasp") or {}).get("object") or (ctx.bb.get("holding") or {}).get("object")
+    others = [w for w in world if w["name"] != touched]
     plan = ArmPlan(ctx.motion)
+    start = plan.mark()
     left, right = plan.palms()
     mid, yaw = plan.m.object_frame(left, right)
     half = float(np.linalg.norm(left - right)) / 2
-    z_up = max([v["top_z"] for v in ctx.bb["objects"].values()] + [float(mid[2]) - _glove()["below"]]) \
-        + _glove()["below"] + M["retreat_clear_m"]
+    top = max([v["top_z"] for v in ctx.bb["objects"].values()] + [float(mid[2]) - _glove()["below"]])
+    last = None
+    for extra in M["escape_up_extra_m"]:
+        plan.restore(start)
+        z_up = top + _glove()["below"] + M["retreat_clear_m"] + extra
+        try:
+            if z_up > mid[2] + 0.005:
+                plan.line("hands straight up", _hands(mid[0], mid[1], z_up, half, yaw, keep=True), others,
+                          use_map=False)
+        except SkillError as e:
+            last = e
+            log.warning("escape up %.0f cm above the tops: %s", 100 * (z_up - top), e)
+            continue
+        up = plan.mark()
+        for margin, use_map in ((M["near_margin_m"], True), (0.0, False)):
+            plan.restore(up)
+            plan.use_map = use_map
+            try:
+                for name, angles in (("arms out to the sides", M["side_deg"]), ("arms down", M["rest_deg"])):
+                    goal = dict(plan.q)
+                    goal.update({15 + k: math.radians(v) for k, v in enumerate(angles)})
+                    plan.to_joint(name, goal, world, margin=margin)
+                plan.use_map = True
+                return plan
+            except SkillError as e:
+                last = e
+                log.warning("escape down (margin %.3f, map %s): %s", margin, use_map, e)
+    plan.use_map = True
+    raise last
+
+
+def _last_resort(ctx):
+    """Nothing else could be planned: stop squeezing, then the escape (planned, see _escape_plan), waist straight,
+    release. If even that cannot be planned the arms stay held: never blind joint moves (run 37: the old direct
+    stow swept the just-made stack off)."""
+    a = ctx.cfg["arms"]
+    _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0)
     try:
-        if z_up > mid[2] + 0.005:
-            plan.line("hands straight up", _hands(mid[0], mid[1], z_up, half, yaw, keep=True),
-                      [w for w in world if w["name"] != "table"])
-        _via_sideways(ctx, plan, M["rest_deg"], "arms down")
+        plan = _escape_plan(ctx)
     except SkillError as e:
         log.error("last resort: no safe path (%s): the arms stay held", e)
-        return f"arms HELD where they are (no collision-free way down: {e})"
+        return f"arms HELD where they are (no collision-free way out: {e})"
     for st in plan.steps:
         ctx.motion.execute(st["traj"])
     j = {x["index"]: x["deg"] for x in ctx.link.state()["joints"]}
@@ -184,7 +220,7 @@ def _last_resort(ctx):
         ctx.motion.move_waist([0.0, math.radians(j[13]), math.radians(j[14])], max(1.0, abs(j[12]) / a["waist_speed_dps"]))
     ctx.agent("release_upperbody", {}, timeout=15)
     ctx.bb.update(hand="EMPTY", holding=None, grasp=None, grip=None)
-    return "hands up, arms down by the sides (planned around everything), released"
+    return "hands up, back, arms down by the sides (planned around everything), released"
 
 
 def rest(ctx):
