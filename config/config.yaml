@@ -192,6 +192,9 @@ hands:
                                  # the soft wrist yaw (kp 30) then presses the finger pads ~15 N (3 deg: ~8 N, the box pivoted on the heels
                                  # and its front dropped after 5-8 s - user photos Media 55-57, 2026-10-30)
       squeeze_n: 22              # 18 N let the box's front swing down (user 10-30: press a little)
+      grip_forward_fallback_m: [-0.015, -0.03]   # only if the set grip has no pose: the grip this much further forward (base 4 -> 2.5 / 1 cm behind the face)
+      pick_face_extra_deg: [10, 20, -10]         # pick: waist turned this much more (deg, + left) than facing the object, tried after face_fractions
+      place_face_extra_deg: [5, 8, -5, -10, -15, -20]   # place: waist turned this much more/less than facing the target
       palm_turn_max_deg: 15.0    # ...at most this much
       palm_line: {heel: [0.0, 0.030, 0.06], tip: [0.0, 0.015, 0.20]}   # hand frame: palm heel and fingertip pads
 
@@ -341,6 +344,8 @@ planner_model:
                                 # (roll and yaw sign-flipped). Stiffer wrists and shoulder yaw = natural solutions
     default_deg: {shoulder_pitch: -40, shoulder_roll: 15, shoulder_yaw: 0, elbow: 35, wrist_roll: 0, wrist_pitch: 0, wrist_yaw: 0}
     null_space_weight: {shoulder_pitch: 1.0, shoulder_roll: 1.0, shoulder_yaw: 2.0, elbow: 1.0, wrist_roll: 5.0, wrist_pitch: 5.0, wrist_yaw: 5.0}
+  arm_pad_m: 0.005              # elbow and wrist spheres grow by this (user 2026-10-30: arms passed too close below the elbows)
+  arm_pad_links: [left_elbow_link, right_elbow_link]
   self_collision_check: {left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link]}
   self_collision_buffer: {left_shoulder_yaw_link: -0.004, right_shoulder_yaw_link: -0.004}
   fit_seed: 7                   # sphere fitting is random; a fixed seed keeps rebuilds identical
@@ -579,7 +584,7 @@ manipulation:
 thermal:
   torque_scale: 1.0              # (1.2 over-predicted the passing UI stack: 88 vs 76 C real)
   waist_torque_scale: 1.2        # measured / modelled waist pitch torque (median 1.19-1.20 over 546 samples, both hands)
-  waist_limit_c: 94              # waist pitch forecast limit (user 2026-10-30, for the 3/3: the live guard warns at 92, holds at 95)
+  waist_limit_c: 88              # waist pitch forecast limit (2026-10-30: a 99 C hold sagged the waist 10 deg; keep <= 88; the live guard warns at 92, holds at 95)
   start_ok_c: 60                 # a task starting with every arm motor <= this runs even if the peak is predicted
                                  # over the limit (user 2026-10-26); the agent still warns at 92 and holds at 95 C
   margin_c: 2                    # (whole-run replays: within ~5 C; it over-predicted the stack that passed, 89 vs 85 C)

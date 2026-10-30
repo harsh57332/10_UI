@@ -636,12 +636,12 @@ def _face_fractions(ctx):
     return [0.0] if 12 in ctx.cfg["arms"]["waist_hold_joints"] else ctx.cfg["manipulation"]["face_fractions"]
 
 
-def _face(ctx, plan, x, y, what, frac=1.0, lean=0.0):
-    """Turn the waist (a fraction of the way) so (x, y) comes in front of the arms, leaning forward `lean` rad
-    (from the resting pitch) when it is beyond the arms' reach."""
+def _face(ctx, plan, x, y, what, frac=1.0, lean=0.0, extra=0.0):
+    """Turn the waist (a fraction of the way, plus `extra` rad: the arms' stance beside neighbours) so (x, y) comes
+    in front of the arms, leaning forward `lean` rad (from the resting pitch) when it is beyond the arms' reach."""
     lim = math.radians(ctx.cfg["manipulation"]["max_face_deg"])
     plan.waist_to(f"turn waist toward {what}" + (" (leaning)" if lean else ""),
-                  [max(-lim, min(lim, math.atan2(y, x) * frac)), 0.0, lean])
+                  [max(-lim, min(lim, math.atan2(y, x) * frac + extra)), 0.0, lean])
 
 
 def _held(m, h, yaw):
@@ -867,15 +867,16 @@ def _check_lines(plan, moves):
 def pre_grasp(ctx, plan, object):
     M = ctx.cfg["manipulation"]
     g = _grasp_geometry(ctx, object)
-    if not g["slot"]:
-        return _pre_grasp_at(ctx, plan, object, g)
     last = None
-    for toward in M["slot_grip_toward_m"]:      # the grip nearest the object's centre that plans
+    # the grip nearest the object's centre that plans (a narrow slot: toward the robot, the wrist in front of it); the
+    # grip the user set comes first, then forward fallbacks (2026-10-30: base 4 cm behind the near face has no pose
+    # beside a stack that stands nearer, base 1 cm does): the log says which one was used
+    for toward in (M["slot_grip_toward_m"] if g["slot"] else [0.0]) + M.get("grip_forward_fallback_m", []):
         try:
             r = _pre_grasp_at(ctx, plan, object, g if not toward else _grasp_geometry(ctx, object, toward))
             if toward:
-                log.info("pre_grasp '%s': grip %.0f cm toward the robot (wrist in front of the slot beside %s)",
-                         object, 100 * toward, g["slot"])
+                log.info("pre_grasp '%s': grip %.0f cm %s", object, abs(100 * toward), "toward the robot (wrist in front "
+                         f"of the slot beside {g['slot']})" if toward > 0 else "further forward than the set grip")
             return r
         except SkillError as e:
             last = e
@@ -902,12 +903,14 @@ def _pre_grasp_at(ctx, plan, object, g):
     mid = (half + g["mid_l"], half + g["mid_r"])          # a slot glove centred, if the palm-side room has no pose
     widths += [mid] if mid not in widths else []
     leans = [math.radians(d) for d in M["pick_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
-    for lean, frac, palm, pitch, (hl, hr) in [(ln, f, p, t, w) for ln in leans for f in _face_fractions(ctx)
-                                              for p in M["palm_align"] for t in M["grasp_pitch_deg"] for w in widths]:
+    faces = [(f, 0.0) for f in _face_fractions(ctx)]       # (fraction of the bearing, extra yaw rad): the extra turns
+    faces += [(1.0, math.radians(d)) for d in M.get("pick_face_extra_deg", [])]
+    for lean, (frac, extra), palm, pitch, (hl, hr) in [(ln, f, p, t, w) for ln in leans for f in faces
+                                                       for p in M["palm_align"] for t in M["grasp_pitch_deg"] for w in widths]:
         if True:
             if True:
                 plan.restore(start)
-                _face(ctx, plan, cx, cy, object, frac, lean)   # frac 0: straight (not where a look left it)
+                _face(ctx, plan, cx, cy, object, frac, lean, extra)   # frac 0: straight (not where a look left it)
                 yaw = palm * g["byaw"] + (1 - palm) * plan.waist[0]
                 stage = 0
                 down, up = _hands2(cx, cy, zg, hl, hr, yaw, pitch), _hands2(cx, cy, za, hl, hr, yaw, pitch)
@@ -1752,13 +1755,13 @@ def _rects_overlap(c1, e1, t1, c2, e2, t2):
     return True
 
 
-def _turn_carrying(ctx, plan, h, x, y, what, frac, z_high, world, lean=0.0):
+def _turn_carrying(ctx, plan, h, x, y, what, frac, z_high, world, lean=0.0, extra=0.0):
     """Turn the waist toward (x, y) with the object held low as far as it clears everything on the way, then
     raise it to z_high (hands' height) and finish the turn: the arms are high, and heating fastest, only for
     the last part of the way."""
     M = ctx.cfg["manipulation"]
     lim = math.radians(M["max_face_deg"])
-    goal = max(-lim, min(lim, math.atan2(y, x) * frac))
+    goal = max(-lim, min(lim, math.atan2(y, x) * frac + extra))
     w0 = plan.waist[0]
     safe = _turn_clear_angle(ctx, plan, h, goal)
     if safe == goal:
@@ -1858,11 +1861,12 @@ def place(ctx, plan, on):
     last, base, aligned = None, plan.mark(), False
     leans = [math.radians(d) for d in M["place_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
     for align in (True,):                       # squared to the target only: an unsquared box overhangs and falls
-        for frac, lean in [(f, ln) for f in _face_fractions(ctx) for ln in leans]:   # angle (run 36: placed turned)
+        faces = [(f, 0.0) for f in _face_fractions(ctx)] + [(1.0, math.radians(d)) for d in M.get("place_face_extra_deg", [])]
+        for (frac, extra), lean in [(f, ln) for f in faces for ln in leans]:   # angle (run 36: placed turned)
             plan.restore(base)
             try:
-                if frac or lean:
-                    _turn_carrying(ctx, plan, h, x, y, on, frac, above, world, lean)
+                if frac or lean or extra:
+                    _turn_carrying(ctx, plan, h, x, y, on, frac, above, world, lean, extra)
                 th = target_yaw if align else plan.m.object_frame(*plan.palms())[1]
                 px, py = palms_at(x, y, th)
                 held = _held(plan.m, h, th)     # the grip moved rigidly: the box stays level, the hands never turn on it

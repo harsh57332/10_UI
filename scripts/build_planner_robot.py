@@ -156,6 +156,9 @@ def main():
     k = data["kinematics"]
     if pm.get("glove"):                         # the old rubber hands wore padded gloves; bare hands keep their fit
         glove(k["collision_spheres"], tcp, {n: t["normal"] for n, t in pm["tcp"].items()}, pm["glove"])
+    for link in pm.get("arm_pad_links", []):    # more clearance at the forearms (user 2026-10-30: too close below the elbows)
+        for c in k["collision_spheres"].get(link, []):
+            c["radius"] = round(c["radius"] + pm["arm_pad_m"], 5)
     # a link for a held box (cuRobo fits spheres to it when attached), riding on the left palm frame
     for key in ("extra_links", "extra_collision_spheres", "self_collision_buffer"):
         k[key] = k.get(key) or {}
