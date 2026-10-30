@@ -389,7 +389,7 @@ scene:
   moved_tol_m: 0.015             # before playing: an object moved more than this since Generate -> Generate again
   align_frames: 5                # place line-up: fine frames per camera measurement of the held object
   align_tol_m: 0.005             # held object's centre over the target's centre within this (camera vs camera)
-  align_iters: 3
+  align_iters: 2                 # (camera calibrated: one correction is usually enough; each costs ~1 s of holding high)
   align_accept_m: 0.02           # ...and if a correction cannot be planned, lowering goes ahead only below this
   align_max_m: 0.06              # a camera line-up error above this is a wrong measurement: refuse, never place on it
   held_near_m: 0.08               # the held object: the camera's instance this close to the palms' midpoint
@@ -510,10 +510,10 @@ manipulation:
                                  # (they hang at the sides: no load, they cool); held objects keep them held
   start_max_temp_c: 70           # (sanity bound only: the heat model gate decides) a task starts only with every arm motor at or below this (released arms settle at
                                  # 50-56 C; a stack adds ~36 C to the shoulder pitch; the warning is warn_motor_temp_c)
-  align_iters: 3                 # line up the measured palm midpoint over the target (place)
+  align_iters: 2                 # line up the measured palm midpoint over the target (place; each round holds the box high ~1 s)
   align_tol_m: 0.005
   lower_fast_above_m: 0.02       # lowering an object: at normal speed down to this far above where it should touch,
-  lower_slowdown: 4.0            # ...then this slow until it touches down (contact within mm)...
+  lower_slowdown: 2.0            # ...then this slow until it touches down (contact within mm)...
   back_to_lowering_max_deg: 20   # lowering after a line-up: if no straight line from there, the joint move back to the
                                  # planned lowering's start only when every joint is within this (the held box is not modelled)
   land_lag_m: 0.008              # ...and stops once the hands are this far above their command (it sits down)
@@ -569,6 +569,7 @@ manipulation:
 thermal:
   torque_scale: 1.0              # (1.2 over-predicted the passing UI stack: 88 vs 76 C real)
   waist_torque_scale: 1.2        # measured / modelled waist pitch torque (median 1.19-1.20 over 546 samples, both hands)
+  waist_limit_c: 94              # waist pitch forecast limit (user 2026-10-30, for the 3/3: the live guard warns at 92, holds at 95)
   start_ok_c: 60                 # a task starting with every arm motor <= this runs even if the peak is predicted
                                  # over the limit (user 2026-10-26); the agent still warns at 92 and holds at 95 C
   margin_c: 2                    # (whole-run replays: within ~5 C; it over-predicted the stack that passed, 89 vs 85 C)
@@ -585,8 +586,8 @@ thermal:
     "close until contact": 4.0                       # at close_slowdown 1.5 (was 6-9 s at 3.0)
     "come down beside the object (touch-checked)": 5.0   # at descent_slowdown 1.0 (was 9-10.4 s at 2.0)
     "secure the grip (test lift)": 4.0               # 2 s + the camera's before/after look
-    "line up over the target": 3.0                   # 2.3-3.6 s
-    "lower until it sits on the target": 3.0         # 2.9-4.2 s at the old speed
+    "line up over the target": 2.0                   # at most 2 rounds (was up to 3: 2.3-3.6 s)
+    "lower until it sits on the target": 2.0         # the last 2-3 cm at lower_slowdown 2 (was 4: 2.9-4.2 s)
     "let go": 3.0
     "set down until it sits on something": 4.0
   squeeze_on: ["close until contact"]                       # the squeeze force starts here...

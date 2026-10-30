@@ -1190,9 +1190,13 @@ def _close_until_contact(ctx, cx, cy, zg, half, sq, yaw, pitch, world, grip):
         # height): close in sideways at the height the hands are at, not back down to the planned one
         lc, rc = m.palms(m.q_now(commanded=True))
         z_live, last = float(lc[2] + rc[2]) / 2, None
+        # sideways only, so not into the support below: a descent ending 1 mm low put the hands inside its 2 mm
+        # margin and every close-in 'started in collision' (runs 2026-10-29 16:47 and 10-30 11:51); the
+        # neighbours stay in the check
+        beside = [w for w in world if w["name"] != "table"]
         for z in ([z_live, zg] if abs(z_live - zg) > 0.005 else [zg]):
             try:
-                _line_or_free(p, "close in", goals(half - sq, half - sq, c, z), world)
+                _line_or_free(p, "close in", goals(half - sq, half - sq, c, z), beside)
                 break
             except SkillError as e:
                 last = e

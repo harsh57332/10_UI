@@ -91,13 +91,15 @@ def check(ctx, plan):
     T0 = {j["index"]: j["temp"] for j in ctx.link.state()["joints"] if j["index"] in WATCHED}
     segs = segments(cfg, plan)
     peak = simulate(cfg, segs, T0)
-    j = max(peak, key=peak.get)
-    if peak[j] <= limit:
-        return {joints.NAMES[k]: round(v) for k, v in peak.items() if v >= limit - 15}
-    if peak[WAIST_PITCH] > limit:               # never run anyway: the balance joint (no start_ok_c exception)
-        raise SkillError(f"predicted waist pitch peak {peak[WAIST_PITCH]:.0f} C (limit {limit:.0f} C, now "
+    waist_limit = cfg["thermal"].get("waist_limit_c", limit)
+    if peak[WAIST_PITCH] > waist_limit:         # never run anyway: the balance joint (no start_ok_c exception)
+        raise SkillError(f"predicted waist pitch peak {peak[WAIST_PITCH]:.0f} C (limit {waist_limit:.0f} C, now "
                          f"{T0[WAIST_PITCH]} C): the arms stay out too long or too far for the waist motor that holds "
                          f"them; refused")
+    arm_peak = {k: v for k, v in peak.items() if k != WAIST_PITCH}
+    j = max(arm_peak, key=arm_peak.get)
+    if peak[j] <= limit:
+        return {joints.NAMES[k]: round(v) for k, v in peak.items() if v >= limit - 15}
     if max(T0.values()) <= cfg["thermal"]["start_ok_c"]:     # user 2026-10-26: starting this cool, run it anyway (the
         log.warning("predicted %s peak %.0f C (limit %.0f C), but every arm motor starts <= %d C: allowed",   # runtime
                     joints.NAMES[j], peak[j], limit, cfg["thermal"]["start_ok_c"])   # guard still holds at 95 C)
