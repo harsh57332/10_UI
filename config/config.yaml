@@ -169,6 +169,10 @@ hands:
       finger_extra_m: 0.02       # glove fingertips beyond the rubber fingertips (estimate)
     manipulation:                # this hand's own values over `manipulation`
       grasp_up_m: 0.01           # grip 1 cm above the box's centre height: more room over the stack at the place (user 2026-10-30: the left arm touched the stack)
+      wrist_close_deg: 0         # OFF (it works with 0). Tried 6 on 2026-11-02: the wrist turn pulls the palm points ~1.4 cm closer (12.9 -> 11.5 cm on a 14.3 cm box)
+                                 # while the plan carries/places the box at width + grip_hold_extra_m (-0.5 cm): the 2.3 cm mismatch exceeds live_grip_tol_m, the arm was
+                                 # re-solved for the live grip and the lowering flipped (left elbow -80, wrist swing). Fingertip pressure would need the planned gap
+                                 # recalibrated with it (grip_hold_extra_m about -1.9 cm at 6 deg) and live tests; see the notes.
       pick_face_extra_deg: [10, 20, 30]   # pick: waist turned this much more to the left than facing the object, tried after face_fractions: the left
                                           # arm then comes into a gap along it, past a stack that stands nearer than the box (2026-10-30)
   inspire:                       # Inspire RH56DFTP (fitted 2026-10-29), open, no gloves; scripts.make_inspire_urdf
@@ -468,7 +472,7 @@ manipulation:
   place_descent_margin_m: 0.01   # the place's move above / lowering onto the target keeps this far from the neighbours (user 2026-10-30: +1 cm,
                                  # the left wrist touched the stack by a hair in 3/3 run 1); the pick keeps descent_margin_m
   descent_margin_m: 0.01         # planning margin of the straight descent (touch-checked when it runs)
-  descent_slowdown: 1.25         # it plays this slow, in short pieces, stopping if a glove meets an edge
+  descent_slowdown: 1.0          # it plays this slow, in short pieces, stopping if a glove meets an edge
   descent_follow_min: 0.3        # a glove is blocked when it lags (land_lag_m) and went down less than this part of the
   descent_block_lag_m: 0.025     #   commanded drop in the last piece (rubbing a face only slows it), or lags this much
   rest_high_max_m: 0.03          # a glove stopped this close above the grasp height (on a rail, the case edge) with
@@ -499,7 +503,7 @@ manipulation:
   min_box_width_m: 0.05          # STANDARDS M4.3
   max_box_width_m: 0.40
   # STANDARDS M3 / M5: checked before any planning, refused with the rule number
-  reach_m: [0.335, 0.415]        # M3.1 (advisory: the planner still tries outside) object centre's distance from the
+  reach_m: [0.335, 0.435]        # M3.1 (advisory: the planner still tries outside) object centre's distance from the
                                  # torso axis where the stack is tested to plan: 24-32 cm from the chest (grid
                                  # 2026-10-23 with the measured 5 cm glove; failures only at 21-23 cm; beyond 32 cm the
                                  # shoulders heat up, which the heat gate checks)
@@ -616,7 +620,7 @@ thermal:
   call_s:                        # how long the live (call) steps of a plan usually take, s
     default: 0.3                                     # state changes and checks: ~0.3 s measured
     "close until contact": 4.0                       # at close_slowdown 1.5 (was 6-9 s at 3.0)
-    "come down beside the object (touch-checked)": 5.0   # at descent_slowdown 1.0 (was 9-10.4 s at 2.0)
+    "come down beside the object (touch-checked)": 4.0   # at descent_slowdown 1.0 and joint_speed_rps 0.625 (1.25x; was 5.0 at 0.5)
     "secure the grip (test lift)": 4.0               # 2 s + the camera's before/after look
     "line up over the target": 2.0                   # at most 2 rounds (was up to 3: 2.3-3.6 s)
     "lower until it sits on the target": 2.0         # the last 2-3 cm at lower_slowdown 2 (was 4: 2.9-4.2 s)

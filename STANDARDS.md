@@ -33,7 +33,7 @@ Distances "from the chest" are measured horizontally from the chest front.
 
 ## M3. Object position (robot at its stance)
 
-- M3.1 Object centre **24 – 32 cm from the chest** (measured from the robot's centre line through the waist, along
+- M3.1 Object centre **24 – 34 cm from the chest** (measured from the robot's centre line through the waist, along
   the direction the waist turns to face it) [swept 2026-10-23 with the measured glove: the full stack plans at every
   tested spot in this zone; failures only at 21 – 23 cm]. At the 12 cm stance this means the **object centre is 12 –
   20 cm back from the table edge**. Beyond 32 cm the shoulders heat up (the heat gate decides).
