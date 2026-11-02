@@ -22,7 +22,11 @@ connect() {
 {
   echo "startup calibration $(date '+%F %T')"
   if ! connect; then echo "robot $HOST not reachable: nothing calibrated (power it on, then run scripts/startup_calibrate.sh)"; exit 0; fi
-  sleep 8                                                                  # the agent's first state / hands detection
+  for _ in $(seq 1 40); do                                                  # the robot must stand in manipulation mode (fsm 501), still
+    curl -s -m5 "localhost:$PORT/api/status" | "$PY" -c "import json,sys; s=json.load(sys.stdin).get('state') or {}; sys.exit(0 if s.get('mode')=='manipulation' and s.get('fsm_id')==501 else 1)" && break
+    sleep 3
+  done
+  sleep 10                                                                 # settled; the agent's first state / hands detection
   "$PY" -m scripts.camera_tilt --auto 2>&1 | grep -E "camera looks|fix \(|CALIBRATION|no accelerometer|moving|moved"
   rc=${PIPESTATUS[0]}
   if [ "$rc" = 3 ]; then

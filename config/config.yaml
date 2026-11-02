@@ -428,6 +428,7 @@ camera_mount:
   # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
   optical_fix_rpy_deg: [0.29, -0.88, 0.49]
   auto_tolerance_deg: 1.0        # startup calibration (scripts/startup_calibrate.sh) rewrites the fix only when a REFINED measurement moved more
+  auto_max_deg: 4.0              # ...and never writes a change bigger than this (a bad measurement or a knocked camera: look at the mount)
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:

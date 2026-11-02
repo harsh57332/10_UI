@@ -130,6 +130,10 @@ def main():
     cfg = config.load()
     st = httpx.get(f"http://127.0.0.1:{cfg['server']['port']}/api/status", timeout=5).json()["state"]
     r_deg, p_deg, _ = st["imu"]["torso_rpy"]
+    if "--auto" in sys.argv and (st.get("mode") != "manipulation" or st.get("fsm_id") != 501):
+        print(f"CALIBRATION SKIPPED: the robot is not standing in manipulation mode (mode {st.get('mode')}, fsm {st.get('fsm_id')}): "
+              "its torso is not steady; run scripts/startup_calibrate.sh when it stands")   # 2026-11-02 14:35: measured while
+        return                                                                               # standing up: wrote -9.4 deg
     a = accel(cfg)
     st2 = httpx.get(f"http://127.0.0.1:{cfg['server']['port']}/api/status", timeout=5).json()["state"]
     r2, p2, _ = st2["imu"]["torso_rpy"]
@@ -171,6 +175,10 @@ def main():
             print("CALIBRATION NOT VERIFIED: fewer than two level surfaces in view; the configured fix is kept")   # from it flipped
             return                              # the result by 2 deg between two runs (2026-11-02)
         moved = max(abs(fix[0] - cur[0]), abs(fix[1] - cur[1]))
+        if moved > cfg["camera_mount"].get("auto_max_deg", 4.0):    # a camera does not move this far by itself: a bad measurement
+            print(f"CALIBRATION REFUSED: the camera would have moved {moved:.1f} deg (more than "          # or a knocked camera: look
+                  f"{cfg['camera_mount'].get('auto_max_deg', 4.0)} deg); the configured fix is kept; check the camera mount")   # at it
+            return
         tol = cfg["camera_mount"].get("auto_tolerance_deg", 1.0)
         if moved <= tol:
             print(f"CALIBRATION OK: the camera angle is {moved:.2f} deg from the configured fix (tolerance {tol} deg)")
