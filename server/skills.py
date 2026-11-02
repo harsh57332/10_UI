@@ -281,11 +281,38 @@ def rest(ctx):
         _via_sideways(ctx, plan, M["rest_deg"], "arms down")
         for st in plan.steps:
             ctx.motion.execute(st["traj"])
-    except SkillError as e:                     # never let them swing into something: stay held at ready
-        log.warning("rest: %s; the arms stay held", e)
-        return False
+    except SkillError as e:                     # the arms touch something in the model (an elbow within the margin of a stack):
+        log.warning("rest: %s", e)             # the same route with no margin and the exact boxes only, then (2026-11-02, told
+        if not _rest_relaxed(ctx):              # twice: the arms stayed held) released from the ready pose if they are there
+            if not _at_ready_pose(ctx):
+                log.warning("rest: not at the ready pose and no planned way down: the arms stay held")
+                return False
+            log.warning("rest: no planned way down; released from the ready pose (the arms hang down by the sides)")
     ctx.agent("release_upperbody", {}, timeout=15)
     return True
+
+
+def _rest_relaxed(ctx):
+    """The way down by the sides planned with no margin against the exact boxes only (no depth map): True if it ran."""
+    M = ctx.cfg["manipulation"]
+    plan = ArmPlan(ctx.motion)
+    plan.use_map = False
+    try:
+        _via_sideways(ctx, plan, M["rest_deg"], "arms down", margin=0.0)
+        for st in plan.steps:
+            ctx.motion.execute(st["traj"])
+        return True
+    except SkillError as e:
+        log.warning("rest (no margin, boxes only): %s", e)
+        return False
+
+
+def _at_ready_pose(ctx, tol_deg=15.0):
+    """The arms are at the ready pose (commanded), the posture the task ends in."""
+    m = ctx.motion
+    q = m.q_now(commanded=True)
+    want = [math.radians(v) for v in ctx.cfg["manipulation"]["ready_deg"]]
+    return all(abs(q[15 + k] - w) <= math.radians(tol_deg) for k, w in enumerate(want))
 
 
 def check_waist_lock(ctx):
@@ -631,7 +658,7 @@ def _scene_world(ctx):
     return world + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()]
 
 
-def _via_sideways(ctx, plan, goal_deg, label):
+def _via_sideways(ctx, plan, goal_deg, label, margin=None):
     """Arms up or down by the sides: first out to the sideways posture (arms raised out to the sides, away from
     everything in front), then to the goal. Lifting from hanging and lowering to hanging straight in front hit
     the case's front face (the user's photo, 2026-10-24)."""
@@ -643,7 +670,7 @@ def _via_sideways(ctx, plan, goal_deg, label):
     for name, angles in (("arms out to the sides", M["side_deg"]), (label, goal_deg)):
         goal = dict(plan.q)
         goal.update({15 + k: math.radians(v) for k, v in enumerate(angles)})
-        plan.to_joint(name, goal, world, margin=M["near_margin_m"])
+        plan.to_joint(name, goal, world, margin=M["near_margin_m"] if margin is None else margin)
 
 
 def _ensure_ready(ctx, plan):
