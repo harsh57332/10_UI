@@ -128,6 +128,18 @@ def main():
     (out_dir / "meshes").mkdir(parents=True, exist_ok=True)
     tcp = config.tcp_frames()
     links, meshes = cut_urdf(config.path(pm["source_urdf"]), out_urdf, tcp)
+    caps = pm.get("joint_cap_deg") or {}         # planning limits tighter than the robot's (e.g. the real arm meets the torso)
+    if caps:
+        tree = ET.parse(out_urdf)
+        for j in tree.getroot().iter("joint"):
+            if j.get("name") in caps:
+                lim = j.find("limit")
+                lo, hi = caps[j.get("name")]
+                if lo is not None:
+                    lim.set("lower", str(round(np.radians(lo), 5)))
+                if hi is not None:
+                    lim.set("upper", str(round(np.radians(hi), 5)))
+        tree.write(out_urdf)
     dirs = pm["source_meshes"] if isinstance(pm["source_meshes"], list) else [pm["source_meshes"]]
     for m in meshes:                            # the first mesh folder that has it (unitree_ros, then our own)
         src = next((config.path(d) / Path(m).name for d in dirs if (config.path(d) / Path(m).name).exists()), None)

@@ -66,7 +66,7 @@ locomotion:
 
 arms:
   rate_hz: 50
-  max_speed_dps: 45              # joint speed used to time set_upperbody moves
+  max_speed_dps: 56              # joint speed used to time set_upperbody moves
   playback_slowdown: 1.0         # planned trajectories play this many times slower (1.0 = as planned; slower = less body
                                  # sway, but heat grows with time under load: 2.5 kept the arms out ~35-40 s per stack)
   chunk_s: 0.3                   # moves that may end early (lowering until contact) play in pieces this long
@@ -75,8 +75,8 @@ arms:
   max_arm_turn_deg: 300          # refuse a planned move whose joints of one arm turn more than this in
                                  # total: cuRobo accepts any collision-free IK, incl. arms wrapped over the
                                  # shoulders (that one was ~500-600; standing -> ready is ~180)
-  waist_speed_dps: 10            # waist turns while manipulating (20 swung the whole robot)
-  waist_speed_holding_dps: 10    # ...and while holding a box (it fell during a 20 deg/s turn with the old weak grip)
+  waist_speed_dps: 12.5           # waist turns while manipulating (20 swung the whole robot)
+  waist_speed_holding_dps: 12.5   # ...and while holding a box (it fell during a 20 deg/s turn with the old weak grip)
   engage_s: 1.0                  # arm_sdk weight ramp 0 -> 1
   release_s: 2.0                 # arm_sdk weight ramp 1 -> 0
   warn_motor_temp_c: 92          # (80 stopped every stack: a stack adds ~36 C to the shoulder pitch, which idles at
@@ -167,6 +167,10 @@ hands:
       pad_m: 0.009               # glove fabric/padding all round, measured 2026-10-23 (gloved hand 5.0 cm thick)
       thickness_m: 0.050         # palm surface to back
       finger_extra_m: 0.02       # glove fingertips beyond the rubber fingertips (estimate)
+    manipulation:                # this hand's own values over `manipulation`
+      grasp_up_m: 0.01           # grip 1 cm above the box's centre height: more room over the stack at the place (user 2026-10-30: the left arm touched the stack)
+      pick_face_extra_deg: [10, 20, 30]   # pick: waist turned this much more to the left than facing the object, tried after face_fractions: the left
+                                          # arm then comes into a gap along it, past a stack that stands nearer than the box (2026-10-30)
   inspire:                       # Inspire RH56DFTP (fitted 2026-10-29), open, no gloves; scripts.make_inspire_urdf
     urdf: assets/robot/g1_29dof_rev_1_0_inspire_ftp.urdf
     planner_urdf: assets/planner/inspire/g1_arms.urdf
@@ -293,7 +297,7 @@ services:
       max_halvings: 3                            # a step that fails or jumps is retried in halves down to step/8: an
                                                  # arm swivelling as the hands close in moves continuously (1 cm steps
                                                  # jumped 18 deg in wrist roll at random: 2 of 3 squeezes refused)
-      joint_speed_rps: 0.5                       # timing of the resulting trajectory (before playback slowdown)
+      joint_speed_rps: 0.625                      # timing of the resulting trajectory (before playback slowdown)
     timeout_s: 60
 
   llm:
@@ -344,8 +348,10 @@ planner_model:
                                 # (roll and yaw sign-flipped). Stiffer wrists and shoulder yaw = natural solutions
     default_deg: {shoulder_pitch: -40, shoulder_roll: 15, shoulder_yaw: 0, elbow: 35, wrist_roll: 0, wrist_pitch: 0, wrist_yaw: 0}
     null_space_weight: {shoulder_pitch: 1.0, shoulder_roll: 1.0, shoulder_yaw: 2.0, elbow: 1.0, wrist_roll: 5.0, wrist_pitch: 5.0, wrist_yaw: 5.0}
-  arm_pad_m: 0.005              # elbow and wrist spheres grow by this (user 2026-10-30: arms passed too close below the elbows)
-  arm_pad_links: [left_elbow_link, right_elbow_link]
+  joint_cap_deg: {right_shoulder_roll_joint: [null, 8.0]}   # planning only: the real right arm meets the torso at ~+9 deg roll (3/3 runs 2026-10-30:
+                                                            # blocked 11-13 Nm at +9.1 with +10.9..+14.6 commanded); the robot's own limit is unchanged
+  arm_pad_m: 0.005              # spheres of arm_pad_links grow by this. OFF (links []): a 1 cm pad on the wrists made the 10.8 cm gap layout
+  arm_pad_links: []             # unplannable (2026-10-30; unpadded: ROBUST). The Inspire planner yml was built with the elbows at 5 mm (47af9ed)
   self_collision_check: {left_shoulder_yaw_link: [torso_link], right_shoulder_yaw_link: [torso_link]}
   self_collision_buffer: {left_shoulder_yaw_link: -0.004, right_shoulder_yaw_link: -0.004}
   fit_seed: 7                   # sphere fitting is random; a fixed seed keeps rebuilds identical
@@ -420,7 +426,8 @@ camera_mount:
   # the camera's real angle in its mount relative to the URDF's d435_joint, as a rotation of the optical frame
   # (rpy, deg; x right = pitch). Measured with the camera's own accelerometer + torso IMU: scripts/camera_tilt.py
   # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
-  optical_fix_rpy_deg: [-1.76, -0.80, 0.74]
+  optical_fix_rpy_deg: [0.29, -0.88, 0.49]
+  auto_tolerance_deg: 1.0        # startup calibration (scripts/startup_calibrate.sh) rewrites the fix only when a REFINED measurement moved more
 
 # Dual-arm box handling with dummy hands (squeeze between the palms). Torso frame, metres.
 manipulation:
@@ -457,8 +464,10 @@ manipulation:
   slot_grip_toward_m: [0.0, 0.02, 0.04]   # grip positions tried in a narrow slot, nearest the object's centre first
   slot_clear_min_m: 0.003        # in a slot, at least this on each side of the glove (else refused: too tight; the
                                  # user's demonstration fitted the 5.0 cm glove into a 5.6 cm gap)
+  place_descent_margin_m: 0.01   # the place's move above / lowering onto the target keeps this far from the neighbours (user 2026-10-30: +1 cm,
+                                 # the left wrist touched the stack by a hair in 3/3 run 1); the pick keeps descent_margin_m
   descent_margin_m: 0.01         # planning margin of the straight descent (touch-checked when it runs)
-  descent_slowdown: 1.0          # it plays this slow, in short pieces, stopping if a glove meets an edge
+  descent_slowdown: 1.25         # it plays this slow, in short pieces, stopping if a glove meets an edge
   descent_follow_min: 0.3        # a glove is blocked when it lags (land_lag_m) and went down less than this part of the
   descent_block_lag_m: 0.025     #   commanded drop in the last piece (rubbing a face only slows it), or lags this much
   rest_high_max_m: 0.03          # a glove stopped this close above the grasp height (on a rail, the case edge) with
@@ -477,6 +486,8 @@ manipulation:
   turn_clear_m: 0.03             # a waist turn carrying an object low keeps it this far from what it passes...
   turn_margin_deg: 3             # ...and stops this short of where it would come closer, raises it, then goes on
   place_above_m: 0.04            # approach the place pose from this far above
+  lift_extra_m: [0.06, 0.04, 0.02]   # after the minimum lift, lift this much higher if it plans straight AND no arm joint turns more than
+  lift_extra_swing_deg: 6        # the minimum lift's most-turned joint + this (the object stays level). Higher = more clearance, more shoulder load
   pull_in_m: 0.0                 # after lifting, draw the box this far toward the chest. Off: it saves <1 Nm of
                                  # shoulder pitch but swings the upper arms inward (the left upper arm hit the
                                  # torso, 12 Nm on the shoulder roll, with the box 4 cm off centre)
@@ -564,7 +575,7 @@ manipulation:
   contact_early_m: 0.035         # a hand "touching" further than this outside the measured face is stopped by
                                  # something else (camera/glove errors are ~1-2 cm) -> refuse
   blocked_lag_m: 0.02            # a hand already this far behind its command before closing is blocked -> refuse
-  grip_hold_extra_m: 0.03        # the real squeezed palm gap minus the object's measured width (runs 10-12: +2.8,
+  grip_hold_extra_m: -0.005       # the real squeezed palm gap minus the object's measured width (runs 10-12: +2.8,
                                  # +4.0, +3.0 cm: the wrists press first); the plan carries/places at this width
   pick_lean_deg: [0, 10, 20]     # waist pitch (forward lean, from the resting pitch) tried for a pick beyond reach
                                  # (10 deg brings the shoulders 4.3 cm closer; a box 42 cm from the chest needs ~20)
@@ -574,6 +585,11 @@ manipulation:
   palm_align: [1.0, 0.5, 0.0]    # palm angle: 1 = flat on the measured faces (centred on them) ... 0 = along the
                                  # turned torso (a 22 deg waist turn put the palms 4.6 cm behind the box centre)
   max_trusted_box_yaw_deg: 15    # larger box-angle estimates are treated as mis-fits (run 8 gripped the length)
+  live_grip_tol_m: 0.01          # a holding move plays its PLANNED end pose when the live palm gap is within this of the plan's
+                                 # (re-solving the arm for the live grip put the left wrist near 0 deg pitch: line-up/lowering flipped)
+  place_candidates: 4            # waist turns that plan are compared (largest turn first); the one with the least arm joint travel is used
+  place_waist_cost: 0.1          # + this per degree of waist turn when comparing (a tie goes to the smaller turn)
+  place_face_fractions: [1.0, 0.97, 0.94, 0.91, 0.88, 0.84, 0.8, 0.7, 0.6, 0.5, 0.0]   # the place tries these (largest turn first; 3/3 run: only 1.0 then 0.5 -> 18 deg, right arm across the body)
   face_fractions: [1.0, 0.5, 0.0]   # waist turn toward a target, as fractions of its angle (tried in order);
                                     # palms squeeze along the turned torso, the box turns to meet them
 
@@ -645,3 +661,8 @@ tracking:
 logging:
   dir: logs
   level: INFO
+
+# Offline regression (scripts/plan_regress.py): recorded task scenes re-planned before/after a planner change.
+regress:
+  scenes: [logs/runs/20261026_172304_task, logs/runs/20261030_161419_task, logs/runs/20261030_162826_task,
+           logs/runs/20261030_164100_task, logs/runs/20261030_165136_task, logs/runs/20261030_170658_task]

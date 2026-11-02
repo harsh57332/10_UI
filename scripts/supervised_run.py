@@ -89,6 +89,12 @@ else:
                     subprocess.Popen([sys.executable, str(config.path("docs/reference_grasp/capture.py")), hold_tag],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     say(f"  holding pose photo: docs/reference_grasp/{hold_tag}_rgb.png")
+                for key, name in (("let go", "placed"), ("move the hands up", "released")):   # how it landed / what the open hands left
+                    if last.endswith(key):
+                        tag2 = "run_" + time.strftime("%H%M%S") + "_" + name
+                        subprocess.Popen([sys.executable, str(config.path("docs/reference_grasp/capture.py")), tag2],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        say(f"  {name} photo: docs/reference_grasp/{tag2}_rgb.png")
             if p["state"] in ("done", "failed"):
                 say(f"RESULT: {p['state'].upper()} after {time.time() - t1:.1f} s" + (f": {p['error']}" if p["error"] else ""))
                 break

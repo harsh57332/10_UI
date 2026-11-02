@@ -438,6 +438,12 @@ class ArmPlan:
         return [{"label": s["label"], "kind": s["kind"], "duration": dur[s["kind"]](s) if s["kind"] in dur else None}
                 for s in self.steps]
 
+    def grip_matches_plan(self, q_live, end):
+        """The live palm gap is within live_grip_tol_m of the plan's: the planned end pose already holds the object the way
+        the hands really do, so it is played as planned (a re-solved arm configuration can differ a lot from the plan)."""
+        (ll, lr), (pl, pr) = self.m.palms(q_live), self.m.palms(end)
+        return abs(float(np.linalg.norm(ll - lr)) - float(np.linalg.norm(pl - pr))) <= self.m.cfg["manipulation"]["live_grip_tol_m"]
+
     def at_live_grip(self, end, s):
         """A planned holding end pose (all joints) re-solved for the live grip: the object where the plan puts
         it (palm midpoint and axis at the planned end), held the way the hands really hold it (self.grip, frozen
@@ -470,7 +476,7 @@ class ArmPlan:
             end = dict(live.q)
             end.update({self.m.idx[n]: v for n, v in zip(traj["joint_names"], traj["positions"][-1])})
             try:
-                if s["holding"]:
+                if s["holding"] and not self.grip_matches_plan(live.q, end):
                     end = grip_end = self.at_live_grip(end, s)
                 live.to_joint(s["label"], end, s["world"], margin=s.get("margin"))
                 return live.steps[-1]["traj"]

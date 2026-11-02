@@ -99,6 +99,23 @@ def check_hands(name, state):
         raise SkillError(f"'{name}' needs the hands {' or '.join(allowed)}, but they are {state}")
 
 
+def _arm_travel_deg(steps):
+    """Arm motion of planned steps: for each move the path length of its most-travelled joint (deg), summed. The
+    carry/place moves with the least of it are the simplest for the arms."""
+    total = 0.0
+    for st in steps:
+        if st["kind"] == "traj" and not st.get("dry"):
+            P = st["traj"]["positions"]
+            total += math.degrees(max(sum(abs(P[i + 1][k] - P[i][k]) for i in range(len(P) - 1)) for k in range(len(P[0]))))
+    return total
+
+
+def _swing_deg(traj):
+    """How far the most-turned arm joint goes between the start and the end of a planned move (deg)."""
+    P = traj["positions"]
+    return math.degrees(max(abs(b - a) for a, b in zip(P[0], P[-1])))
+
+
 def _to_state(ctx, plan, hand, **info):
     """Change the hand state: in the plan now, on the robot when this step runs."""
     plan.state.update(hand=hand, **info)
@@ -184,6 +201,11 @@ def _escape_plan(ctx):
             last = e
             log.warning("escape up %.0f cm above the tops: %s", 100 * (z_up - top), e)
             continue
+        try:                                    # the hands are clear above everything: straighten the waist here. "Arms out to the
+            plan.waist_to("waist straight", [math.radians(v) for v in M["waist_deg"]])   # sides" with the waist turned toward
+        except SkillError as e:                 # the stack put the left arm inside it: goal in collision (3/3 run 2026-10-30
+            last = e                            # 17:07, the arms stayed held and the shoulder reached 89 C)
+            continue
         up = plan.mark()
         for margin, use_map in ((M["near_margin_m"], True), (0.0, False)):
             plan.restore(up)
@@ -198,6 +220,20 @@ def _escape_plan(ctx):
             except SkillError as e:
                 last = e
                 log.warning("escape down (margin %.3f, map %s): %s", margin, use_map, e)
+    for margin, use_map in ((M["near_margin_m"], True), (0.0, False)):   # no way down by the sides: the ready pose (cool, in
+        plan.restore(up)                                                  # front, away from the stack); the arms stay held there
+        plan.use_map = use_map
+        try:
+            goal = dict(plan.q)
+            goal.update({15 + k: math.radians(v) for k, v in enumerate(M["ready_deg"])})
+            plan.to_joint("ready pose", goal, world, margin=margin)
+            plan.use_map = True
+            plan.ended_ready = True
+            log.warning("escape: arms to the ready pose (no way down by the sides)")
+            return plan
+        except SkillError as e:
+            last = e
+            log.warning("escape to ready (margin %.3f, map %s): %s", margin, use_map, e)
     plan.use_map = True
     raise last
 
@@ -214,7 +250,13 @@ def _last_resort(ctx):
         log.error("last resort: no safe path (%s): the arms stay held", e)
         return f"arms HELD where they are (no collision-free way out: {e})"
     for st in plan.steps:
-        ctx.motion.execute(st["traj"])
+        if st["kind"] == "waist":
+            ctx.motion.move_waist(st["waist"], st["seconds"])
+        else:
+            ctx.motion.execute(st["traj"])
+    if getattr(plan, "ended_ready", False):     # held at the ready pose, waist straight: cool and clear, never dropped
+        ctx.bb.update(hand="EMPTY", holding=None, grasp=None, grip=None)
+        return "hands up, back to the ready pose (no way down by the sides); the arms stay held there, release them from the UI"
     j = {x["index"]: x["deg"] for x in ctx.link.state()["joints"]}
     if abs(j[12]) > 1.0:                        # the arms are down by the sides now: the waist can turn back
         ctx.motion.move_waist([0.0, math.radians(j[13]), math.radians(j[14])], max(1.0, abs(j[12]) / a["waist_speed_dps"]))
@@ -768,6 +810,7 @@ def _grasp_geometry(ctx, object, toward=0.0):
     # centre height, but the gloves' lowest point stays clear of the support: a short object is gripped with
     # the lower part of the palm, of which enough must be on the object
     zg = max(cz, b["support_z"] + _glove()["below"] + M["support_clear_m"])
+    zg = max(zg, min(zg + M.get("grasp_up_m", 0.0), b["top_z"] - 0.02))   # gripped a little higher: the place keeps the
     contact = b["top_z"] - max(b["support_z"], zg - M["palm_below_m"])
     if contact < M["min_palm_contact_m"]:
         need = _glove()["below"] + M["support_clear_m"] - M["palm_below_m"] + M["min_palm_contact_m"]
@@ -994,16 +1037,43 @@ def lift(ctx, plan):
     hold = lambda x, y, z: (lambda: plan.m.held_goals(the_grip(), x + grip["dx"], y + grip["dy"], z, grip_yaw()))
     plan.call("secure the grip (test lift)", lambda: _secure_grip(ctx, cx, cy, zg, half, sq, yaw, pitch, free, grip))
     up = g["others"]                            # straight up: the support it leaves is not in the way
-    try:                                        # planned from the grip-width pose; else the line proven by pre_grasp
-        plan.line("lift", hold(cx, cy, z_cmd)(), up, goals_fn=hold(cx, cy, z_cmd), traj=None if g.get("hold") else g["lines"]["lift"])
-    except SkillError as e:
-        log.warning("lift at the grip width: %s; using the proven lift line", e)
-        plan.line("lift", hold(cx, cy, z_cmd)(), up, goals_fn=hold(cx, cy, z_cmd), traj=g["lines"]["lift"])
+    mk_lift = plan.mark()
+
+    def minimum_lift():
+        try:                                    # planned from the grip-width pose; else the line proven by pre_grasp
+            plan.line("lift", hold(cx, cy, z_cmd)(), up, goals_fn=hold(cx, cy, z_cmd),
+                      traj=None if g.get("hold") else g["lines"]["lift"])
+        except SkillError as e:
+            log.warning("lift at the grip width: %s; using the proven lift line", e)
+            plan.line("lift", hold(cx, cy, z_cmd)(), up, goals_fn=hold(cx, cy, z_cmd), traj=g["lines"]["lift"])
+    minimum_lift()
+    extra_up = 0.0
+    extras = sorted(M.get("lift_extra_m", []), reverse=True)
+    if extras:                                  # as high as it goes without turning the arm joints any further (the object
+        base_swing = _swing_deg(plan.steps[-1]["traj"])      # stays level: the held goals keep its orientation)
+        for extra in extras:
+            plan.restore(mk_lift)
+            try:
+                plan.line("lift", hold(cx, cy, z_cmd + extra)(), up, goals_fn=hold(cx, cy, z_cmd + extra))
+            except SkillError as e:
+                log.debug("lift +%.0f cm: %s", 100 * extra, e)
+                continue
+            swing = _swing_deg(plan.steps[-1]["traj"])
+            if swing <= base_swing + M["lift_extra_swing_deg"]:
+                extra_up = extra
+                z_lift, z_cmd = z_lift + extra, z_cmd + extra
+                log.info("lift: %.0f cm higher than the minimum (arm joints turn %.0f deg, minimum lift %.0f deg)",
+                         100 * extra, swing, base_swing)
+                break
+            log.debug("lift +%.0f cm turns an arm joint %.0f deg (minimum lift %.0f): not used", 100 * extra, swing, base_swing)
+        else:
+            plan.restore(mk_lift)               # none qualified: the minimum lift, exactly as planned before
+            minimum_lift()
     held = {"object": g["object"], "width": g["width"], "dims": g["dims"], "grasp_above_bottom": zg - g["support_z"],
             "support_z": g["support_z"], "gap_of": lambda: grip["gap"], "pitch": pitch, "clear": g["clear"], "yaw": yaw,
             "shift": g["grip_shift"], "grip": the_grip}           # the object's centre is this far ahead of the palms (along them)
     _to_state(ctx, plan, "HOLDING", holding=held)
-    plan.attach(cuboid("held", (g["center"][0], g["center"][1], cz + g["lift"] + M["lift_sag_comp_m"]), g["dims"], g["byaw"]))
+    plan.attach(cuboid("held", (g["center"][0], g["center"][1], cz + g["lift"] + extra_up + M["lift_sag_comp_m"]), g["dims"], g["byaw"]))
     # draw the object toward the chest along the torso's forward axis: shorter lever, less load (carry pose)
     wy = plan.waist[0]
     pull = min(M["pull_in_m"], max(0.0, math.hypot(cx, cy) - M["min_carry_x_m"]))
@@ -1018,7 +1088,7 @@ def lift(ctx, plan):
     plan.call("check lift height", lambda: _check_height(ctx, z_lift, "the object did not come up to the lift height"))
     plan.call("check grip after lift", lambda: _check_gap(ctx, held["gap_of"](), "the object slipped during the lift"))
     plan.call("holding", lambda: ctx.bb["objects"].pop(g["object"], None))
-    return {"object": g["object"], "lift_m": round(g["lift"], 3)}
+    return {"object": g["object"], "lift_m": round(g["lift"] + extra_up, 3)}
 
 
 @skill("set_down", {}, "Recovery while holding: lower the object straight down onto the surface under it "
@@ -1601,17 +1671,19 @@ def _lower_live(ctx, xy_fn, z_floor, goals_at, world, fast=True):
     return {"landed_lag_m": round(_zlag(ctx) - base, 4)}
 
 
-def _come_down(ctx, plan, up, down, world, labels=("grasp pose", "palms above the object", "come down beside the object")):
+def _come_down(ctx, plan, up, down, world, labels=("grasp pose", "palms above the object", "come down beside the object"),
+               margin=None):
     """Plan the move to above the object and the straight descent beside it, bottom-up: an arm configuration
     at the bottom (IK), the straight line from it up to the top, played in reverse. The descent is then
     continuous to the very bottom (a line planned down from whatever configuration the top pose got ran into a
     joint limit part way), and the free move (transit margin) goes to its top. Returns 2 (stages done) or raises
     a SkillError; stage numbers let pre_grasp report the candidate that got furthest."""
     M = ctx.cfg["manipulation"]
-    bottom = plan.ik(labels[0], down, world, margin=M["descent_margin_m"])
+    dm = M["descent_margin_m"] if margin is None else margin    # the place asks for more (place_descent_margin_m)
+    bottom = plan.ik(labels[0], down, world, margin=dm)
     probe = ArmPlan(plan.m, start=bottom)
     probe.attached = plan.attached
-    probe.line(labels[2], up, world, margin=M["descent_margin_m"])
+    probe.line(labels[2], up, world, margin=dm)
     rise = probe.steps[-1]["traj"]
     top = plan.m.end_q(bottom, rise)
     margins = (M["transit_margin_m"], M["near_margin_m"], M["min_free_margin_m"])
@@ -1624,7 +1696,7 @@ def _come_down(ctx, plan, up, down, world, labels=("grasp pose", "palms above th
         except SkillError:
             if k == len(margins) - 1:
                 raise
-    plan.line(labels[2], down, world, margin=M["descent_margin_m"], traj={**rise, "positions": rise["positions"][::-1]})
+    plan.line(labels[2], down, world, margin=dm, traj={**rise, "positions": rise["positions"][::-1]})
     return 2
 
 
@@ -1792,7 +1864,11 @@ def _verify_placed(ctx, x, y, top_expected, dims, on):
     P = ctx.geometry.points(frame, step=2, T=ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q)))
     r = max(0.03, min(dims[0], dims[1]) / 2 - 0.03)
     near = P[np.hypot(P[:, 0] - x, P[:, 1] - y) < r]
-    top = float(np.percentile(near[:, 2], 90)) if len(near) > 30 else None
+    if len(near) <= 30:                         # nothing at all in the target's column: it is outside the camera's view (a tall
+        log.warning("placed-object check on '%s': the target is outside the camera's view (expected top %.3f): cannot verify, "   # stack's
+                    "not counted as a failure", on, top_expected)                                                # top is above the image)
+        return
+    top = float(np.percentile(near[:, 2], 90))
     log.info("placed-object check on '%s': top %s, expected %.3f", on, "unseen" if top is None else f"{top:.3f}", top_expected)
     if top is None or top < top_expected - ctx.cfg["manipulation"]["placed_check_tol_m"]:
         raise SkillError(f"the object is NOT on '{on}': the camera sees its top at "
@@ -1858,31 +1934,62 @@ def place(ctx, plan, on):
     _map_scene(ctx, [cuboid(h["object"], (mid[0] + sh * math.cos(h["yaw"]), mid[1] + sh * math.sin(h["yaw"]),
                                           mid[2] - h["grasp_above_bottom"] + h["dims"][2] / 2), h["dims"], h["yaw"])]
                + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()])
-    last, base, aligned = None, plan.mark(), False
+    last, base = None, plan.mark()
     leans = [math.radians(d) for d in M["place_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
-    for align in (True,):                       # squared to the target only: an unsquared box overhangs and falls
-        faces = [(f, 0.0) for f in _face_fractions(ctx)] + [(1.0, math.radians(d)) for d in M.get("place_face_extra_deg", [])]
-        for (frac, extra), lean in [(f, ln) for f in faces for ln in leans]:   # angle (run 36: placed turned)
-            plan.restore(base)
+    fracs = _face_fractions(ctx)
+    if fracs != [0.0]:                          # the waist turn: any that plans (the less it turns, the further the far arm
+        fracs = M.get("place_face_fractions", fracs)       # reaches across the body: right shoulder roll +10 deg, 12 Nm)
+    faces = [(f, 0.0) for f in fracs] + [(1.0, math.radians(d)) for d in M.get("place_face_extra_deg", [])]
+    th = target_yaw                             # squared to the target only: an unsquared box overhangs and falls
+
+    def attempt(frac, extra, lean):
+        """Turn the waist, then above the target and straight down onto it (planned bottom-up, always continuous to the
+        bottom); the grip moved rigidly: the box stays level, the hands never turn on it. Raises if it does not plan."""
+        plan.restore(base)
+        if frac or lean or extra:
+            _turn_carrying(ctx, plan, h, x, y, on, frac, above, world, lean, extra)
+        px, py = palms_at(x, y, th)
+        held = _held(plan.m, h, th)
+        pm = M.get("place_descent_margin_m", M["descent_margin_m"])
+        margins = sorted({M["descent_margin_m"], pm, (M["descent_margin_m"] + pm) / 2}, reverse=True)
+        for dm in margins:                      # the most clearance that plans, else the pick's
+            mk2 = plan.mark()
             try:
-                if frac or lean or extra:
-                    _turn_carrying(ctx, plan, h, x, y, on, frac, above, world, lean, extra)
-                th = target_yaw if align else plan.m.object_frame(*plan.palms())[1]
-                px, py = palms_at(x, y, th)
-                held = _held(plan.m, h, th)     # the grip moved rigidly: the box stays level, the hands never turn on it
-                # above the target, then straight down onto it: planned bottom-up (always continuous to the bottom)
                 _come_down(ctx, plan, held(px, py, above), held(px, py, z), world,
-                           labels=("place pose", "move above the target", "lower"))
-                aligned, yaw = align, th
-                break
+                           labels=("place pose", "move above the target", "lower"), margin=dm)
+                if dm != margins[0]:
+                    log.info("place on '%s': only %.0f mm clearance plans (%.0f mm wanted)", on, 1000 * dm, 1000 * margins[0])
+                return
             except SkillError as e:
-                last = e
-        else:
+                log.debug("place candidate waist frac %.2f extra %.0f lean %.0f margin %.0f mm: %s", frac, math.degrees(extra),
+                          math.degrees(lean), 1000 * dm, e)
+                plan.restore(mk2)
+                if dm == margins[-1]:
+                    raise
+
+    # the waist turns the object and the stack toward each other: it takes the bulk of a sideways move so the arms move
+    # little. Of the turns that plan (largest first) the one with the least arm joint travel is used (a few are tried)
+    scored = []
+    for (frac, extra), lean in [(f, ln) for f in faces for ln in leans]:
+        try:
+            attempt(frac, extra, lean)
+        except SkillError as e:
+            last = e
+            log.debug("place candidate frac %.2f extra %.0f lean %.0f failed: %s", frac, math.degrees(extra), math.degrees(lean), e)
             continue
-        break
-    else:
+        scored.append((_arm_travel_deg(plan.steps[base[0]:]) + M.get("place_waist_cost", 0.1) * abs(math.degrees(plan.waist[0])),
+                       frac, extra, lean))
+        if len(scored) >= M.get("place_candidates", 1):
+            break
+    if not scored:
         plan.restore(base)
         raise SkillError(f"cannot bring the box above '{on}': {last}" + (f". {note}" if note else ""))
+    best = min(scored, key=lambda c: c[0])
+    if len(scored) > 1:
+        log.info("place on '%s': waist turns %s -> least arm motion at %.0f deg of the way", on,
+                 [(round(c[1], 2), round(c[0])) for c in scored], 100 * best[1])
+    attempt(*best[1:])
+    aligned, yaw = True, th
     keep = not aligned
     log.info("place on '%s': %s, waist %.0f deg", on, "squared to it" if aligned else "NOT squared (no plan squared)",
              math.degrees(plan.waist[0]))

@@ -3,6 +3,9 @@
 # Start service
 scripts/svc.sh start all
 
+# (starting everything also runs scripts/startup_calibrate.sh in the background: camera angle, hands, body -> logs/startup_report.txt;
+#  run it by hand after powering the robot on later)
+
 # Check Status
 scripts/svc.sh status
 

@@ -48,3 +48,7 @@ for n in $LIST; do
     *) echo "usage: $0 start|stop|restart|status|logs [server|vision|planner|llm|all]"; exit 1 ;;
   esac
 done
+if [ "$ACTION" = start ] && [ "$TARGET" = all ]; then   # every start: the robot checks its own camera angle, hands and body (logs/startup_report.txt)
+  ( sleep 20; setsid nohup "$ROOT/scripts/startup_calibrate.sh" >> "$LOGS/startup_calibrate.log" 2>&1 ) >/dev/null 2>&1 &
+  echo "startup calibration will run in ~20 s (logs/startup_report.txt)"
+fi

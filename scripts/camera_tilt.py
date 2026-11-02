@@ -7,6 +7,7 @@ the URDF predicts is the mount fix (pitch and roll; yaw is not seen by gravity).
 Robot standing still. The camera service is stopped for ~10 s (the accelerometer has its own stream).
   python -m scripts.camera_tilt            measure, print the fix and how far the current config is off
   python -m scripts.camera_tilt --write    also put the fix into config.yaml (camera_mount.optical_fix_rpy_deg)
+  python -m scripts.camera_tilt --auto     write it only if the angle moved more than camera_mount.auto_tolerance_deg (exit 3 = changed)
 Then restart the server (it reads the camera mount at start).
 The D435i accelerometer is not factory calibrated (~1-2 deg). The fix is then refined on the level surfaces in view
 (floor, table, box tops; the large flat ones that agree within 1 deg): their normal must be the IMU's up. The
@@ -164,6 +165,25 @@ def main():
             C = geo0.R.T @ D @ geo0.R @ C
     fix = [math.degrees(x) for x in config._mat_rpy(C)]
     print(f"fix (optical frame rpy, deg): [{fix[0]:.2f}, {fix[1]:.2f}, {fix[2]:.2f}]")
+    if "--auto" in sys.argv:                    # every start (scripts/startup_calibrate.sh): fix only if the angle really moved
+        cur = cfg["camera_mount"]["optical_fix_rpy_deg"]    # (gravity sees roll and pitch only: the yaw stays as configured)
+        if n is None:                           # accelerometer only: it is ~2 deg off by itself (not factory calibrated); a fix written
+            print("CALIBRATION NOT VERIFIED: fewer than two level surfaces in view; the configured fix is kept")   # from it flipped
+            return                              # the result by 2 deg between two runs (2026-11-02)
+        moved = max(abs(fix[0] - cur[0]), abs(fix[1] - cur[1]))
+        tol = cfg["camera_mount"].get("auto_tolerance_deg", 1.0)
+        if moved <= tol:
+            print(f"CALIBRATION OK: the camera angle is {moved:.2f} deg from the configured fix (tolerance {tol} deg)")
+            return
+        p = config.path("config/config.yaml")
+        s = open(p).read()
+        s2, n = re.subn(r"^  optical_fix_rpy_deg: \[.*\]$", f"  optical_fix_rpy_deg: [{fix[0]:.2f}, {fix[1]:.2f}, {cur[2]:.2f}]", s,
+                        flags=re.M)
+        if n != 1:
+            raise SystemExit("config.yaml has no camera_mount.optical_fix_rpy_deg line to update")
+        open(p, "w").write(s2)
+        print(f"CALIBRATION CHANGED: the camera moved {moved:.2f} deg; fix written [{fix[0]:.2f}, {fix[1]:.2f}, {cur[2]:.2f}]")
+        sys.exit(3)
     if "--write" in sys.argv:
         p = config.path("config/config.yaml")
         s = open(p).read()
