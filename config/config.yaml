@@ -453,12 +453,12 @@ manipulation:
   # object beside it comes down in the middle of that slot (the same clearance on both sides); a free side
   # comes down free_side_off_m off the face. Only the short straight moves near the object use small margins
   above_clear_m: 0.04            # gloves' lowest point this far above every nearby object top before coming down
-  free_side_off_m: 0.045         # a glove with nothing beside it comes down this far off the object's face (4 cm: both
+  free_side_off_m: 0.03           # a glove with nothing beside it comes down this far off the object's face (4 cm: both
                                  # gloves rubbed the faces coming down, runs 14 17 19; 2 cm: the
                                  # camera's ~1-2 cm error put a glove on the box's top edge, run 2026-10-24 11:16)
   slot_min_gap_m: 0.06           # STANDARDS M5.1: a glove comes down between two objects only this far apart (at 12-13 cm
                                  # the real glove touched one or the other, runs 14-33)
-  slot_palm_max_m: 0.035         # ...but at most this (a wide gap put it 5.6 cm off: no grasp pose, run 40)
+  slot_palm_max_m: 0.02           # ...but at most this (a wide gap put it 5.6 cm off: no grasp pose, run 40)
   slot_palm_share: 0.55          # in a slot the palm side gets this share of the free space, the back the rest
   slot_back_clear_m: 0.035      # in a slot the glove's back keeps this from the neighbour; the palm side gets the rest
   slot_back_extra_m: 0.0         # in a slot the hand moves this much toward the object it grips, away from the neighbour
