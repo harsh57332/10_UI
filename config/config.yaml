@@ -491,7 +491,7 @@ manipulation:
   turn_clear_m: 0.03             # a waist turn carrying an object low keeps it this far from what it passes...
   turn_margin_deg: 3             # ...and stops this short of where it would come closer, raises it, then goes on
   place_above_m: 0.04            # approach the place pose from this far above
-  lift_extra_m: [0.06, 0.04, 0.02]   # after the minimum lift, lift this much higher if it plans straight AND no arm joint turns more than
+  lift_extra_m: []   # after the minimum lift, lift this much higher if it plans straight AND no arm joint turns more than
   lift_extra_swing_deg: 6        # the minimum lift's most-turned joint + this (the object stays level). Higher = more clearance, more shoulder load
   pull_in_m: 0.0                 # after lifting, draw the box this far toward the chest. Off: it saves <1 Nm of
                                  # shoulder pitch but swings the upper arms inward (the left upper arm hit the
@@ -546,6 +546,8 @@ manipulation:
                                  # planned lowering's start only when every joint is within this (the held box is not modelled)
   land_lag_m: 0.008              # ...and stops once the hands are this far above their command (it sits down)
   land_overrun_m: 0.03           # lower at most this far below where the surface should be, else refuse
+  land_accept_above_m: 0.015    # no touch felt but the hands ended this far above the expected surface height (or...
+  land_accept_below_m: 0.012    # ...this far below it): the object rests there (the line ended at the surface, nothing pushed further): landed
   contact_free_margin_m: 0.01     # a live contact move that falls back to a free path keeps this far from obstacles
   release_open_m: [0.05, 0.03, 0.015]  # letting go: each glove straight outward this far (smaller if a glove meets something;
                                        # 5 cm first: the wrist presses the face too, see planner_model.glove.contact_span_x_m)

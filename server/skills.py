@@ -1692,8 +1692,18 @@ def _lower_live(ctx, xy_fn, z_floor, goals_at, world, fast=True):
     if not landed:
         time.sleep(M["close_settle_s"])
         landed = _zlag(ctx) - base >= M["land_lag_m"]
+    lc, rc = m.palms(m.q_now(commanded=False))
+    z_hands, z_contact = float(lc[2] + rc[2]) / 2, z_floor + M["land_overrun_m"]    # where the hands are / where the surface should stop them
+    log.info("lowering ended: hands at z %.3f, the surface expected at z %.3f (%+.1f cm), lag %.1f mm, felt: %s",
+             z_hands, z_contact, 100 * (z_hands - z_contact), 1000 * (_zlag(ctx) - base), landed)
     if not landed:
-        raise SkillError("lowered past where the surface should be without touching it")
+        # The planned line can end exactly where the object rests (no push beyond it, so no lag to feel): hands stopped at the
+        # expected surface height (not through the whole overrun) = landed (user 2026-11-03: the box sat on the target, the run
+        # failed 'without touching it'). A release from there is at most a ~1 cm drop onto the target.
+        if -M["land_accept_below_m"] <= z_hands - z_contact <= M["land_accept_above_m"]:
+            log.warning("lowering: no touch felt, but the hands stopped at the expected surface height: taken as landed")
+        else:
+            raise SkillError("lowered past where the surface should be without touching it")
     _hold_here(ctx)
     return {"landed_lag_m": round(_zlag(ctx) - base, 4)}
 
