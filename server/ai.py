@@ -240,6 +240,9 @@ class MotionPlanning:
             if ctx.scene is not None:               # a new task: the last one's scene is over
                 ctx.scene.forget(ctx)
             ctx.forget_positions()                 # people move things between tasks: always look again
+            if ctx.bb["hand"] != "EMPTY" and not ctx.link.state()["arms"]["engaged"]:
+                log.warning("hands recorded as %s but the arms are released (a stopped run): hands are EMPTY", ctx.bb["hand"])
+                ctx.bb.update(hand="EMPTY", holding=None, grasp=None, grip=None)   # released arms hold nothing
             ctx.bb.pop("calib", None)
             scene = ctx.scene = TaskScene(ctx, text)
             self.scene_dir = scene.run_dir

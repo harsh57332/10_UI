@@ -189,7 +189,7 @@ def _escape_plan(ctx):
     mid, yaw = plan.m.object_frame(left, right)
     half = float(np.linalg.norm(left - right)) / 2
     top = max([v["top_z"] for v in ctx.bb["objects"].values()] + [float(mid[2]) - _glove()["below"]])
-    last = None
+    last, up = None, None
     for extra in M["escape_up_extra_m"]:
         plan.restore(start)
         z_up = top + _glove()["below"] + M["retreat_clear_m"] + extra
@@ -221,7 +221,7 @@ def _escape_plan(ctx):
                 last = e
                 log.warning("escape down (margin %.3f, map %s): %s", margin, use_map, e)
     for margin, use_map in ((M["near_margin_m"], True), (0.0, False)):   # no way down by the sides: the ready pose (cool, in
-        plan.restore(up)                                                  # front, away from the stack); the arms stay held there
+        plan.restore(up if up is not None else start)                     # front, away from the stack); the arms stay held there
         plan.use_map = use_map
         try:
             goal = dict(plan.q)
