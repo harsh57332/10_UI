@@ -157,6 +157,7 @@ class Arms:
         self._wait_weight(1.0)
 
     def release(self, wait=True):
+        self.fault = None           # released on purpose: nothing is held, the next engage starts clean (a stale hold blocked 3 runs, 2026-11-03)
         with self.lock:
             self._let_go()
             self.segments = []
@@ -216,7 +217,12 @@ class Arms:
         warm = self._hot(self.cfg["warn_motor_temp_c"])
         self.warning = f"arm motors hot: {self._describe(warm)}" if warm else None
         hot = {j: t for j, t in warm.items() if t > self.cfg["max_motor_temp_c"]}
-        if hot and not self.fault and time.monotonic() > self.recover_until:
+        self._hot_seen = getattr(self, "_hot_seen", 0) + 1 if hot else 0      # a one-sample reading is not a trip (the status read 57 C when this read 97)
+        if hot:
+            m = self.g1.low.get()
+            log.warning("motor temperature above max (%d in a row): %s raw %s", self._hot_seen, self._describe(hot),
+                        {joints.NAMES[j]: list(m.motor_state[j].temperature) for j in hot} if m else None)
+        if self._hot_seen >= 3 and not self.fault and time.monotonic() > self.recover_until:
             self._hold_in_place(f"over-temperature: {self._describe(hot)}")
 
     def _blocked_check(self, now):

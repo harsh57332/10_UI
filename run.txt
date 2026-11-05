@@ -10,7 +10,7 @@ scripts/svc.sh start all
 scripts/svc.sh status
 
 # Open website
-http://192.168.0.136:8000/
+http://192.168.0.149:8000
 
 # If any new changes made on server
 scripts/robot.sh deploy && scripts/robot.sh restart agent

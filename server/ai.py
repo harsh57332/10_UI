@@ -1,12 +1,15 @@
 """Section 6 (motion planning) and section 7 (AI control).
 
-The LLM only picks skills from the library; perception, poses and trajectories come from code.
+The LLM (Cosmos) only picks skills from the library; perception, poses and trajectories come from code.
 Section 6: text -> skills (arms only) -> every trajectory planned up front -> played on request.
-Section 7: text -> skill plan -> py_trees sequence. Before each node an isolated LLM call reviews it
-against the live blackboard; compulsory safety checks run before every node; step mode waits for
-"Next" before each node. A failed node triggers a bounded re-plan. Abort stops after the current
-node; the arms keep holding whatever they hold.
+Section 7: text -> skill plan (temperature 0, checked against the hand-state machine) -> py_trees sequence of
+fixed behaviours. A stretch of arm skills that picks something up is one node and runs like section 6 (task
+scene, margin check, planned up front, played). Walking is in measured legs; the last leg towards a place target
+is walked while cuRobo already plans the place. Compulsory safety checks run before every node; step mode waits
+for "Next". A failed node triggers a bounded re-plan. Abort stops after the current node; the arms keep holding
+whatever they hold. After the task everything measured is forgotten.
 """
+import re
 import copy
 import json
 import logging
@@ -25,15 +28,16 @@ from . import heat
 from . import skills as skills_mod
 from .scene import TaskScene, parse
 from .services import ServiceError
-from .skills import (SKILLS, SURFACE_WORDS, catalog, check_cool, check_hands, clean_params, execute, new_plan, rest,
-                     run_skill)
+from .skills import (SKILLS, TARGET_WORDS, stand_for_pick, SURFACE_WORDS, catalog, check_cool, check_hands, clean_params, execute, new_plan, place_with_prefetch,
+                     recover, rest, run_skill)
 
 log = logging.getLogger("ai")
 
 BRIEF = (
     "You control a Unitree G1 humanoid robot in a lab. It has two dummy hands without working fingers, so it "
     "can only pick up boxes by squeezing them between both palms (boxes 4-50 cm wide, up to 2 kg). It walks at a "
-    "fixed 0.4 m/s and turns in place. It never changes its control mode. Distances are metres in the robot's "
+    "fixed 0.4 m/s and turns in place. It never changes its control mode. It can also set its head light colour "
+    "(headlight) and speak a text (speak). Distances are metres in the robot's "
     "torso frame: x forward, y left, z up."
 )
 RULES = (
@@ -46,7 +50,8 @@ RULES = (
     "at ready; to put it on a table you are not at, approach the table first. retreat lets go of an object "
     "that is gripped but not lifted. Each skill only works in the hand state it lists. Keep the plan short. "
     "To stack object A on object B: find A, find B, pre_grasp A, grasp, lift, place on B (A is the object that "
-    "moves; B stays where it is). Only one object can be held at a time. Do not add ready at the end: the arms "
+    "moves; B stays where it is). A turn of N degrees to the left/right is one turn step with angle_deg N. To put a "
+    "held object on something far away: turn if told to, approach it, then place on it. If the user states how far the target is (from the toe tip), pass that number as distance_cm to approach (the camera only sees 50-60 cm: that part is walked blind). Only one object can be held at a time. Do not add ready at the end: the arms "
     "go back to their normal position by themselves after the task."
 )
 AFTER = {"pre_grasp": "AT_OBJECT", "grasp": "GRIPPING", "lift": "HOLDING", "place": "EMPTY",
@@ -58,11 +63,6 @@ def plan_schema(names):
         "plan": {"type": "array", "items": {"type": "object", "required": ["skill", "params", "why"], "properties": {
             "skill": {"type": "string", "enum": names}, "params": {"type": "object"}, "why": {"type": "string"}}}},
         "notes": {"type": "string"}}}
-
-
-REVIEW_SCHEMA = {"type": "object", "required": ["decision", "params", "reason"], "properties": {
-    "decision": {"type": "string", "enum": ["run", "skip", "abort"]},
-    "params": {"type": "object"}, "reason": {"type": "string"}}}
 
 
 class Busy:
@@ -91,7 +91,13 @@ def llm_plan(ctx, llm, text, kinds, extra=""):
             if n.get("skill") not in SKILLS or SKILLS[n["skill"]]["kind"] not in kinds:
                 raise SkillError(f"the LLM chose a skill that is not allowed here: {n.get('skill')}")
             n["params"] = clean_params(n["skill"], n.get("params"))[0]
-        plan = hoist_finds(plan)
+        for n in plan:                                 # a distance only counts when the user wrote that number
+            d = n["params"].get("distance_cm")
+            if d is not None and not any(w in str(n["params"].get("target", "")).lower() for w in TARGET_WORDS):
+                n["params"].pop("distance_cm")                # a distance belongs to a case/table-like target, never to the box
+            elif d is not None and not re.search(r"(?<![\d.])%s(?:\.0+)?(?![\d.])" % re.escape(str(d).rstrip("0").rstrip(".") if "." in str(d) else str(d)), text):
+                n["params"].pop("distance_cm")
+        plan = drop_redundant_finds(hoist_finds(plan))
         problem = check_plan(ctx, plan)
         if not problem:
             return plan, (out["json"] or {}).get("notes", "")
@@ -143,6 +149,12 @@ def hoist_finds(plan):
             i += len(moved)
         i += 1
     return out
+
+
+def drop_redundant_finds(plan):
+    """approach measures its own target (and holding a box blocks the camera): a find right before it is dropped."""
+    return [n for k, n in enumerate(plan) if not (n["skill"] == "find" and k + 1 < len(plan) and plan[k + 1]["skill"] == "approach"
+                                                  and plan[k + 1]["params"].get("target") == n["params"].get("object"))]
 
 
 def sync_hands(ctx, name, plan6=None):
@@ -350,18 +362,46 @@ class MotionPlanning:
 
 # ==================================================================== section 7
 class SkillNode(py_trees.behaviour.Behaviour):
-    def __init__(self, ai, index):
-        super().__init__(name=f"{index}:{ai.nodes[index]['skill']}")
-        self.ai, self.index, self.thread = ai, index, None
+    """One behaviour = one segment of the plan (a single skill, or the arm skills of a pick)."""
+    def __init__(self, ai, seg):
+        super().__init__(name="+".join(ai.nodes[i]["skill"] for i in seg))
+        self.ai, self.seg, self.thread = ai, seg, None
 
     def initialise(self):
-        self.thread = threading.Thread(target=self.ai.execute, args=(self.index,), daemon=True)
+        self.thread = threading.Thread(target=self.ai.execute, args=(self.seg,), daemon=True)
         self.thread.start()
 
     def update(self):
         if self.thread.is_alive():
             return Status.RUNNING
-        return Status.SUCCESS if self.ai.nodes[self.index]["status"] in ("done", "skipped") else Status.FAILURE
+        ok = all(self.ai.nodes[i]["status"] in ("done", "skipped") for i in self.seg)
+        return Status.SUCCESS if ok else Status.FAILURE
+
+
+def segments(ctx, nodes, start):
+    """Group the plan from `start`: consecutive perceive/arm skills that begin with empty hands and contain an arm skill
+    (a pick: find, pre_grasp, grasp, lift) are one segment, run like section 6; every other skill is its own."""
+    out, hand, i = [], ctx.bb["hand"], 0
+    for k in range(start):
+        hand = AFTER.get(nodes[k]["skill"], hand)
+    i = start
+    while i < len(nodes):
+        j = i
+        while j < len(nodes) and SKILLS[nodes[j]["skill"]]["kind"] in ("perceive", "arm"):
+            j += 1
+        group = list(range(i, j))
+        if hand == "EMPTY" and any(SKILLS[nodes[k]["skill"]]["kind"] == "arm" for k in group):
+            out.append(group)
+        else:
+            out.extend([k] for k in group)
+        for k in group:
+            hand = AFTER.get(nodes[k]["skill"], hand)
+        if j < len(nodes) and j == i:
+            out.append([j])
+            hand = AFTER.get(nodes[j]["skill"], hand)
+            j += 1
+        i = j
+    return out
 
 
 class AIControl:
@@ -397,7 +437,7 @@ class AIControl:
 
     def status(self):
         return {"state": self.state, "task": self.task, "mode": self.mode, "error": self.error,
-                "nodes": [{k: n.get(k) for k in ("skill", "params", "why", "status", "result", "error", "review")}
+                "nodes": [{k: n.get(k) for k in ("skill", "params", "why", "status", "result", "error")}
                           for n in self.nodes],
                 "log": self.log[-30:], "known": self.ctx.summary()}
 
@@ -409,7 +449,7 @@ class AIControl:
         try:
             self._safety(None)
             check_cool(self.ctx)
-            self.ctx.forget_positions()           # people move things between tasks: always find again
+            self._forget()                        # people move things between tasks: always find again
             plan, notes = llm_plan(self.ctx, self.llm, self.task, self.KINDS)
             self.nodes = [{**n, "status": "pending"} for n in plan]
             self._say(f"plan: {' -> '.join(n['skill'] for n in plan)}" + (f" ({notes})" if notes else ""))
@@ -426,6 +466,8 @@ class AIControl:
                     self._say("aborted by user; arms keep their current hold")
                     return
                 failed = next(i for i, n in enumerate(self.nodes) if n["status"] == "failed")
+                if SKILLS[self.nodes[failed]["skill"]]["kind"] == "move":     # turning/walking is not retried or re-planned
+                    raise SkillError(f"step {failed + 1} ({self.nodes[failed]['skill']}) failed: {self.nodes[failed]['error']}")
                 if replans >= self.cfg["ai"]["max_replans"]:
                     raise SkillError(f"step {failed + 1} failed and the re-plan limit was reached")
                 replans += 1
@@ -440,18 +482,46 @@ class AIControl:
         except SkillError as e:
             self.state, self.error = "failed", str(e)
             self._say(f"stopped: {e}")
+            self._recover()
         finally:
             try:
                 if rest(self.ctx):                 # arms back to their normal position after every task
                     self._say("arms released to their normal position")
             except Exception as e:
                 self._say(f"arms not released: {e}")
+            self._forget()                         # memory clear for the next task
             Busy.owner = None
             Busy.lock.release()
 
+    def _recover(self):
+        """A task that stops while the hands hold or touch something: the recovery for that state (set down / retreat; it
+        ignores the heat gate by design, a held box heats the shoulders). Never when the user aborted: that keeps the hold."""
+        ctx = self.ctx
+        if ctx.bb["hand"] == "EMPTY" or not ctx.link.state()["arms"]["engaged"] or self._abort.is_set():
+            return
+        try:
+            self._say(recover(ctx))
+        except Exception as e:                         # no surface to set it on (lost): drop the object, arms down, stand
+            self._say(f"recovery failed: {e}; releasing the arms (the object drops)")
+            try:
+                ctx.agent("release_upperbody", {}, timeout=15)
+                ctx.bb.update(hand="EMPTY", holding=None)
+            except Exception as e2:
+                self._say(f"release failed: {e2}")
+
+    def _forget(self):
+        """Forget everything measured, planned or remembered for the task (objects, surfaces, map, scene, prefetched plan)."""
+        ctx = self.ctx
+        if ctx.scene is not None:
+            ctx.scene.forget(ctx)
+            ctx.scene = None
+        ctx.forget_positions()
+        for k in ("prefetch", "place_next", "no_map", "calib"):
+            ctx.bb.pop(k, None)
+
     def _tick_tree(self, start):
-        root = py_trees.composites.Sequence(name="task", memory=True,
-                                            children=[SkillNode(self, i) for i in range(start, len(self.nodes))])
+        segs = segments(self.ctx, self.nodes, start)
+        root = py_trees.composites.Sequence(name="task", memory=True, children=[SkillNode(self, g) for g in segs])
         tree = py_trees.trees.BehaviourTree(root)
         self.state = "running"
         while True:
@@ -460,40 +530,104 @@ class AIControl:
                 return root.status
             time.sleep(0.1)
 
-    def execute(self, i):
-        """One node: safety checks -> LLM review -> step gate -> skill."""
-        n = self.nodes[i]
+    def execute(self, seg):
+        """One behaviour: safety checks -> step gate -> the skill (or the whole pick)."""
+        first = self.nodes[seg[0]]
         try:
             if self._abort.is_set():
                 raise SkillError("aborted")
-            n["status"] = "checking"
-            self._safety(n)
-            n["status"] = "reviewing"
-            review = self._review(i)
-            n["review"] = review
-            if review["decision"] == "abort":
-                raise SkillError(f"LLM stopped the task: {review['reason']}")
-            if review["decision"] == "skip":
-                n["status"] = "skipped"
-                self._say(f"step {i + 1} {n['skill']} skipped: {review['reason']}")
-                return
-            params, missing = clean_params(n["skill"], review.get("params") or n["params"])
-            n["params"] = n["params"] if missing else params     # a review that drops a needed input is ignored
+            for i in seg:
+                self.nodes[i]["status"] = "checking"
+            self._safety(first)
             if self.mode == "step":
-                n["status"] = "waiting"
+                for i in seg:
+                    self.nodes[i]["status"] = "waiting"
                 self.state = "waiting"
                 self._gate.clear()
-                self._gate.wait()
+                hold = self.ctx.bb["hand"] != "EMPTY"       # holding heats the shoulders: do not wait long for "Next"
+                if not self._gate.wait(self.cfg["ai"]["hold_gate_max_s"] if hold else None):
+                    self._say(f"no 'Next' within {self.cfg['ai']['hold_gate_max_s']} s while holding: continuing (the arms heat)")
                 if self._abort.is_set():
                     raise SkillError("aborted")
             self.state = "running"
-            n["status"] = "running"
-            self._say(f"step {i + 1}: {n['skill']} {json.dumps(n['params'])}")
-            n["result"] = run_skill(self.ctx, n["skill"], n["params"])
-            n["status"] = "done"
-        except (SkillError, TypeError, ValueError) as e:
-            n["status"], n["error"] = "failed", str(e)
-            self._say(f"step {i + 1} {n['skill']} failed: {e}")
+            for i in seg:
+                self.nodes[i]["status"] = "running"
+            if len(seg) > 1:
+                self._say(f"steps {seg[0] + 1}-{seg[-1] + 1}: {' -> '.join(self.nodes[i]['skill'] for i in seg)} (planned up front)")
+                self._pick(seg)
+            else:
+                self._one(seg[0])
+            for i in seg:
+                self.nodes[i]["status"] = "done"
+        except (SkillError, ServiceError, TypeError, ValueError) as e:
+            bad = next((i for i in seg if self.nodes[i]["status"] != "done"), seg[0])
+            for i in seg:
+                if self.nodes[i]["status"] != "done":
+                    self.nodes[i]["status"] = "failed" if i == bad else "skipped"
+            self.nodes[bad]["error"] = str(e)
+            self._say(f"step {bad + 1} {self.nodes[bad]['skill']} failed: {e}")
+            if len(seg) > 1 and self.ctx.scene is not None:
+                self._end_scene(error=str(e))
+
+    def _one(self, i):
+        n, ctx = self.nodes[i], self.ctx
+        n["params"] = clean_params(n["skill"], n["params"])[0]
+        self._say(f"step {i + 1}: {n['skill']} {json.dumps(n['params'])}")
+        if n["skill"] == "approach":              # a place on this target follows: plan it while walking the last leg
+            nxt = self.nodes[i + 1] if i + 1 < len(self.nodes) else None
+            ctx.bb["place_next"] = n["params"]["target"] if nxt and nxt["skill"] == "place" and \
+                nxt["params"].get("on") == n["params"]["target"] else None
+        try:
+            if n["skill"] == "place":
+                n["result"] = place_with_prefetch(ctx, n["params"]["on"])
+            else:
+                n["result"] = run_skill(ctx, n["skill"], n["params"])
+        finally:
+            ctx.bb.pop("place_next", None)
+
+    def _pick(self, seg):
+        """Like section 6: scan the scene (SAM 3, side views where needed), plan every step, check it holds when the objects
+        are a little off, then play at once (no play check: the scene was scanned seconds ago and nothing else moves). The scene is forgotten afterwards (the robot walks next)."""
+        ctx = self.ctx
+        steps = [{**self.nodes[i]} for i in seg]
+        for n in steps:
+            n["params"] = clean_params(n["skill"], n["params"])[0]
+        for n in list(steps):                          # a walk forgot every position: a pick not led by its find gets one
+            o = n["params"].get("object")
+            if n["skill"] == "pre_grasp" and o and not any(m["skill"] == "find" and m["params"].get("object") == o
+                                                         for m in steps[:steps.index(n)]):
+                steps.insert(steps.index(n), {"skill": "find", "params": {"object": o}, "why": "find it again after the walk"})
+        self._forget()
+        first = next((n["params"]["object"] for n in steps if n["skill"] == "pre_grasp"), None)
+        if first and ctx.bb["hand"] == "EMPTY" and self.cfg["ai"]["stand_for_pick"]:
+            with ctx.processing("standing for the pick"):
+                if stand_for_pick(ctx, first):
+                    time.sleep(1.0)
+            self._forget()
+            if self._abort.is_set():
+                raise SkillError("aborted")
+        scene = ctx.scene = TaskScene(ctx, self.task)
+        nouns = sorted({parse(n["params"]["object"])[0] for n in steps if n["skill"] == "find"
+                        and not any(w in n["params"]["object"].lower() for w in SURFACE_WORDS)})
+        scene.capture(ctx, 0.0)
+        views = scene.scan(ctx, nouns)
+        scene.note(llm_steps=[{k: n.get(k) for k in ("skill", "params", "why")} for n in steps], nouns=nouns,
+                   start_state=ctx.link.state())
+        plan = plan_task(ctx, steps)
+        margin = margin_check(ctx, steps)
+        scene.note(views_deg=views, plan=plan.summary(), margin=margin)
+        self._say("plan " + ("robust" if margin["robust"] else f"MARGINAL ({', '.join(margin['failed'])})"))
+        if self._abort.is_set():
+            raise SkillError("aborted")
+        execute(ctx, plan, on_step=lambda i, label: log.info("ai step %d/%d %s", i + 1, len(plan.steps), label))
+        self._end_scene()
+
+    def _end_scene(self, error=None):
+        ctx = self.ctx
+        if ctx.scene is not None:
+            ctx.scene.note(result="failed" if error else "done", error=error)
+            ctx.scene.forget(ctx)
+            ctx.scene = None
 
     def _safety(self, node):
         """Compulsory before every node."""
@@ -511,19 +645,3 @@ class AIControl:
             raise SkillError("camera is offline")
         if self.ctx.bb["holding"]:
             run_skill(self.ctx, "check_holding", {})     # raises if the box slipped
-
-    def _review(self, i):
-        n = self.nodes[i]
-        prev = [{"skill": m["skill"], "status": m["status"], "result": m.get("result")} for m in self.nodes[:i]]
-        user = (f"Task: {self.task}\nPlan: {[(m['skill'], m['params']) for m in self.nodes]}\nDone so far: "
-                f"{json.dumps(prev, default=str)[:3000]}\nWhat the robot knows now: {json.dumps(self.ctx.summary())}\n"
-                f"Next step {i + 1}: skill {n['skill']} with params {json.dumps(n['params'])} "
-                f"(parameters: {json.dumps(SKILLS[n['skill']]['params'])}).\n{RULES}\nDecide: run it (you may "
-                'correct its params), skip it if it is no longer needed, or abort if the task cannot succeed. '
-                'Return JSON {"decision": "run|skip|abort", "params": {...}, "reason": ...}.')
-        with self.ctx.processing("llm"):
-            out = self.llm.call("chat", {"system": BRIEF, "user": user, "schema": REVIEW_SCHEMA, "max_tokens": 1024})
-        r = out["json"] or {}
-        if r.get("decision") not in ("run", "skip", "abort"):
-            return {"decision": "run", "params": n["params"], "reason": "review unreadable; running as planned"}
-        return r

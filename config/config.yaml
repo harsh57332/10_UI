@@ -63,6 +63,7 @@ locomotion:
   duration_max_s: 30.0
   turn_stop_lead_s: 0.25         # turn_by stops this early (x velocity) to absorb the stopping lag
   turn_settle_s: 0.6
+  tilt_stop_deg: 12              # a walk stops at once if the pelvis roll/pitch moves this far from where it started
 
 arms:
   rate_hz: 50
@@ -169,7 +170,9 @@ hands:
       finger_extra_m: 0.02       # glove fingertips beyond the rubber fingertips (estimate)
     manipulation:                # this hand's own values over `manipulation`
       grasp_up_m: 0.01           # grip 1 cm above the box's centre height: more room over the stack at the place (user 2026-10-30: the left arm touched the stack)
-      wrist_close_deg: 0         # OFF (it works with 0). Tried 6 on 2026-11-02: the wrist turn pulls the palm points ~1.4 cm closer (12.9 -> 11.5 cm on a 14.3 cm box)
+      wrist_close_deg: 2         # light fingertip pressure only (user 2026-11-03: the wrist curves are pressed by the shoulders, the main squeeze; 6 deg pressed the fingertips alone and the box slipped)
+      grip_hold_extra_m: -0.010  # the 2 deg wrist turn pulls the palm points ~0.5 cm closer: the carried width is planned for it
+      # was OFF (it works with 0). Tried 6 on 2026-11-02: the wrist turn pulls the palm points ~1.4 cm closer (12.9 -> 11.5 cm on a 14.3 cm box)
                                  # while the plan carries/places the box at width + grip_hold_extra_m (-0.5 cm): the 2.3 cm mismatch exceeds live_grip_tol_m, the arm was
                                  # re-solved for the live grip and the lowering flipped (left elbow -80, wrist swing). Fingertip pressure would need the planned gap
                                  # recalibrated with it (grip_hold_extra_m about -1.9 cm at 6 deg) and live tests; see the notes.
@@ -309,19 +312,20 @@ services:
     port: 8025
     conda_env: g1ui_llm
     module: services.llm.serve                   # execs `vllm serve` with the flags below
-    model: nvidia/Cosmos3-Nano
-    served_name: cosmos3-nano
+    model: nvidia/Cosmos3-Super                  # was nvidia/Cosmos3-Nano (until 2026-11-05)
+    served_name: cosmos3-super
     hf_overrides: {architectures: [Cosmos3ReasonerForConditionalGeneration]}
     tensor_parallel_size: 1
     max_num_seqs: 256
     kv_cache_dtype: auto
-    gpu_memory_utilization: 0.65                 # one GPU shared with OWLv2 and cuRobo
+    gpu_memory_utilization: 0.90                 # GPU 1 alone (Super's reasoner is ~63 GB; Nano's 17 GB shared GPU 0 at 0.65)
     max_model_len: 32768
     max_tokens: 4096
     temperature: 0.2
     timeout_s: 300
     env:                                         # FlashInfer's sampler JIT fails on sm_120 with the system nvcc
       VLLM_USE_FLASHINFER_SAMPLER: "0"
+      CUDA_VISIBLE_DEVICES: "1"                  # the LLM on the second GPU; vision and planner stay on cuda:0
 
 # Arms-only planning model: torso-rooted, waist fixed at 0, palm contact frames on the hands (hands.<name>).
 planner_model:
@@ -430,7 +434,7 @@ camera_mount:
   # the camera's real angle in its mount relative to the URDF's d435_joint, as a rotation of the optical frame
   # (rpy, deg; x right = pitch). Measured with the camera's own accelerometer + torso IMU: scripts/camera_tilt.py
   # --write. 2026-10-29: the camera sat ~13 deg further down than the URDF (floor and table read 13 deg tilted).
-  optical_fix_rpy_deg: [0.29, -0.88, 0.49]
+  optical_fix_rpy_deg: [-2.29, -0.80, 0.49]
   auto_tolerance_deg: 1.0        # startup calibration (scripts/startup_calibrate.sh) rewrites the fix only when a REFINED measurement moved more
   auto_max_deg: 4.0              # ...and never writes a change bigger than this (a bad measurement or a knocked camera: look at the mount)
 
@@ -534,6 +538,7 @@ manipulation:
                                  # test lift, then the box slid out during the turn, 2026-10-24 11:27) squeeze grip_retry_n harder
   use_grasp_calibration: true    # the gripped palms' midpoint vs the camera's box centre = the camera's offset along the
                                  # squeeze axis: applied to the place target (corners mismatched on 2026-10-24 run 1)
+  set_down_range_m: 0.12          # set_down lowers at most this far below where the hands are, stopping at contact (user 2026-11-04)
   rest_after_task: true          # after every task with empty hands, release the arms to the walking policy
                                  # (they hang at the sides: no load, they cool); held objects keep them held
   start_max_temp_c: 70           # (sanity bound only: the heat model gate decides) a task starts only with every arm motor at or below this (released arms settle at
@@ -594,6 +599,7 @@ manipulation:
   max_trusted_box_yaw_deg: 15    # larger box-angle estimates are treated as mis-fits (run 8 gripped the length)
   live_grip_tol_m: 0.01          # a holding move plays its PLANNED end pose when the live palm gap is within this of the plan's
                                  # (re-solving the arm for the live grip put the left wrist near 0 deg pitch: line-up/lowering flipped)
+  place_big_target_m: 0.10       # a place target deeper than the box by this much (a case, a bin): the box goes near its front edge, not its centre
   place_candidates: 4            # waist turns that plan are compared (largest turn first); the one with the least arm joint travel is used
   place_waist_cost: 0.1          # + this per degree of waist turn when comparing (a tie goes to the smaller turn)
   place_face_fractions: [1.0, 0.97, 0.94, 0.91, 0.88, 0.84, 0.8, 0.7, 0.6, 0.5, 0.0]   # the place tries these (largest turn first; 3/3 run: only 1.0 then 0.5 -> 18 deg, right arm across the body)
@@ -634,14 +640,62 @@ thermal:
 
 # AI control and skills.
 ai:
-  speed: 0.4                     # fixed walking speed (m/s); walk time = distance / speed
+  speed: 0.4                     # fixed commanded walking speed (m/s)
+  walk_vy_bias_mps: 0.05         # forward walk at 0.4 m/s: constant push to the left (tape 2026-11-04: 12 cm right in 2.05 s with 0; 3 cm left with 0.06;
+                                 # 2026-11-05: 2 cm right / 8 cm left over 1.25 m)
+  walk_vy_bias_slow_mps: 0.03    # forward walk at 0.2 m/s: push to the left (tape 2026-11-05, 0.5 m with 0: 10 and 12 cm right in 3 s)
+  walk_vy_bias_back_mps: 0.015   # backward walk at 0.4 m/s: push to the left (tape 2026-11-05, 1.2 m with 0: 15 and 13 cm right in 3.85 s;
+                                 # with 0.03: 15 cm LEFT, so backward the push acts ~2x as strongly as forward)
+                                 # (backward at 0.2 m/s and side steps went straight: no push)
+  walk_step_m: 0.096             # 0.4 m/s forward: one gait step (tape 2026-11-05, empty hands: 13 steps = 125, 125 cm; was 0.094 from 2026-11-04)
+  walk_step_back_m: 0.091        # 0.4 m/s backward: one gait step (tape 2026-11-05: 13 steps = 118, 118 cm)
+  walk_step_s: 0.30              # one step takes this long
+  walk_step_mid_s: 0.05          # command n steps for n x walk_step_s minus this (the first step starts ~0.1 s late; lands mid-step)
+  walk_ground_mps: 0.3525        # fit to tape measurements (2026-11-03, 0.4 m/s commanded): 1 s -> 30 cm, 2 s -> 64.5 and 66 cm: d = v (t - lag)
+  walk_lag_s: 0.149              # start-up lag (s): time = d / ground speed + walk_lag_s
+  walk_ground_slow_mps: 0.167    # 0.2 m/s forward/backward: ground speed (tape 2026-11-05: 2.99 s -> 47, 48 cm forward, 48, 47 cm back)
+  walk_aside_left_mps: 0.144     # 0.2 m/s side step left: ground speed (tape 2026-11-05: 1.57 s -> 22, 19 cm; each also turned ~4 deg right)
+  walk_aside_right_mps: 0.204    # 0.2 m/s side step right: ground speed (tape 2026-11-05: 1.57 s -> 29, 29 cm)
+  walk_corridor_m: 0.60          # clearance check ahead: corridor width (body 0.45 m + margin)
+  walk_floor_clear_m: 0.15       # ...above the floor (a step lower than this is not an obstacle)
+  walk_stop_clear_m: 0.22        # ...forward walks keep the nearest thing ahead at least this far from the pelvis origin afterwards (table standoff is 0.25)
+  walk_held_front_m: 0.45        # holding: points nearer than this ahead of the pelvis are the box and arms; the box front leads the body by this
+  walk_held_sphere_m: 0.16       # ...the held box and this much around it is ignored
+  walk_min_points: 30            # ...fewer depth points than this in the corridor = clear
+  turn_tolerance_deg: 5          # turn: the IMU-checked turn is corrected until within this of the angle asked
+  turn_corrections: 1            # one short correction pass if the turn ends more than turn_tolerance_deg off
+  surface_min_above_floor_m: 0.25   # a surface top lower than this above the floor is the floor seen past a tall thing: its front face is measured instead
+  surface_ahead_frames: 5         # depth frames for a surface measured without a detection
+  hold_gate_max_s: 600           # calibration session 2026-11-04: wait for the user between steps
+  walk_leg_fraction: 0.6         # approach walks this fraction of the remaining distance, then measures again
+  walk_min_leg_m: 0.15           # ...but not less than this (walking shorter than that is not repeatable)
+  place_prefetch_tol_m: 0.02     # the place planned during the last leg is played only if the target is found this close to the prediction
   table_standoff_m: 0.25         # torso origin to table front edge when ready to manipulate
   face_turn_deg: 15              # approach: turn toward a target more than this off to the side
-  box_reach_x_m: 0.32            # box centre this far in front of the torso for a pick
+  box_reach_x_m: 0.33            # box centre this far in front of the torso for a pick
   approach_tolerance_m: 0.05
+  arrived_max_m: 0.25            # holding a box: the walk guard stopping the last this-much of an approach counts as arrived (the box is at the target)
+  speed_slow: 0.2                # turning/side steps/adjusting steps (m/s); 0.4 only for a confident long forward/backward walk
+  confident_walk_min_m: 0.60     # forward/backward walks at least this long use the 0.4 m/s speed
+  back_before_turn_m: 0.25       # holding something: step back this far before a turn so the box clears the chair/table in front (user 2026-11-03)
+  stand_for_pick: false          # OFF (user 2026-11-03): the robot picks from where it stands; the stance loop moved it 20 cm sideways on bad readings
+  stand_rounds: 4                # look-step-look rounds at most
+  stand_step_max_m: 0.10
+  stand_settle_s: 1.5
+  stand_side_tol_m: 0.04         # before a pick: the object more than this off-centre -> one side step
+  stand_x_m: [0.32, 0.37]        # ...and outside this distance ahead of the torso -> one forward/backward step to its middle
+  turn_deg_per_s: 14.9           # held box: timed 90 deg turned +94.8 at 15.7 (2026-11-04); section 3 style turn_left/right
+  turn_settle_s: 0.8
+  turn_rad_s: 0.4                # turning speed in AI mode (0.4 shook the robot, user 2026-11-03)
+  blind_keep_m: 0.35             # a distance the user gave: walk blind up to this far (m) from it, then look (the camera sees 50-60 cm)
+  blind_leg_m: 0.90              # blind legs of at most this length
+  search_turns: 3                # a target not in view: this many turns of search_turn_deg, toward the last turn (then the task stops)
+  search_turn_deg: 25
+  object_tolerance_m: 0.02       # an object to pick stands in a narrow band the planner solves (picks at 0.33 worked, 0.29 and 0.36+ had no IK)
+  object_front_min_m: 0.20       # approaching an object: its front face stays at least this far from the torso origin (a big case: the edge, not the centre)
   approach_max_leg_m: 1.5        # walk at most this far before looking again
   lateral_tolerance_m: 0.06
-  max_replans: 2
+  max_replans: 2                 # vision / cuRobo / Cosmos steps are retried; turning and walking never are (ai.py)
   plan_fix_tries: 2               # an invalid LLM plan goes back with the exact problem at most this often
   min_battery_pct: 20
 

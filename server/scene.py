@@ -468,6 +468,23 @@ class TaskScene:
         fill = 0.0
         if len(tp) >= 5:
             fill = float(cv2.contourArea(cv2.convexHull((tp * 1000).astype(np.float32)))) / max(1.0, a * b_)
+        if len(tp) >= self.S["min_points"]:
+            # the mask spilled onto what the box stands on (a black box on a carton: 49 x 21 x 23 cm "irregular", 2026-11-03):
+            # its top face alone is the footprint, and the support is the surface around that top face (mask points too)
+            cx2, cy2, dx2, dy2, yaw2, a2, b2 = self._footprint(tp[:, :2])
+            fill2 = float(cv2.contourArea(cv2.convexHull((tp * 1000).astype(np.float32)))) / max(1.0, a2 * b2)
+            log.info('fit check: top %.3f support %.3f body %.1fx%.1f top-face %.1fx%.1f fill2 %.2f (%d top pts, %d bg)', top, support, a/10, b_/10, a2/10, b2/10, fill2, len(tp), len(bg))
+            if fill2 > 0.88:
+                r2 = math.hypot(dx2, dy2) / 2
+                allp = np.vstack([bg, pts]) if len(bg) else pts
+                d2 = np.hypot(allp[:, 0] - cx2, allp[:, 1] - cy2)
+                ring = allp[(d2 > r2 + 0.01) & (d2 < r2 + self.S["support_ring_m"]) & (allp[:, 2] < top - 0.02) & (allp[:, 2] > top - 0.30)]   # not the floor 40 cm below
+                sup2 = Geometry.plane_height(ring[:, 2]) if len(ring) else None
+                log.info('fit check: ring %d pts, z p10/50/90 %s, support %s', len(ring), np.round(np.percentile(ring[:, 2], [10, 50, 90]), 3).tolist() if len(ring) else None, sup2)
+                if sup2 is not None and top - sup2 > 0.02 and (a2 * b2 < 0.7 * a * b_ or sup2 > support + 0.03):
+                    log.info("mask spilled onto the support: footprint from the top face (%.1f x %.1f cm, was %.1f x %.1f), support %.3f",
+                             a2 / 10, b2 / 10, a / 10, b_ / 10, sup2)
+                    cx, cy, dx, dy, yaw, a, b_, support, fill = cx2, cy2, dx2, dy2, yaw2, a2, b2, float(sup2), fill2
         shape = "box" if fill > 0.88 else ("round" if fill > 0.6 else "irregular")
         x0 = cx - (abs(math.cos(yaw)) * dx + abs(math.sin(yaw)) * dy) / 2
         sup = bg[(np.abs(bg[:, 2] - support) < 0.012) & (np.abs(bg[:, 1] - cy) < 0.2) & (bg[:, 0] < cx)] if len(bg) else bg

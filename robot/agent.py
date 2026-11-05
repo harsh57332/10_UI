@@ -72,10 +72,20 @@ def _walk(params, stop, vx=0.0, vy=0.0, wz=0.0, turn=False):
     v = _num(params, "velocity", 0.0, vmax, vdef)
     d = _num(params, "duration", 0.0, loc["duration_max_s"])
     _require_mode("walk_modes")
-    g1.velocity(vx * v, vy * v, wz * v, d)
-    stop.wait(d)
+    limit = loc.get("tilt_stop_deg")
+    rpy0 = g1.imu().get("pelvis_rpy") if limit else None
+    tilt = None
+    bias = _num(params, "vy_bias_mps", -0.2, 0.2, 0.0)      # a steady sideways push to cancel the gait's drift (+ = left)
+    g1.velocity(vx * v, vy * v + bias, wz * v, d)
+    t_end = time.monotonic() + d
+    while time.monotonic() < t_end and not stop.is_set():
+        stop.wait(0.05)
+        rpy = g1.imu().get("pelvis_rpy") if rpy0 else None
+        if rpy and max(abs(rpy[0] - rpy0[0]), abs(rpy[1] - rpy0[1])) > limit:    # tipping: stop walking, hold still
+            tilt = [round(rpy[0] - rpy0[0], 1), round(rpy[1] - rpy0[1], 1)]
+            break
     g1.stop_move()
-    return {"velocity": v, "duration": d, "interrupted": stop.is_set()}
+    return {"velocity": v, "duration": d, "interrupted": stop.is_set() or tilt is not None, "tilt_deg": tilt}
 
 
 def _turn_by(params, stop):
