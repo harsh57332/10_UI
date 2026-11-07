@@ -54,7 +54,7 @@ RULES = (
     "held object on something far away: turn if told to, approach it, then place on it. If the user states how far the target is (from the toe tip), pass that number as distance_cm to approach (the camera only sees 50-60 cm: that part is walked blind). Only one object can be held at a time. Do not add ready at the end: the arms "
     "go back to their normal position by themselves after the task."
 )
-AFTER = {"pre_grasp": "AT_OBJECT", "grasp": "GRIPPING", "lift": "HOLDING", "place": "EMPTY",
+AFTER = {"pre_grasp": "AT_OBJECT", "grasp": "GRIPPING", "lift": "HOLDING", "place": "EMPTY", "put_back": "EMPTY",
          "set_down": "GRIPPING", "retreat": "EMPTY"}       # hand state after each arm skill
 
 
@@ -111,6 +111,7 @@ def check_plan(ctx, plan):
     (simulated through the plan), and an object must be found before pre_grasp uses it."""
     hand = ctx.bb["hand"]
     known = set(ctx.bb["objects"])
+    lifted = False
     for k, n in enumerate(plan, 1):
         s = SKILLS[n["skill"]]
         missing = clean_params(n["skill"], n["params"])[1]
@@ -121,6 +122,13 @@ def check_plan(ctx, plan):
                     f"before it they are {hand}")
         if s["kind"] == "move":                     # walking/turning forgets positions; approach finds its target
             known = {n["params"].get("target")} if n["skill"] == "approach" else set()
+            if n["skill"] in ("walk", "turn"):
+                lifted = False
+        if n["skill"] == "lift":
+            lifted = True
+        if n["skill"] == "put_back" and not lifted:
+            return (f"step {k} (put_back) puts the object back where it was lifted from, which needs a lift in this plan "
+                    f"and no walk or turn after it: use place on a found surface instead")
         if n["skill"] == "find":
             known.add(n["params"].get("object"))
         if n["skill"] == "pre_grasp" and n["params"].get("object") not in known:
@@ -270,7 +278,7 @@ class MotionPlanning:
             if box.get("err"):
                 raise box["err"]
             nouns = sorted({parse(n["params"]["object"])[0] for n in self.llm_steps if n["skill"] == "find"
-                            and not any(w in n["params"]["object"].lower() for w in SURFACE_WORDS)})
+                            and not any(w in n["params"]["object"].lower() for w in TARGET_WORDS)})
             views = scene.scan(ctx, nouns)
             scene.note(llm_steps=[{k: n.get(k) for k in ("skill", "params", "why")} for n in self.llm_steps],
                        nouns=nouns, start_state=ctx.link.state())
@@ -608,7 +616,7 @@ class AIControl:
                 raise SkillError("aborted")
         scene = ctx.scene = TaskScene(ctx, self.task)
         nouns = sorted({parse(n["params"]["object"])[0] for n in steps if n["skill"] == "find"
-                        and not any(w in n["params"]["object"].lower() for w in SURFACE_WORDS)})
+                        and not any(w in n["params"]["object"].lower() for w in TARGET_WORDS)})
         scene.capture(ctx, 0.0)
         views = scene.scan(ctx, nouns)
         scene.note(llm_steps=[{k: n.get(k) for k in ("skill", "params", "why")} for n in steps], nouns=nouns,

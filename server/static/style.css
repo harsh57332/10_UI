@@ -93,3 +93,4 @@ label.inline input[type=radio] { width: auto; }
 .hands { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
 .hand { border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); border-radius: 8px; padding: 10px; }
 .hand h3 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+.legend { font-size: 12px; line-height: 1.45; margin: 4px 0 0; }

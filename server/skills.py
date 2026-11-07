@@ -21,6 +21,7 @@ from common.fk import mat_to_quat
 
 from . import heat
 from .motion import ArmPlan, SkillError, cuboid, pose
+from .robot_view import publish
 
 log = logging.getLogger("skills")
 SURFACE_WORDS = ("table", "desk", "shelf", "counter", "bench", "stand", "cabinet")
@@ -65,6 +66,7 @@ class Ctx:
         self.bb = {"objects": {}, "surfaces": {}, "holding": None,   # blackboard
                    "hand": "EMPTY", "grasp": None, "grip": None}
         self.scene = None       # the task scene (server/scene.py) while a section 6 task is planned or played
+        self.view = None        # the UI's robot's view panel (server/robot_view.py); None in scripts and replays
 
     def summary(self):
         """Short world state for LLM prompts."""
@@ -499,12 +501,15 @@ def _choose(cands, quals):
     return max(cands, key=lambda c: c[1])
 
 
-def _surface_ahead(ctx, label):
+def _surface_ahead(ctx, label, view=None):
     """No detection (the thing fills the view): the dominant horizontal surface straight ahead, from depth alone."""
     A = ctx.cfg["ai"]
     frame = ctx.camera.fine(A["surface_ahead_frames"])
     q = ctx.motion.q_now(commanded=False)
-    pts = ctx.geometry.points(frame, step=3, T=ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q)))
+    T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(q))
+    if view is not None:
+        view.update(frame=frame, T=T, how="no detection: the surface straight ahead, from depth alone")
+    pts = ctx.geometry.points(frame, step=3, T=T)
     low = ctx.cfg["perception"]["floor_below_m"] + A["surface_min_above_floor_m"]
     pts = pts[(pts[:, 2] > low) & (np.abs(pts[:, 1]) < A["walk_corridor_m"] / 2) & (pts[:, 0] < 1.0)]
     top = ctx.geometry.plane_height(pts[:, 2]) if len(pts) else None
@@ -517,6 +522,8 @@ def _surface_ahead(ctx, label):
     y0, y1 = np.percentile(s[:, 1], [2, 98])
     ctx.bb["surfaces"][label] = {"top_z": float(top), "front_x": float(x0), "back_x": float(x1),
                                  "y_range": [float(y0), float(y1)], "t": time.time()}
+    if view is not None:
+        view["surface"] = ctx.bb["surfaces"][label]
     log.info("find '%s': no detection, surface ahead from depth: top %.3f, front %.3f", label, top, x0)
     return {"surface": label, "front_edge_m": round(float(x0), 3), "height_m": round(float(top), 3), "from": "depth"}
 
@@ -548,9 +555,46 @@ def _surface_or_face(ctx, frame, rect, T):
 def find(ctx, object, precision="fine"):
     if ctx.scene is not None and precision != "coarse":    # a task scene was scanned at Generate: look it up there
         base = _parse(object)[0]
-        if any(w in base for w in SURFACE_WORDS):
-            return ctx.scene.surface(ctx, object)
+        if any(w in base for w in TARGET_WORDS):     # a big thing to place on (table, case, ...): its top plane, as the
+            return ctx.scene.surface(ctx, object)   # live find does (2026-11-07: SAM 3 gave 'black case' to the white box on it)
         return ctx.scene.find(ctx, object)
+    view = {}                                   # what this look saw and made of it, for the UI's robot's view panel
+    try:
+        return _find_live(ctx, object, precision, view)
+    except SkillError as e:
+        view["note"] = str(e)
+        raise
+    finally:
+        _show_find(ctx, f"find '{object}' ({precision})", object, view)
+
+
+def _show_find(ctx, title, label, view):
+    """The robot's view panel (UI server only): the frame this find used, the detector's boxes, every candidate fit
+    (the chosen one with its points) or the surface, and the result or the reason it failed."""
+    if getattr(ctx, "view", None) is None:
+        return
+    try:
+        frame, T = view.get("frame"), view.get("T")
+        if frame is None:                        # it failed before a frame was kept: show what the camera sees now
+            frame = ctx.camera.latest()
+            T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(ctx.motion.q_now(commanded=False)))
+    except Exception:
+        log.exception("robot view: no frame")
+        return
+    publish(ctx, "look", frame, T, title)
+    if view.get("dets"):
+        publish(ctx, "dets", view["dets"], view.get("chosen"), _parse(label)[0])
+    for b, chosen in view.get("boxes", []):
+        publish(ctx, "box", b, label if chosen else "", chosen)
+    if view.get("surface"):
+        publish(ctx, "surface", view["surface"], label)
+    for line in (view.get("how"), view.get("note")):
+        if line:
+            publish(ctx, "note", line)
+
+
+def _find_live(ctx, object, precision, view):
+    """find without a task scene: one look now (the live camera)."""
     check_waist_lock(ctx)                       # the side look turns the waist
     base, quals = _parse(object)
     P = ctx.cfg["perception"]
@@ -567,14 +611,16 @@ def find(ctx, object, precision="fine"):
         frame, dets, T = _look(ctx, base, "coarse" if precision == "coarse" else "fine", quals)
     except SkillError as e:
         if "not visible" in str(e) and any(w in base for w in TARGET_WORDS) and ctx.bb["hand"] != "HOLDING":
-            return _surface_ahead(ctx, object)         # it fills the view (close to a case): the detector sees no 'object'
+            return _surface_ahead(ctx, object, view)   # it fills the view (close to a case): the detector sees no 'object'
         raise
+    view.update(frame=frame, T=T, dets=dets)
     if any(w in base for w in TARGET_WORDS):
-        fits = [(_surface_or_face(ctx, frame, r, T), sc) for r, sc in dets]
-        fits = [(f, sc) for f, sc in fits if f is not None]
+        fits = [(_surface_or_face(ctx, frame, r, T), sc, r) for r, sc in dets]
+        fits = [(f, sc, r) for f, sc, r in fits if f is not None]
         if not fits:
             raise SkillError(f"saw '{object}' but could not measure its top surface")
-        s, _ = max(fits, key=lambda c: c[1])
+        s, _, rect = max(fits, key=lambda c: c[1])
+        view.update(chosen=rect, surface=s)
         ctx.bb["surfaces"][object] = {**s, "t": time.time()}
         return {"surface": object, "front_edge_m": round(s["front_x"], 3), "height_m": round(s["top_z"], 3)}
     M = ctx.cfg["manipulation"]
@@ -596,13 +642,17 @@ def find(ctx, object, precision="fine"):
     wide = lambda b, o: b["dims"][1] > 1.4 * max(o["dims"][1], 0.05)
     small = ctx.cfg["manipulation"]["min_box_width_m"]          # narrower than any graspable object: a stray or a
     cands = [(b, sc) for b, sc in cands if min(b["dims"][0], b["dims"][1]) >= small] or cands   # sliver of an edge
+    # only a detection about as confident as the one around it is a second object: a weak one inside is a part of it
+    # (2026-11-07: a 0.17 'white box' patch inside the 0.67 box made the box a 'group'; the patch was picked)
+    weak = ctx.cfg["perception"]["group_min_score_ratio"]
     single = [(b, sc) for b, sc in cands
-              if not any(o is not b and _contains(b["rect"], o["rect"]) and wide(b, o) for o, _ in cands)]
+              if not any(o is not b and so >= weak * sc and _contains(b["rect"], o["rect"]) and wide(b, o) for o, so in cands)]
     for b, sc in cands:
         log.info("find '%s': candidate at %s, %s cm, score %.2f%s", object, [round(v, 3) for v in b["center"]],
                  [round(100 * v, 1) for v in b["dims"]], sc, "" if any(b is c for c, _ in single) else " (a group: dropped)")
     cands = single or cands
     b, score = _choose(cands, quals)
+    view.update(chosen=b["rect"], boxes=[(c, c is b) for c, _ in cands])
     for k, v in ctx.bb["objects"].items():      # 'left box' and 'right box' must not be the same box
         if k != object and math.hypot(v["center"][0] - b["center"][0], v["center"][1] - b["center"][1]) < 0.05:
             raise SkillError(f"'{object}' is the same object as '{k}' (only one of them is in view): "
@@ -689,6 +739,7 @@ def _walk_raw(ctx, direction, distance_m):
             raise SkillError(f"not walking {float(distance_m):.2f} m: the nearest thing ahead is {c:.2f} m from the pelvis "
                              f"and {ahead_need:.2f} m must stay free")
     params = {"velocity": v, "duration": round(t, 2)}
+    ctx.bb["moves"] = ctx.bb.get("moves", 0) + 1       # the place knows whether the robot stood still since the pick
     bias = _walk_bias(ctx, direction, v)                # forward (both speeds) and fast backward slide to the right
     if bias:
         params["vy_bias_mps"] = bias
@@ -743,6 +794,7 @@ def turn(ctx, direction, angle_deg):
     A = ctx.cfg["ai"]
     yaw = lambda: ctx.link.state()["imu"]["pelvis_rpy"][2]
     yaw0, total = yaw(), 0.0
+    ctx.bb["moves"] = ctx.bb.get("moves", 0) + 1
     for k in range(1 + A["turn_corrections"]):         # the same timed command as section 3 (turn_left / turn_right), then one IMU check
         rest = signed - total
         if k and abs(rest) <= A["turn_tolerance_deg"]:
@@ -761,13 +813,17 @@ def turn(ctx, direction, angle_deg):
     return r
 
 
-@skill("approach", {"target": "a found object or surface", "standoff_m": "optional: final distance (m)",
+@skill("approach", {"target": "a found object or surface",
                     "distance_cm": "optional: distance from the toe tip to the target when the user gave it (cm); walked blind"},
-       "Walk straight to a target at 0.4 m/s until it is within arm reach (tables: front edge at "
-       "standoff; objects: centre at reach distance), side-stepping to centre objects. Finds it again "
-       "between legs. Turns toward the target first if it is off to one side. Hands empty or holding.", "move",
+       "Walk straight to a target at 0.4 m/s until it is within arm reach (tables: front edge at the "
+       "working distance; objects: centre at reach distance), side-stepping to centre objects. Finds it again "
+       "between legs. Turns toward the target first if it is off to one side. Does nothing if the target is "
+       "already within reach. Hands empty or holding.", "move",
        hands=("EMPTY", "HOLDING"))
-def approach(ctx, target, standoff_m=None, distance_cm=None):
+def approach(ctx, target, distance_cm=None):
+    # no stand-off from the LLM (2026-11-07): it invented 0.5 m for a box already in reach and the robot walked away
+    # from it; the distance is always the one the arms need (table_standoff_m / box_reach_x_m)
+    standoff_m = None
     a = ctx.cfg["ai"]
     if distance_cm is not None:       # a distance the user gave: walk it blind (less the margin), then look once
         blind = float(distance_cm) / 100.0 - a["blind_keep_m"]
@@ -797,9 +853,36 @@ def approach(ctx, target, standoff_m=None, distance_cm=None):
         if surface:
             dist, lateral = ctx.bb["surfaces"][target]["front_x"] - ref, 0.0
         else:
+            # an object: the waist turns to face it (STANDARDS M3.3), so its reach is the distance from the waist axis,
+            # and the legs move only for what the waist cannot do (user 2026-11-07: waist before legs)
             o = ctx.bb["objects"][target]
             c = o["center"]
-            dist, lateral = min(c[0] - ref, o.get("front_x", c[0]) - a["object_front_min_m"]), c[1]
+            radial, facing = math.hypot(c[0], c[1]), math.degrees(math.atan2(c[1], c[0]))
+            lo, hi = a["stand_x_m"]
+            waist_ok = abs(facing) <= a["approach_waist_ok_deg"]
+            if lo <= radial <= hi and waist_ok:
+                # already where a pick starts: no step (steps of a few cm are not repeatable; 8 cm asked moved 10-14)
+                log.info("approach: '%s' is already within reach (%.3f m away, %+.0f deg: the waist turns to it): no walking",
+                         target, radial, facing)
+                find(ctx, target, precision="fine")
+                return {"target": target, "walked_m": round(walked, 2), "remaining_m": round(radial - ref, 3), "in_reach": True}
+            # forward/backward distance that brings it to the reach distance with the waist turned (lateral handled by the waist)
+            along = math.sqrt(max(ref * ref - c[1] * c[1], 0.0)) if waist_ok else ref
+            dist, lateral = min(c[0] - along, o.get("front_x", c[0]) - a["object_front_min_m"]), (0.0 if waist_ok else c[1])
+            if waist_ok and dist > 0:
+                room = _room_ahead(ctx)
+                if room is not None and room < dist:
+                    # the guard keeps 22 cm free ahead (the table): walk only what it allows, then let the pick try from there
+                    if room < a["approach_min_step_m"]:
+                        log.info("approach: '%s' is %.2f m away (reach %.2f-%.2f); the table allows no closer step: "
+                                 "the pick tries from here", target, radial, lo, hi)
+                        find(ctx, target, precision="fine")
+                        return {"target": target, "walked_m": round(walked, 2), "remaining_m": round(radial - ref, 3),
+                                "in_reach": False, "blocked_ahead_m": round(room, 3)}
+                    log.info("approach: the guard allows %.2f of the %.2f m toward '%s'", room, dist, target)
+                    walk(ctx, "forward", room)
+                    walked += room
+                    continue
         bearing = math.degrees(math.atan2(lateral, max(dist + ref, 0.05)))
         if abs(bearing) > a["face_turn_deg"]:
             turn(ctx, "left" if bearing > 0 else "right", abs(bearing))
@@ -827,6 +910,15 @@ def approach(ctx, target, standoff_m=None, distance_cm=None):
                 raise
         walked += leg
     raise SkillError(f"could not get within {a['approach_tolerance_m']} m of '{target}'")
+
+
+def _room_ahead(ctx):
+    """How far the robot may still walk forward before the walk guard refuses (m; None: nothing in view ahead)."""
+    A = ctx.cfg["ai"]
+    c = clearance_ahead(ctx)
+    if c is None:
+        return None
+    return max(0.0, c - A["walk_stop_clear_m"] - (A["walk_held_front_m"] if ctx.bb["holding"] else 0.0) - 0.005)
 
 
 def stand_for_pick(ctx, target):
@@ -1182,6 +1274,13 @@ def _grasp_geometry(ctx, object, toward=0.0):
         t = config.load()["planner_model"]["tcp"]["left_tcp"]     # palm along the side (the user, 2026-10-30)
         along = float(np.dot(t["xyz"], t["axis"]) / np.linalg.norm(t["axis"]))   # contact frame from the hand base
         shift = along - dx / 2 - M["grip_base_behind_m"] - toward
+    if M.get("wrist_past_face_m") is not None:   # the wrist curve touches the side, not the link behind it (user photo
+        near = b.get("front_x", cx - dx / 2) - cx    # 2026-11-07: a 27 cm deep box put the wrist 2.3 cm past the near face
+        cap = near + M["wrist_past_face_m"] + M["wrist_curve_to_tcp_m"]   # and the wrist pitch link pressed the corner)
+        if shift > cap:
+            log.info("grip on '%s': %.1f cm toward the robot so the wrist curve is %.1f cm past the near face", object,
+                     100 * (shift - cap), 100 * M["wrist_past_face_m"])
+            shift = cap
     gx, gy = cx + shift * math.cos(byaw), cy + shift * math.sin(byaw)
     return {"object": object, "cx": gx, "cy": gy, "cz": cz, "zg": zg, "half": dy / 2, "width": dy, "grip_shift": -shift,
             "center": list(b["center"]),
@@ -1189,6 +1288,7 @@ def _grasp_geometry(ctx, object, toward=0.0):
             "mid_l": off["left_mid"], "mid_r": off["right_mid"], "z_above": max(z_above, zg), "clear": M["release_open_m"][-1],
             "note": note,
             "dims": list(b["dims"]), "byaw": byaw, "support_z": b["support_z"], "top_z": b["top_z"],
+            "support_front_x": b.get("support_front_x", b["front_x"] - 0.10),
             "box": _slot_margin(ctx, cuboid(object, b["center"], b["dims"], byaw), bool(slot)), "others": others,
             "slot": sorted(slot), "toward": toward, "cut": _support_cut(ctx, b),
             "table": _table(ctx, b["support_z"], b.get("support_front_x", b["front_x"] - 0.10), cy),
@@ -1224,6 +1324,7 @@ def _check_lines(plan, moves):
 def pre_grasp(ctx, plan, object):
     M = ctx.cfg["manipulation"]
     g = _grasp_geometry(ctx, object)
+    publish(ctx, "grasp", g)                    # the robot's view panel: grip centre and the two palm contacts
     last = None
     # the grip nearest the object's centre that plans (a narrow slot: toward the robot, the wrist in front of it); the
     # grip the user set comes first, then forward fallbacks (2026-10-30: base 4 cm behind the near face has no pose
@@ -1385,7 +1486,9 @@ def lift(ctx, plan):
             minimum_lift()
     held = {"object": g["object"], "width": g["width"], "dims": g["dims"], "grasp_above_bottom": zg - g["support_z"],
             "support_z": g["support_z"], "gap_of": lambda: grip["gap"], "pitch": pitch, "clear": g["clear"], "yaw": yaw,
-            "shift": g["grip_shift"], "grip": the_grip}           # the object's centre is this far ahead of the palms (along them)
+            "shift": g["grip_shift"], "grip": the_grip,           # the object's centre is this far ahead of the palms (along them)
+            "from_xy": (g["center"][0], g["center"][1]), "moves": ctx.bb.get("moves", 0),   # where it stood (a place back there)
+            "support_front_x": g["support_front_x"], "others": g["others"]}   # what stood around it (pick frame)
     _to_state(ctx, plan, "HOLDING", holding=held)
     plan.attach(cuboid("held", (g["center"][0], g["center"][1], cz + g["lift"] + extra_up + M["lift_sag_comp_m"]), g["dims"], g["byaw"]))
     # draw the object toward the chest along the torso's forward axis: shorter lever, less load (carry pose)
@@ -1680,9 +1783,10 @@ def _close_wrists(ctx, yaw=None):
         # the whole palm presses (run 10-30 11:59: the right hand stood 6 deg open toward the front, only the back
         # corners were pressed and the front of the box swung down - the user)
         axis = np.array([-math.sin(yaw), math.cos(yaw)])
-        line = M["palm_line"]
+        line = M["palm_line"]                   # one line for both hands, or one per hand ("left"/"right")
+        lines = {n: line.get(n[:-4], line) for n in ("left_tcp", "right_tcp")}
         pts = ctx.motion.hand_points(ctx.motion.q_now(commanded=False),
-                                     {"left_tcp": [line["heel"], line["tip"]], "right_tcp": [line["heel"], line["tip"]]})
+                                     {n: [ln["heel"], ln["tip"]] for n, ln in lines.items()})
         turn = {}
         for name, joint, sign, out in (("left_tcp", "21", -1.0, 1.0), ("right_tcp", "28", 1.0, -1.0)):
             heel, tip = pts[name]
@@ -2238,6 +2342,7 @@ def place(ctx, plan, on):
         t = ctx.bb["objects"][on]
         x, y, z_s = t["center"][0], t["center"][1], t["top_z"]
         x, y = _calibrated(ctx, plan, x, y)
+        back_first = False
         ox = oy = 0.0
         if t["dims"][0] > h["dims"][0] + M["place_big_target_m"]:   # a target much bigger than the box (a case, a bin): the
             nx = min(max(float(left[0] + right[0]) / 2, t["front_x"] + h["dims"][0] / 2 + 0.03), x)   # box goes near its
@@ -2258,8 +2363,21 @@ def place(ctx, plan, on):
         if sf.get("partial"):
             raise SkillError(f"only the front of '{on}' is seen (its top is out of the camera's view): get closer first")
         z_s, y = sf["top_z"], float(left[1] + right[1]) / 2
-        x = max(float(left[0] + right[0]) / 2, sf["front_x"] + h["dims"][0] / 2 + 0.03)
+        back_first = False
+        now_x = float(left[0] + right[0]) / 2 + h.get("shift", 0.0) * math.cos(h["yaw"])   # the object's centre now
+        # the spots tried, first that plans: its front face place_edge_margins_m inside the front edge (the arms reach less
+        # far the further in: 2026-11-07 a box lifted flush with the case edge could not be put 3 cm in)
+        spots = [(max(now_x, sf["front_x"] + h["dims"][0] / 2 + m), y, z_s) for m in M["place_edge_margins_m"]]
+        if h.get("from_xy") and h.get("moves") == ctx.bb.get("moves", 0) and abs(z_s - h["support_z"]) < M["place_back_dz_m"]:
+            # the robot has not walked or turned since the pick and this is the surface it came from: back on the very
+            # spot it was lifted from first (the lift reversed; it stood there before)
+            spots.insert(0, (h["from_xy"][0], h["from_xy"][1], h["support_z"]))
+            back_first = True
+        spots = list(dict.fromkeys((round(a, 4), round(b, 4), c) for a, b, c in spots))
+        x, y, z_s = spots[0]
         world = [_table(ctx, z_s, sf["front_x"], y)]
+    if on in ctx.bb["objects"]:
+        spots = [(x, y, z_s)]
     z = z_s + h["grasp_above_bottom"] + M["place_clear_m"]
     above = max(z + M["place_above_m"], float(left[2] + right[2]) / 2)  # never below the carry height before arriving
     sh = h.get("shift", 0.0)                    # the object's centre is this far ahead of the palms' midpoint
@@ -2267,9 +2385,10 @@ def place(ctx, plan, on):
     def palms_at(px, py, th):                   # the palms' midpoint that puts the object's centre at (px, py)
         return px - sh * math.cos(th), py - sh * math.sin(th)
     mid = (left + right) / 2                    # the held box (between the palms) is cut out of the obstacle map
-    _map_scene(ctx, [cuboid(h["object"], (mid[0] + sh * math.cos(h["yaw"]), mid[1] + sh * math.sin(h["yaw"]),
-                                          mid[2] - h["grasp_above_bottom"] + h["dims"][2] / 2), h["dims"], h["yaw"])]
-               + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()])
+    map_now = lambda: _map_scene(ctx, [cuboid(h["object"], (mid[0] + sh * math.cos(h["yaw"]), mid[1] + sh * math.sin(h["yaw"]),
+                                       mid[2] - h["grasp_above_bottom"] + h["dims"][2] / 2), h["dims"], h["yaw"])]
+                                 + [cuboid(k, v["center"], v["dims"], v.get("yaw", 0.0)) for k, v in ctx.bb["objects"].items()])
+    mapped = False
     last, base = None, plan.mark()
     leans = [math.radians(d) for d in M["place_lean_deg"]] if 14 not in ctx.cfg["arms"]["waist_hold_joints"] else [0.0]
     fracs = _face_fractions(ctx)
@@ -2306,16 +2425,36 @@ def place(ctx, plan, on):
     # the waist turns the object and the stack toward each other: it takes the bulk of a sideways move so the arms move
     # little. Of the turns that plan (largest first) the one with the least arm joint travel is used (a few are tried)
     scored = []
-    for (frac, extra), lean in [(f, ln) for f in faces for ln in leans]:
-        try:
-            attempt(frac, extra, lean)
-        except SkillError as e:
-            last = e
-            log.debug("place candidate frac %.2f extra %.0f lean %.0f failed: %s", frac, math.degrees(extra), math.degrees(lean), e)
-            continue
-        scored.append((_arm_travel_deg(plan.steps[base[0]:]) + M.get("place_waist_cost", 0.1) * abs(math.degrees(plan.waist[0])),
-                       frac, extra, lean))
-        if len(scored) >= M.get("place_candidates", 1):
+    for k, (x, y, z_s) in enumerate(spots):
+        z = z_s + h["grasp_above_bottom"] + M["place_clear_m"]
+        above = max(z + M["place_above_m"], float(left[2] + right[2]) / 2)
+        back = k == 0 and on not in ctx.bb["objects"] and back_first
+        if on not in ctx.bb["objects"]:
+            world = [_table(ctx, z_s, ctx.bb["surfaces"][on]["front_x"], y)] + (list(h.get("others") or []) if back else [])
+        # back on the spot it was lifted from: the gloves go down the way they came up (planned with the pick's map), so
+        # the measured slab and the objects known at the pick suffice. A fresh map lacks the support cut beside the
+        # object (the objects were forgotten after the pick): 2026-11-07 that spot did not plan and the box went 3 cm in
+        plan.use_map = not back
+        if not back and not mapped:
+            map_now()
+            mapped = True
+        for (frac, extra), lean in [(f, ln) for f in faces for ln in leans]:
+            try:
+                attempt(frac, extra, lean)
+            except SkillError as e:
+                last = e
+                log.debug("place candidate frac %.2f extra %.0f lean %.0f failed: %s", frac, math.degrees(extra), math.degrees(lean), e)
+                continue
+            scored.append((_arm_travel_deg(plan.steps[base[0]:]) + M.get("place_waist_cost", 0.1) * abs(math.degrees(plan.waist[0])),
+                           frac, extra, lean))
+            if len(scored) >= M.get("place_candidates", 1):
+                break
+        if not scored and k + 1 < len(spots):
+            log.info("place on '%s': spot %d (%.3f, %.3f) does not plan: %s", on, k + 1, x, y, last)
+        if scored:
+            if len(spots) > 1:
+                log.info("place on '%s': object centre to (%.3f, %.3f) (spot %d of %d%s)", on, x, y, k + 1, len(spots),
+                         ": where it was lifted from" if back else "")
             break
     if not scored:
         plan.restore(base)
@@ -2351,6 +2490,12 @@ def place(ctx, plan, on):
     plan.call("line up over the target", line_up)
     z_touch = z_s + h["grasp_above_bottom"]     # hands' height once the object sits on the target
     below = [w for w in world if w["name"] != on]   # the object comes down onto the target
+    # ...and onto the surface slab: the touch-checked lowering may go land_overrun_m below its measured top (it stops on
+    # the touch). With the slab at its measured top a box not yet touching at the planned end could not be lowered
+    # further (2026-11-07: 'blocked at 44% of the line', the recovery set it down)
+    drop = M["land_overrun_m"] + 0.005
+    below = [{**w, "pose": [w["pose"][0], w["pose"][1], w["pose"][2] - drop, *w["pose"][3:]]} if w["name"] == "table" else w
+             for w in below]
     plan.call("lower until it sits on the target", lambda: _lower_until_contact(
         ctx, lambda: corr["cmd_xy"] if "cmd_xy" in corr else np.array(live_xy()) + corr["xy"],
         z_touch - M["land_overrun_m"], _held(ctx.motion, h, yaw),
@@ -2399,7 +2544,28 @@ def place(ctx, plan, on):
     _back_to_ready(ctx, plan, back_world, hx, hy, z, h["width"] / 2 + opened, yaw, h.get("pitch", 0), keep, clear=away,
                    before_waist=("check the object is on the target",
                                  lambda: _verify_placed(ctx, x, y, z_s + h["dims"][2], h["dims"], on)))
+    plan.use_map = True
     return {"placed": h["object"], "on": on, "height_m": round(z_s, 3)}
+
+
+BACK = "where it was lifted from"
+
+
+@skill("put_back", {}, "Put the held object back down on the very spot it was lifted from ('put it back', 'same place'), "
+       "open the hands and bring the arms back to the ready pose. Needs no find; only while the robot has not walked or "
+       "turned since the pick.", "arm", hands=("HOLDING",))
+def put_back(ctx, plan):
+    h = plan.state.get("holding")
+    if not h or not h.get("from_xy"):
+        raise SkillError("not holding anything lifted in this task")
+    if h.get("moves") != ctx.bb.get("moves", 0):
+        raise SkillError("the robot walked or turned since the pick: the spot it came from is behind it now; place it on a "
+                         "found surface instead")
+    ctx.bb["surfaces"][BACK] = {"top_z": h["support_z"], "front_x": h["support_front_x"], "t": time.time()}
+    try:
+        return place(ctx, plan, BACK)          # the spot it came from is tried first (robot not moved, same surface)
+    finally:
+        ctx.bb["surfaces"].pop(BACK, None)
 
 
 @skill("ready", {}, "Move both arms to the ready pose (hands at chest height, out of the camera view). Hands "

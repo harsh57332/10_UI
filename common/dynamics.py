@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from . import joints
+from . import config, joints
 from .fk import FK, _axis_angle
 
 
@@ -35,6 +35,8 @@ class Gravity:
         self.link_of = {i: by_name[joints.NAMES[i] + "_joint"] for i in joints.ARMS}   # motor -> its child link
         self.hands = [t["parent"] for t in tcp.values()]
         self.palms = [(t["parent"], np.array(t["xyz"], float)) for t in tcp.values()]   # glove contact points
+        at = config.load()["manipulation"].get("squeeze_at")   # where the squeeze acts (hand frame), else the palm points
+        self.press = [(link, np.array(at, float)) for link, _ in self.palms] if at is not None else self.palms
         self.arm_of = [joints.GROUPS["left_arm" if "left" in link else "right_arm"] for link, _ in self.palms]
         self.glove_kg = cfg["glove_kg"]
         self.payload_kg = 0.0
@@ -98,10 +100,11 @@ class Gravity:
             o, z = T[link][:3, 3], T[link][:3, :3] @ np.asarray(self.fk.joints[link]["axis"], float)
             axis[i] = (o, z)
             tau[i] = -float(z @ np.cross(s[link] - m[link] * o, g))   # the motor holds against gravity's torque
-        if self.squeeze_n:
-            d = P[1] - P[0]
+        if self.squeeze_n:                              # each hand pushes toward the other at its squeeze point (the wrist
+            Q = [T[link][:3, :3] @ p + T[link][:3, 3] for link, p in self.press]   # curve: only the shoulders squeeze)
+            d = Q[1] - Q[0]
             d = d / max(float(np.linalg.norm(d)), 1e-6)
-            for p, f, arm in zip(P, (d, -d), self.arm_of):          # each palm pushes toward the other
+            for p, f, arm in zip(Q, (d, -d), self.arm_of):
                 for i in arm:
                     o, z = axis[i]
                     tau[i] += float(z @ np.cross(p - o, self.squeeze_n * f))

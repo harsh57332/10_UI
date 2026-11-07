@@ -26,6 +26,7 @@ import numpy as np
 from common import config
 
 from .motion import SkillError, cuboid
+from .robot_view import publish
 
 log = logging.getLogger("scene")
 QUALS = {"left", "right", "nearest", "closest", "farthest", "middle", "center", "centre"}
@@ -540,6 +541,15 @@ class TaskScene:
     # ---------------------------------------------------------------- what the words refer to
     def find(self, ctx, label):
         """The entity `label` names (stored like the old find's result, for the arm skills)."""
+        try:
+            r = self._find(ctx, label)
+        except SkillError as e:
+            self._show(ctx, f"task scene: find '{label}'", note=str(e))
+            raise
+        self._show(ctx, f"task scene: find '{label}'", label=label)
+        return r
+
+    def _find(self, ctx, label):
         from .skills import _pelvis_yaw
         noun, quals = parse(label)
         for k in range(len(self.views)):
@@ -553,6 +563,16 @@ class TaskScene:
                      sorted(set(k for o in e["objs"] for k in o["views"])))
         if not cands:
             raise SkillError(f"no '{noun}' seen on the table (views at waist {[round(v.yaw_deg) for v in self.views]} deg)")
+        # a match another match stands on is its support, not a second one (2026-11-07: 'black box' also named the black
+        # case the box stood on)
+        under = [e for e in cands if any(o is not e and o.get("support_z") is not None and abs(e["top_z"] - o["support_z"]) < 0.03
+                                         and abs(o["center"][0] - e["center"][0]) < e["dims"][0] / 2
+                                         and abs(o["center"][1] - e["center"][1]) < e["dims"][1] / 2 for o in cands)]
+        if under and len(under) < len(cands):
+            for e in under:
+                log.info("find '%s': the match at (%.3f, %.3f) is what another one stands on: not a candidate", label,
+                         e["center"][0], e["center"][1])
+            cands = [e for e in cands if not any(e is u for u in under)]
         pick = None
         if "left" in quals:
             pick = max(cands, key=lambda e: e["center"][1])
@@ -615,6 +635,7 @@ class TaskScene:
         y0, y1 = np.percentile(s[:, 1], [2, 98])
         ctx.bb["surfaces"][label] = {"top_z": top, "front_x": float(x0), "back_x": float(x1),
                                      "y_range": [float(y0), float(y1)], "t": time.time()}
+        self._show(ctx, f"task scene: find '{label}'", surface=(label, ctx.bb["surfaces"][label]))
         return {"surface": label, "front_edge_m": round(float(x0), 3), "height_m": round(top, 3)}
 
     # ---------------------------------------------------------------- the map of this task
@@ -716,6 +737,22 @@ class TaskScene:
             return
         with open(os.path.join(self.run_dir, "scene.json"), "w") as fh:
             json.dump(self.record, fh, indent=1, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
+
+    def _show(self, ctx, title, label=None, surface=None, note=None):
+        """The robot's view panel (UI server only): the straight view with every SAM 3 mask of it (grey with the reason
+        when unusable), every found object's fitted box (the one just found with its points) and the result."""
+        if getattr(ctx, "view", None) is None or not self.views:
+            return
+        v = self.views[0]
+        publish(ctx, "look", v, v.T, title + f"  (view at waist {v.yaw_deg:+.0f} deg, {len(self.views)} view(s))")
+        publish(ctx, "masks", [i for (n, k), lst in self.inst.items() if k == 0 for i in lst])
+        for name, b in self.used.items():
+            if b.get("support_z") is not None:
+                publish(ctx, "box", b, name, name == label)
+        if surface:
+            publish(ctx, "surface", surface[1], surface[0])
+        if note:
+            publish(ctx, "note", note)
 
     def _annotate(self):
         """The straight view with every found entity named (shown in the UI next to the plan)."""

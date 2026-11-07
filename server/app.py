@@ -23,6 +23,7 @@ from .image_client import ImageClient
 from .llm import LLM
 from .motion import ArmMotion, SkillError
 from .robot_link import AgentLink
+from .robot_view import RobotView
 from .services import Service, ServiceError
 from .skills import Ctx
 from .tracking import Tracking
@@ -51,6 +52,7 @@ tracking = Tracking(camera, link, vision)
 llm = LLM()
 motion = ArmMotion(link, Service("planner"), tracking.processing)
 ctx = Ctx(link, camera, vision, Geometry(), motion, tracking.processing)
+ctx.view = RobotView(ctx.geometry)      # camera panel 3: what the robot looked at last and made of it
 plan6 = MotionPlanning(ctx, llm)
 ai = AIControl(ctx, llm)
 
@@ -134,9 +136,10 @@ def status():
 # ---------------------------------------------------------------- camera
 @app.get("/video/{kind}.mjpg")
 def video(kind: str):
-    if kind not in ("rgb", "depth"):
+    if kind not in ("rgb", "depth", "view"):
         raise HTTPException(404)
-    return StreamingResponse(camera.mjpeg(kind), media_type="multipart/x-mixed-replace; boundary=frame")
+    stream = ctx.view.mjpeg() if kind == "view" else camera.mjpeg(kind)    # view: the robot's view (server/robot_view.py)
+    return StreamingResponse(stream, media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.post("/api/detect")

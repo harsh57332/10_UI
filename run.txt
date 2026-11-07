@@ -16,6 +16,7 @@ http://192.168.0.149:8000
 scripts/robot.sh deploy && scripts/robot.sh restart agent
 
 # To Shut down
+scripts/svc.sh stop all
 
 # Trash
 Walking at 0.4 m/s for 2 seconds

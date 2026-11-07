@@ -172,6 +172,12 @@
       <img id="cam-rgb" class="cam" alt="RGB">
       <label>Live depth frame</label>
       <img id="cam-depth" class="cam" alt="Depth">
+      <label>Robot's view <span class="muted">(the last frame the robot looked at, and what it made of it)</span></label>
+      <img id="cam-view" class="cam" alt="Robot's view">
+      <p class="muted legend">Boxes: detector, with its score (white = used). Coloured areas: SAM 3 masks (grey = not used, with the reason).
+        Points: <b style="color:#3cc83c">green</b> top face, <b style="color:#ffd700">yellow</b> sides,
+        <b style="color:#288cff">blue</b> the surface it stands on. <b style="color:#00e5e5">Cyan</b>: the fitted 3D box, red dot its centre.
+        <b style="color:#ff8c00">Orange</b>: a table's front edge. <b style="color:#ff00ff">Magenta</b>: palm contacts, red cross the grip centre.</p>
     </div>
   </section>
   <section>

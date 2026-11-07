@@ -152,7 +152,7 @@ function setCamera(open) {
   $("cam-off").hidden = open;
   $("btn-camera").textContent = open ? "Close camera live feed" : "Open camera live feed";
   const t = Date.now();  // fresh URL so the browser reconnects the stream
-  for (const kind of ["rgb", "depth"]) {
+  for (const kind of ["rgb", "depth", "view"]) {
     if (open) $(`cam-${kind}`).src = `/video/${kind}.mjpg?${t}`;
     else $(`cam-${kind}`).removeAttribute("src");
   }
