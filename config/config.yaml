@@ -179,6 +179,9 @@ hands:
       wrist_past_face_m: 0.005   # the wrist curve (wrist yaw axis) at most this far past the object's near face (user photo 2026-11-07: the
                                  # centred grip put it 2.3 cm past the near face of a 27 cm deep box and the wrist pitch link pressed the corner;
                                  # the wrist curve must touch the side). Shallow boxes keep the centred grip (it is nearer the robot already)
+      wrist_curve_to_fingertip_end_m: 0.19   # wrist yaw axis to the end of the gloved fingers (hand mount 4.15 + rubber fingertip 13 + glove ~2 cm)
+      fingertip_inside_m: 0.01   # ...which end at least this far inside the object's far face, so the fingertips press its side (user 2026-11-17:
+                                 # 'hold it slightly behind': on an 18.7 cm box they reached past the far end, no fingertip force, the box swung)
       wrist_curve_to_tcp_m: 0.1165   # wrist yaw axis to the palm frame along the fingers (hand mount 4.15 cm + palm frame 7.5 cm)
       palm_toe_in_deg: 4.0       # fingertips by the wrist motors (user photo 2026-11-07: wrist curves pressed, fingertips 2-3 cm off the box):
                                  # after the squeeze each wrist yaw turns its hand until the wrist-curve-to-fingertip line lies on the box side
@@ -288,6 +291,8 @@ services:
     max_cuboids: 12
     interpolation_dt: 0.02                       # s between trajectory points sent to the robot
     ik_solutions: 32                             # IK solutions per pose goal; the nearest to the start is used
+    ik_batch: 64                                 # goal sets per batched IK solve (ik_batch: the grasp candidate search)
+    ik_batch_tolerance_x: 2.0                    # ...a lenient pre-filter: 2x the position/orientation tolerance of the exact IK
     ik_tries: 3                                  # ...or the next nearest if no path to it is found
     rng_seed: 0                                  # random numbers re-seeded per request: same scene, same plan
     natural:                                     # deterministic, natural-looking arms: IK seeds and the ranking of solutions
@@ -400,6 +405,12 @@ scene_map:
 # the hands are down. SAM 3 masks -> 3D points -> whole objects -> stacks -> the entity a word names.
 scene:
   scan_side_deg: 25              # a side view (waist yaw only) where an object of the task is cut off at that side
+  prescan_max_words: 3           # section 6: object words guessed from the instruction for the side views taken during the LLM
+  prescan_skip_words: [pick, picks, lift, hold, place, put, stack, move, take, carry, grab, bring, give, the, and, from, both, hand,
+                       hands, upon, onto, into, with, for, second, again, same, position, back, down, then, side, left, right,
+                       middle, top, bottom, front, near, nearest, closest, farthest, small, big, large, tall, short, red,
+                       white, black, brown, blue, green, yellow, grey, gray, orange, this, that, them, those, these, please,
+                       robot, one, two, three, four, other, another, all, its, their, there, here, over, under, next, beside]
   scan_frames: 10                # fine depth per view: per-pixel median over this many frames
   depth_max_m: 1.2
   mask_erode_px: 3               # mask edges mix object and background depth
@@ -430,6 +441,8 @@ scene:
   align_tol_m: 0.005             # held object's centre over the target's centre within this (camera vs camera)
   align_iters: 2                 # (camera calibrated: one correction is usually enough; each costs ~1 s of holding high)
   align_accept_m: 0.02           # ...and if a correction cannot be planned, lowering goes ahead only below this
+  held_size_tol_m: 0.03          # the held object's top as the camera sees it must match its size measured at the pick within this, else
+                                 # it is a partial view and the arm model lines up (2026-11-17: partly out of view, read 5.7 cm short)
   align_max_m: 0.06              # a camera line-up error above this is a wrong measurement: refuse, never place on it
   held_near_m: 0.08               # the held object: the camera's instance this close to the palms' midpoint
   margin_shift_m: 0.02           # margin check: the plan must also hold with every object 2 cm off (4 directions)...
@@ -610,8 +623,14 @@ manipulation:
   palm_align: [1.0, 0.5, 0.0]    # palm angle: 1 = flat on the measured faces (centred on them) ... 0 = along the
                                  # turned torso (a 22 deg waist turn put the palms 4.6 cm behind the box centre)
   max_trusted_box_yaw_deg: 15    # larger box-angle estimates are treated as mis-fits (run 8 gripped the length)
-  live_grip_tol_m: 0.01          # a holding move plays its PLANNED end pose when the live palm gap is within this of the plan's
+  live_grip_tol_m: 0.02          # a holding move plays its PLANNED end pose when the live palm gap is within this of the plan's
+                                 # (2026-11-17: 1 -> 2 cm: measured widths are off +-1 cm and the fingertip turn adds ~1 cm; at 1.1 cm the
+                                 # move went to a live re-solve that failed over the stack. Keeping the live wrist turn in the played angles
+                                 # was tried and reverted: over the stack that end pose collided in the model, and the planned lowering
+                                 # no longer started where the arm was)
                                  # (re-solving the arm for the live grip put the left wrist near 0 deg pitch: line-up/lowering flipped)
+  unstick_roll_deg: [2, 3, 4, 5, 6, 8]   # last resort with an arm against the body: shoulders opened this much (first free one)...
+  unstick_pitch_deg: 2           # ...and raised this much (2026-11-17 by hand: left roll +5, pitch -2 freed it)
   place_edge_margins_m: [0.03, 0.02, 0.01, 0.0]   # a place on a surface: the object's front face this far inside its front edge,
                                  # first that plans (2026-11-07: a box lifted flush with the case edge could not be put 3 cm in: out of reach)
   place_back_dz_m: 0.03          # robot not moved since the pick and the surface within this of the one it came from: back on that spot first
@@ -711,6 +730,9 @@ ai:
   object_front_min_m: 0.20       # approaching an object: its front face stays at least this far from the torso origin (a big case: the edge, not the centre)
   approach_max_leg_m: 1.5        # walk at most this far before looking again
   lateral_tolerance_m: 0.06
+  section6_blind: false          # section 6 plays without the camera (true) or with the camera line-up and checks (false; the user 2026-11-17)
+  margin_check: false            # re-plan with the scene shifted 2 cm / turned 3 deg to report robustness (6 full re-plans, up to
+                                 # 150 s; it never changes the plan): off for speed (user 2026-11-17: motion within 15 s)
   approach_waist_ok_deg: 25      # an object this far to the side is faced with the waist, not the legs (STANDARDS M3.3: picks tested to 25 deg; user 2026-11-07)
   approach_min_step_m: 0.03      # the walk guard allows less than this toward an object: no step, the pick tries from where the robot stands
   max_replans: 2                 # vision / cuRobo / Cosmos steps are retried; turning and walking never are (ai.py)

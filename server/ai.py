@@ -59,10 +59,12 @@ AFTER = {"pre_grasp": "AT_OBJECT", "grasp": "GRIPPING", "lift": "HOLDING", "plac
 
 
 def plan_schema(names):
-    return {"type": "object", "required": ["plan"], "properties": {
-        "plan": {"type": "array", "items": {"type": "object", "required": ["skill", "params", "why"], "properties": {
-            "skill": {"type": "string", "enum": names}, "params": {"type": "object"}, "why": {"type": "string"}}}},
-        "notes": {"type": "string"}}}
+    # skills and parameters only: a 'why' per step and closing notes were about half of what the LLM wrote (Super
+    # writes ~16 tokens/s: 14-17 s per plan; the user wants the motion within 15 s, 2026-11-17)
+    return {"type": "object", "required": ["plan"], "additionalProperties": False, "properties": {
+        "plan": {"type": "array", "items": {"type": "object", "required": ["skill", "params"], "additionalProperties": False,
+                                            "properties": {"skill": {"type": "string", "enum": names},
+                                                           "params": {"type": "object"}}}}}}
 
 
 class Busy:
@@ -78,12 +80,13 @@ def llm_plan(ctx, llm, text, kinds, extra=""):
     allowed = catalog(kinds)
     fix = ""
     for attempt in range(config.load()["ai"]["plan_fix_tries"] + 1):
-        user = (f"Task: {text}\n\nSkills:\n{json.dumps(allowed, indent=1)}\n\nWhat the robot currently knows:\n"
-                f"{json.dumps(ctx.summary())}\n\n{RULES}{extra}{fix}\n\nReturn JSON: "
-                '{"plan": [{"skill": ..., "params": {...}, "why": ...}], "notes": ...}')
+        base = (f"Task: {text}\n\nSkills:\n{json.dumps(allowed, indent=1)}\n\nWhat the robot currently knows:\n"
+                f"{json.dumps(ctx.summary())}\n\n{RULES}{extra}{fix}\n\n")
+        # schema-constrained JSON: never 'thinks' first (without the schema Cosmos3-Super sometimes wrote a <think> block for
+        # 24-180 s, 2026-11-17); skills and parameters only, ~7 s
         with ctx.processing("llm"):
-            out = llm.call("chat", {"system": BRIEF, "user": user, "temperature": 0.0,
-                                    "schema": plan_schema([s["skill"] for s in allowed])})
+            out = llm.call("chat", {"system": BRIEF, "temperature": 0.0, "schema": plan_schema([s["skill"] for s in allowed]),
+                                    "user": base + 'Return JSON: {"plan": [{"skill": ..., "params": {...}}]} (no explanations)'})
         plan = (out["json"] or {}).get("plan")
         if not plan:
             raise SkillError(f"the LLM returned no usable plan: {out['text'][:300]}")
@@ -266,9 +269,9 @@ class MotionPlanning:
             ctx.bb.pop("calib", None)
             scene = ctx.scene = TaskScene(ctx, text)
             self.scene_dir = scene.run_dir
-            # the straight view is taken while the LLM chooses the skills (both take a few seconds)
+            # the straight view (and the likely side views) are taken while the LLM chooses the skills
             box = {}
-            th = threading.Thread(target=lambda: box.update(err=_try(lambda: scene.capture(ctx, 0.0))), daemon=True)
+            th = threading.Thread(target=lambda: box.update(err=_try(lambda: scene.prescan(ctx, text))), daemon=True)
             th.start()
             try:
                 self.llm_steps, _ = llm_plan(ctx, self.llm, text, self.KINDS,
@@ -283,7 +286,8 @@ class MotionPlanning:
             scene.note(llm_steps=[{k: n.get(k) for k in ("skill", "params", "why")} for n in self.llm_steps],
                        nouns=nouns, start_state=ctx.link.state())
             plan = plan_task(ctx, self.llm_steps)
-            self.margin = margin_check(ctx, self.llm_steps)
+            # the margin check only reports how fragile the plan is (6 full re-plans: 150 s on 2026-11-17): off by default
+            self.margin = margin_check(ctx, self.llm_steps) if ctx.cfg["ai"].get("margin_check") else None
             self.plan, self.state = plan, "ready"
             try:
                 self.heat = {"peaks_c": heat.check(ctx, plan)}
@@ -327,12 +331,16 @@ class MotionPlanning:
                 def on_step(i, label):                 # logged: a stop can be placed exactly afterwards
                     self.current = f"{i + 1}/{len(plan.steps)} {label}"
                     log.info("play step %s", self.current)
+                # eyes during the play too (the user, 2026-11-17 evening, after a blind try: 'give the eyes'): the camera
+                # line-up over the target (partial views refused), the test-lift and placed-object checks
+                ctx.bb["blind"] = bool(ctx.cfg["ai"].get("section6_blind", False))
                 execute(ctx, plan, on_step=on_step)
                 self.state = "done"
             except (SkillError, ServiceError) as e:
                 self.state, self.error = "failed", str(e)
                 log.warning("play failed at %s: %s", self.current, e)
             finally:
+                ctx.bb.pop("blind", None)
                 released = False
                 try:
                     released = rest(ctx)           # arms back to their normal position after every task
@@ -524,7 +532,7 @@ class AIControl:
             ctx.scene.forget(ctx)
             ctx.scene = None
         ctx.forget_positions()
-        for k in ("prefetch", "place_next", "no_map", "calib"):
+        for k in ("prefetch", "place_next", "no_map", "calib", "landed"):
             ctx.bb.pop(k, None)
 
     def _tick_tree(self, start):
@@ -572,6 +580,17 @@ class AIControl:
             for i in seg:
                 if self.nodes[i]["status"] != "done":
                     self.nodes[i]["status"] = "failed" if i == bad else "skipped"
+            n = self.nodes[bad]
+            if n["skill"] in ("place", "put_back") and self.ctx.bb.get("landed") and self.ctx.bb["hand"] == "EMPTY":
+                # the object is down on the target; only letting go needed the recovery (hands away, empty): done, the
+                # LLM is not asked to place a box that already sits there (2026-11-17)
+                n["status"], n["error"] = "done", None
+                n["result"] = {"placed": self.ctx.bb.get("landed"), "note": f"let go by the recovery: {e}"}
+                self._say(f"step {bad + 1} {n['skill']}: the object is down; the hands came away by the recovery ({e})")
+                for i in seg:
+                    if self.nodes[i]["status"] == "skipped":
+                        self.nodes[i]["status"] = "done"
+                return
             self.nodes[bad]["error"] = str(e)
             self._say(f"step {bad + 1} {self.nodes[bad]['skill']} failed: {e}")
             if len(seg) > 1 and self.ctx.scene is not None:
@@ -622,9 +641,10 @@ class AIControl:
         scene.note(llm_steps=[{k: n.get(k) for k in ("skill", "params", "why")} for n in steps], nouns=nouns,
                    start_state=ctx.link.state())
         plan = plan_task(ctx, steps)
-        margin = margin_check(ctx, steps)
+        margin = margin_check(ctx, steps) if self.cfg["ai"].get("margin_check") else None
         scene.note(views_deg=views, plan=plan.summary(), margin=margin)
-        self._say("plan " + ("robust" if margin["robust"] else f"MARGINAL ({', '.join(margin['failed'])})"))
+        if margin:
+            self._say("plan " + ("robust" if margin["robust"] else f"MARGINAL ({', '.join(margin['failed'])})"))
         if self._abort.is_set():
             raise SkillError("aborted")
         execute(ctx, plan, on_step=lambda i, label: log.info("ai step %d/%d %s", i + 1, len(plan.steps), label))

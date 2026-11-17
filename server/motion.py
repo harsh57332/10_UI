@@ -188,6 +188,12 @@ class ArmMotion:
                                             "goals": goals, "world": world, "attached": attached,
                                             "map": use_map, "margin": margin})
 
+    def ik_batch(self, start, goal_sets, world, attached=None, use_map=None, margin=0.0):
+        with self.processing("curobo"):
+            return self.planner.call("ik_batch", {"start": [start[self.idx[n]] for n in self.names],
+                                                  "goal_sets": goal_sets, "world": world, "attached": attached,
+                                                  "map": use_map, "margin": margin})["ok"]
+
     def plan_joint(self, start, goal, world, attached=None, use_map=None, margin=0.0):
         with self.processing("curobo"):
             return self.planner.call("plan_joint", {"start": [start[self.idx[n]] for n in self.names],
@@ -380,6 +386,19 @@ class ArmPlan:
         q.update({self.m.idx[n]: v for n, v in zip(r["joint_names"], r["q"])})
         return q
 
+    def ik_ok(self, goal_sets, world, margin=None):
+        """Which goal sets may have an IK solution (one batched, lenient check: a False is certain, a True is then
+        decided by ik). All True if the planner cannot batch (the caller then tries each, as before)."""
+        if not goal_sets:
+            return []
+        wld = self._torso({}, world)[1]
+        try:
+            return self.m.ik_batch(self.q, [self._torso(g, world)[0] for g in goal_sets], wld, self.attached, self._map(),
+                                   self._margin(margin))
+        except Exception as e:
+            log.warning("batched IK check unavailable (%s): each candidate is tried", e)
+            return [True] * len(goal_sets)
+
     def to_joint(self, label, goal, world, margin=None):
         _, wld = self._torso({}, _free(world))
         margin = self._margin(margin)
@@ -469,6 +488,7 @@ class ArmPlan:
         live.use_map = not s.get("line")        # straight contact moves: the cuboids only
         traj = s["traj"]
         grip_end = None                         # a holding step's end, re-solved for the live grip
+        hold_ok = False                         # holding with the grip the plan assumed: its end angles hold it right
         if not s.get("goals_fn"):
             now = np.array([live.q[self.m.idx[n]] for n in traj["joint_names"]])
             if np.degrees(np.abs(now - np.array(traj["positions"][0]))).max() < 1.0:
@@ -476,7 +496,8 @@ class ArmPlan:
             end = dict(live.q)
             end.update({self.m.idx[n]: v for n, v in zip(traj["joint_names"], traj["positions"][-1])})
             try:
-                if s["holding"] and not self.grip_matches_plan(live.q, end):
+                hold_ok = s["holding"] and self.grip_matches_plan(live.q, end)
+                if s["holding"] and not hold_ok:
                     end = grip_end = self.at_live_grip(end, s)
                 live.to_joint(s["label"], end, s["world"], margin=s.get("margin"))
                 return live.steps[-1]["traj"]
@@ -499,16 +520,16 @@ class ArmPlan:
             tries.append(("free path", lambda: live.to_pose(label, goals, world, margin=margin)))
             if margin:                          # a little tighter, never zero (zero grazed the boxes)
                 tries.append(("free path, half margin", lambda: live.to_pose(label, goals, world, margin=margin / 2)))
-            end_q = None if s["holding"] else {k: v for k, v in zip((self.m.idx[n] for n in traj["joint_names"]),
-                                                                     traj["positions"][-1])}
+            end_q = None if s["holding"] and not hold_ok else {k: v for k, v in zip((self.m.idx[n] for n in traj["joint_names"]),
+                                                                                    traj["positions"][-1])}
         else:                                   # (not while holding either: planned at the modelled grip gap)
-            end_q = None if s["holding"] else {k: v for k, v in s["goal_q"].items() if 15 <= k <= 28}
+            end_q = None if s["holding"] and not hold_ok else {k: v for k, v in s["goal_q"].items() if 15 <= k <= 28}
         if grip_end is not None:                # holding: the same chain toward the end re-solved for the live grip
             end_q = {k: v for k, v in grip_end.items() if 15 <= k <= 28}
         if end_q:
             goal = dict(live.q)
             goal.update(end_q)
-            if grip_end is None:                # (the live-grip end was just tried at full margin)
+            if grip_end is None and not hold_ok:   # (the live-grip / matching-grip end was just tried at full margin)
                 tries.append(("planned end angles", lambda: live.to_joint(label, goal, world, margin=margin)))
             if margin:                          # the move was proven at full margin when planned; from a slightly
                 tries.append(("planned end angles, half margin",          # different live start, a little closer

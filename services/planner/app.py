@@ -52,6 +52,7 @@ M = CFG["scene_map"]
 _mapper = None              # cuRobo Mapper (depth -> TSDF -> distance field)
 _map = None                 # distance-field VoxelGrid of the last map (torso frame at capture), or None
 _checker = None             # cuRobo collision checker sharing the planner's world and kinematics (held box)
+_batch_ik = None            # IK solver for many goal sets in one GPU solve (ik_batch), sharing the planner's world
 NAT, PATH = P["natural"], P["path"]
 
 
@@ -60,7 +61,7 @@ _planners = {}             # hand profile -> (MotionPlanner, RobotCollisionCheck
 
 def _load():
     """One planner per hand profile whose model is built (config hands), then the depth mapper."""
-    global _planner, _checker
+    global _planner, _checker, _batch_ik
     active = config.hands()
     for name, h in CFG["hands"].items():
         if not config.path(h["planner_yml"]).exists():
@@ -71,19 +72,24 @@ def _load():
         _planners[name] = _load_planner()
         log.info("hands '%s': planner model %s", name, h["planner_yml"])
     config.use_hands(active if active in _planners else next(iter(_planners)))
-    _planner, _checker = _planners[config.hands()]
+    _planner, _checker, _batch_ik = _planners[config.hands()]
+    try:                                        # the batched IK's CUDA graphs now, not on the first grasp search (+2 s)
+        q = [math.radians(v) for v in NAT["posture_deg"]]
+        ik_batch(q, [fk(q)["poses"]], None)
+    except Exception as e:
+        log.warning("batched IK warm-up: %s", e)
     _load_mapper()
 
 
 def _select(name):
     """Use the planner of this hand profile (the server sends the robot's detected hands with every request)."""
-    global _planner, _checker, _attached
+    global _planner, _checker, _batch_ik, _attached
     if not name or name == config.hands():
         return
     if name not in _planners:
         raise RuntimeError(f"no planner model for hands '{name}' (run scripts.build_planner_robot --hands {name})")
     config.use_hands(name)
-    _planner, _checker = _planners[name]
+    _planner, _checker, _batch_ik = _planners[name]
     _attached = None                            # that planner's attachment state is its own
     log.info("hands '%s' selected", name)
 
@@ -110,7 +116,19 @@ def _load_planner():
         robot_config=robot, scene_collision_checker=planner.scene_collision_checker,
         collision_activation_distance=0.0, self_collision_activation_distance=0.0))
     checker.kinematics = planner.kinematics     # the held box attached to the planner is checked too
-    return planner, checker
+    # the same IK as the planner's (LBFGS, ik_solutions seeds, same tolerances), for up to ik_batch goal sets at once,
+    # on the planner's own collision world: the grasp search asks ~50 candidates per waist turn in one solve instead
+    # of one ~12 ms call each (2026-11-17: 707 calls, 36 s live)
+    from curobo._src.solver.solver_ik import IKSolver
+    from curobo._src.solver.solver_ik_cfg import IKSolverCfg
+    # a pre-filter, so more lenient than the exact IK (tolerances x ik_batch_tolerance_x): it must never reject a pose
+    # the exact IK solves (strict, it missed the one marginal grasp that planned on 2026-11-17); the exact IK decides
+    tx = P["ik_batch_tolerance_x"]
+    bik = IKSolver(IKSolverCfg.create(robot=robot, optimizer_configs=["ik/lbfgs_ik.yml"], num_seeds=P["ik_solutions"],
+                                      max_batch_size=P["ik_batch"], self_collision_check=True,
+                                      position_tolerance=0.005 * tx, orientation_tolerance=0.05 * tx),
+                   planner.scene_collision_checker)
+    return planner, checker, bik
 
 
 def _load_mapper():
@@ -310,6 +328,34 @@ def _natural_cost(sol, start):
         r = sol[:, names.index(f"{side}_shoulder_roll_joint")] * sign
         c = c + NAT["adduction_weight"] * torch.clamp(free - r, min=0.0) ** 2
     return c
+
+
+def ik_batch(start, goal_sets, world, use_map=None, margin=0.0):
+    """For each palm-goal set: is there a collision-free, natural IK solution (the test _ik makes, no held object)?
+    Solved ik_batch sets at a time in one GPU call; the world and seeds are those of a single ik request."""
+    from curobo.types import GoalToolPose, JointState
+    frames = _planner.tool_frames
+    _world(world, use_map, margin)
+    cur = fk(start)["poses"]
+    n, B = P["ik_solutions"], P["ik_batch"]
+    wrist = [i for i, j in enumerate(_planner.joint_names) if "wrist" in j]
+    seeds = _seeds(start, n)
+    out = []
+    for i in range(0, len(goal_sets), B):
+        chunk = [{**{f: cur[f] for f in frames}, **g} for g in goal_sets[i:i + B]]
+        real = len(chunk)
+        chunk += [chunk[-1]] * (B - real)       # always the full batch (cuRobo's own padding missed the seeds)
+        k = len(chunk)
+        pos = _t([[[g[f]["position"]] for f in frames] for g in chunk]).view(k, 1, len(frames), 1, 3)
+        quat = _t([[[g[f]["quaternion"]] for f in frames] for g in chunk]).view(k, 1, len(frames), 1, 4)
+        state = JointState.from_position(_t(start).view(1, -1).repeat(k, 1), joint_names=_planner.joint_names)
+        _batch_ik.reset_seed()
+        ik = _batch_ik.solve_pose(GoalToolPose(tool_frames=frames, position=pos, quaternion=quat),
+                                  current_state=state, seed_config=seeds.repeat(k, 1, 1), return_seeds=n)
+        sol = ik.solution.reshape(k, -1, len(start))
+        ok = ik.success.reshape(k, -1) & (sol[..., wrist].abs() <= math.radians(NAT["wrist_max_deg"])).all(-1)
+        out += ok.any(-1).tolist()[:real]
+    return {"ok": out}
 
 
 def solve_ik(start, goals, world, use_map=None, margin=0.0, debug=False):
@@ -517,13 +563,16 @@ def infer(req: Request):
             _select(p.get("hands"))
             if req.action == "fk":
                 return envelope.done(req.id, fk(p["q"]), t0)
-            if req.action in ("plan_pose", "plan_joint", "plan_line", "ik"):
+            if req.action in ("plan_pose", "plan_joint", "plan_line", "ik", "ik_batch"):
                 torch.manual_seed(P["rng_seed"])        # the same request always gets the same plan
                 _planner.reset_seed()
                 _attach(p.get("attached"))
             if req.action == "plan_pose":
                 return envelope.done(req.id, plan_pose(p["start"], p["goals"], p.get("world"), p.get("map"),
                                                        p.get("margin", 0.0)), t0)
+            if req.action == "ik_batch":
+                return envelope.done(req.id, ik_batch(p["start"], p["goal_sets"], p.get("world"), p.get("map"),
+                                                      p.get("margin", 0.0)), t0)
             if req.action == "ik":
                 return envelope.done(req.id, solve_ik(p["start"], p["goals"], p.get("world"), p.get("map"),
                                                       p.get("margin", 0.0), p.get("debug", False)), t0)

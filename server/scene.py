@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import math
+import re
 import os
 import time
 
@@ -142,11 +143,39 @@ class TaskScene:
                 need |= {1, -1}
             for i in found:
                 need |= {s for s in (1, -1) if i["cut"] == s}
+        have = {round(v.yaw_deg) for v in self.views}
         for s in sorted(need, reverse=True):                 # left first, then right
-            self.capture(ctx, s * self.S["scan_side_deg"])
-        if need:
+            if not any(abs(h - s * self.S["scan_side_deg"]) <= 2 for h in have):   # not already taken by prescan
+                self.capture(ctx, s * self.S["scan_side_deg"])
+        if len(self.views) > 1:
             self.capture_straight(ctx)
         return [v.yaw_deg for v in self.views]
+
+    def prescan(self, ctx, text):
+        """While the LLM plans (section 6): the straight view, then the side views the task will probably need, from the
+        object words guessed in the instruction (scan reuses them; a wrong guess only costs a waist turn during the
+        LLM's ~7 s). 2026-11-17: the side view after the LLM cost 6.5 s of a 15 s budget."""
+        from .skills import TARGET_WORDS
+        if not self.views:
+            self.capture(ctx, 0.0)
+        skip = set(self.S["prescan_skip_words"]) | set(TARGET_WORDS)
+        words = []
+        for w in re.findall(r"[a-z]+", text.lower()):
+            w = w[:-2] if w.endswith("xes") else w[:-1] if w.endswith("s") and not w.endswith("ss") else w
+            if len(w) >= 3 and w not in skip and w not in words:
+                words.append(w)
+        need = set()
+        for w in words[:self.S["prescan_max_words"]]:
+            for i in self._segment(ctx, w, 0):
+                if i["ok"] and i["cut"] in (1, -1):
+                    need.add(i["cut"])
+        for s in sorted(need, reverse=True):
+            self.capture(ctx, s * self.S["scan_side_deg"])
+        self.capture_straight(ctx)               # straight again before the LLM is back (also if the LLM fails)
+        for k in range(1, len(self.views)):      # the side views segmented now too (cached for the find)
+            for w in words[:self.S["prescan_max_words"]]:
+                self._segment(ctx, w, k)
+        log.info("prescan: words %s -> side views %s", words[:self.S["prescan_max_words"]], sorted(need))
 
     def capture_straight(self, ctx):
         q = ctx.motion.q_now()
@@ -681,7 +710,7 @@ class TaskScene:
         self.save()
         return report
 
-    def measure_held(self, ctx, noun, palms_mid, above_z):
+    def measure_held(self, ctx, noun, palms_mid, above_z, dims=None):
         """The held object's centre (x, y) as the camera sees it now: the instance of its noun above above_z (the
         target's top) nearest the palms' midpoint, its top face's rectangle. Camera to camera with the target: the
         arm calibration and the object's place in the grip cancel out."""
@@ -698,13 +727,22 @@ class TaskScene:
         if not inst:
             return None
         i = min(inst, key=lambda i: float(np.hypot(*(np.median(i["pts"][:, :2], axis=0) - palms_mid[:2]))))
+        if i["cut"] or i["far_cut"]:            # cut off at an image edge: its centre would be off (2026-11-17: held high over
+            log.info("held '%s': cut off at the image %s", noun, "top" if i["far_cut"] else "side")   # a stack, 5.7 cm short)
+            return None
         p = i["pts"]
         top = p[p[:, 2] > np.percentile(p[:, 2], 97) - 0.02, :2]
         if len(top) < 30:
             return None
         lo, hi = np.percentile(top, 2, axis=0), np.percentile(top, 98, axis=0)
         top = top[np.all((top >= lo) & (top <= hi), axis=1)]
-        (mx, my), _, _ = cv2.minAreaRect((top * 1000).astype(np.float32))
+        (mx, my), (w, l), _ = cv2.minAreaRect((top * 1000).astype(np.float32))
+        if dims is not None:                    # only part of its top seen (gloves, view edge): not a measurement of its centre
+            seen, known = sorted([w / 1000, l / 1000]), sorted(float(d) for d in dims[:2])
+            if max(abs(a - b) for a, b in zip(seen, known)) > self.S["held_size_tol_m"]:
+                log.info("held '%s': top seen %.1f x %.1f cm, measured at the pick %.1f x %.1f cm: partial view", noun,
+                         100 * seen[0], 100 * seen[1], 100 * known[0], 100 * known[1])
+                return None
         return np.array([mx / 1000, my / 1000])
 
     def held_top(self, ctx, noun, palms_mid):
