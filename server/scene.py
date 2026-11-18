@@ -216,17 +216,68 @@ class TaskScene:
             i = {"noun": noun, "view": k, "score": r["score"], "box": r["box"], "mask": mask, "pts": pts, "cut": cut,
                  "far_cut": y1 <= S["top_edge_px"], "id": f"{k}.{j}"}   # touches the image top = its far side
             i["ok"], i["why"] = self._usable(i)
+            filled = 0
             if i["ok"]:
-                i["vox"] = self._vox(pts)
                 from .geometry import Geometry
                 z = pts[:, 2]
                 t = Geometry.plane_height(z[z > np.percentile(z, 30)])
                 i["top"] = float(np.percentile(z, 97)) if t is None else float(t)
+                if t is not None:
+                    fill = self._fill_top(ctx, v, inner, float(t))
+                    if len(fill):
+                        i["pts"] = pts = np.vstack([pts, fill])
+                        filled = len(fill)
+                i["vox"] = self._vox(pts)
             out.append(i)
-            log.info("view %d '%s' #%d: score %.2f, %d points%s", k, noun, j, r["score"], len(pts),
+            log.info("view %d '%s' #%d: score %.2f, %d points%s%s", k, noun, j, r["score"], len(pts),
+                     f" ({filled} put on its top plane where the top had no depth)" if filled else "",
                      "" if i["ok"] else f" (not an object: {i['why']})")
         self.inst[key] = out
         return out
+
+    def _fill_top(self, ctx, v, inner, top):
+        """A glossy top face reflects the lights into the depth camera, which then has no depth there (2026-11-18: 53 % of a
+        white carton's top: it read 14-24 cm deep from one minute to the next, so the grip and the play check moved with
+        it). The mask pixels without depth that lie on the top face - in their image column above the lowest pixel whose
+        depth is on the top plane (the top's near edge; interpolated over columns with no top depth at all) - are put on
+        the top plane along their camera rays. Pixels below that edge (the front face) are left alone."""
+        S, st = self.S, self.S["point_step_px"]
+        vs, us = np.nonzero(inner[::st, ::st])
+        us, vs = us * st, vs * st
+        z = v.depth[vs, us].astype(np.float32) * v.depth_scale
+        valid = (z > 0.05) & (z < S["depth_max_m"])
+        if valid.all() or not valid.any():
+            return np.zeros((0, 3))
+        P = self._pixels_to_pelvis(ctx, v, us[valid], vs[valid])       # same order as us[valid] (same depth filter)
+        # the top is level in the world, so in the pelvis frame it rises ahead by the body's forward lean (IMU; standing
+        # ~2 deg): a flat plane put the far edge 2-3 cm too far (white carton 29 cm deep read 31-32, 2026-11-18)
+        try:
+            m = math.tan(math.radians(float(ctx.link.state()["imu"]["pelvis_rpy"][1])))
+        except Exception:
+            m = 0.0
+        on = np.abs(P[:, 2] - top) < S["top_fill_tol_m"]
+        if not on.any():
+            return np.zeros((0, 3))
+        x0 = float(np.median(P[on, 0]))
+        on = np.abs(P[:, 2] - (top + (P[:, 0] - x0) * m)) < S["top_fill_tol_m"]
+        tu, tv = us[valid][on], vs[valid][on]
+        if len(tu) < S["min_points"]:
+            return np.zeros((0, 3))
+        cols = np.unique(tu)
+        edge = np.array([tv[tu == c].max() for c in cols])
+        hole = ~valid & (us >= cols.min()) & (us <= cols.max())
+        hole &= vs <= np.interp(us, cols, edge)
+        if not hole.any():
+            return np.zeros((0, 3))
+        k = v.intrinsics
+        d = np.stack([(us[hole] - k["ppx"]) / k["fx"], (vs[hole] - k["ppy"]) / k["fy"], np.ones(int(hole.sum()))], axis=1)
+        R = v.T[:3, :3] @ ctx.geometry.R                                 # camera -> pelvis (as _pixels_to_pelvis)
+        o = v.T[:3, :3] @ ctx.geometry.t + v.T[:3, 3]
+        d = d @ R.T
+        den = d[:, 2] - m * d[:, 0]                                      # plane z = top + (x - x0) m
+        ok = den < -1e-6                                                 # rays going down to the plane
+        s = (top + (o[0] - x0) * m - o[2]) / den[ok]
+        return o + s[:, None] * d[ok]
 
     def _usable(self, i):
         p, M = i["pts"], self.cfg["manipulation"]
@@ -699,8 +750,12 @@ class TaskScene:
             seen = [o for o in probe.objects(ctx, [b["noun"]]) if 0 in o["views"] and o["cut"].get(0) == 0]
             if not seen:
                 raise SkillError(f"'{label}' is no longer seen where Generate found it: press Generate again")
-            o = min(seen, key=lambda o: math.hypot(o["center"][0] - x, o["center"][1] - y))
-            moved = math.hypot(o["center"][0] - x, o["center"][1] - y)
+            # like with like: Generate kept the straight view's own fit of its mask (view0), not the edge-grown one
+            # (2026-11-18: the grown fit read the box 5 cm shorter -> 'moved 3.0 cm' while nothing had moved)
+            c0 = lambda o: probe._fit(o["views"][0]["pts"], probe._background(ctx))["center"][:2]
+            seen = [(o, c0(o)) for o in seen]
+            o, c = min(seen, key=lambda oc: math.hypot(oc[1][0] - x, oc[1][1] - y))
+            moved = math.hypot(c[0] - x, c[1] - y)
             report[label] = round(100 * moved, 1)
             log.info("play check '%s': %.1f cm from where Generate measured it", label, 100 * moved)
             if moved > self.S["moved_tol_m"]:

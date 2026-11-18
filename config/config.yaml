@@ -425,7 +425,10 @@ scene:
   jump_rel: 0.04
   min_blob_m2: 0.0004            # a depth patch (cut off by jumps) smaller than 2 x 2 cm is a false match, dropped
   point_step_px: 2
-  edge_px: 6                     # a mask this close to the image side is cut off there
+  top_fill_tol_m: 0.01           # a glossy top face has no depth where it reflects the lights (2026-11-18: white carton, 53 % of
+                                 # its top): mask pixels without depth above the top's near edge are put on the top plane; a
+                                 # depth point within this of the top plane counts as top face (finds that near edge per column)
+  edge_px: 6                    # a mask this close to the image side is cut off there
   top_edge_px: 2                 # a mask touching the image top runs out of view on its far side
   min_points: 60
   voxel_m: 0.015                 # 3D overlap tests between masks
@@ -633,6 +636,8 @@ manipulation:
                                  # (re-solving the arm for the live grip put the left wrist near 0 deg pitch: line-up/lowering flipped)
   unstick_roll_deg: [2, 3, 4, 5, 6, 8]   # last resort with an arm against the body: shoulders opened this much (first free one)...
   unstick_pitch_deg: 2           # ...and raised this much (2026-11-17 by hand: left roll +5, pitch -2 freed it)
+  place_side_margin_m: 0.02      # placing after walking up to a surface: the object lined up sideways this far inside its top...
+  place_side_shift_max_m: 0.12   # ...by the arms, at most this (more: not placing)
   place_edge_margins_m: [0.03, 0.02, 0.01, 0.0]   # a place on a surface: the object's front face this far inside its front edge,
                                  # first that plans (2026-11-07: a box lifted flush with the case edge could not be put 3 cm in: out of reach)
   place_back_dz_m: 0.03          # robot not moved since the pick and the surface within this of the one it came from: back on that spot first
@@ -727,10 +732,29 @@ ai:
   carry_min_pull_m: 0.02         # pulled in only if that is at least this far
   carry_step_m: 0.02             # candidates from the closest outward in these steps (first with a plan and the arms clear)
   carry_settle_s: 1.0            # then the body settles before the lean is read
-  carry_max_lean_deg: 4.0        # pelvis pitch above this while holding: no walking/turning (normal ~2.2, at arm's length ~6)
-  back_before_turn_m: 0.0        # holding: step back this far before a turn. OFF (2026-11-18): with a box the robot cannot step back (it
-                                 # leans ~6 deg forward; asked 25 cm back at 0.2 and 0.4 m/s it stepped in place, drifted 3 cm forward and 10 cm
-                                 # right, twice into the case); the box is turned over the case top instead (was 0.25, user 2026-11-03)
+  carry_low_top_torso_m: 0.02    # carrying (after the step back from where it was lifted): the box down to the stomach until its top
+                                 # is this high in the torso frame (camera 0.43): the camera sees ~0.6-1.15 m ahead at table height
+                                 # past it (2026-11-18: in the chest-high carry pose the box filled the whole image; user: carry it low)
+  carry_low_bottom_min_pelvis_m: -0.03   # ...but its bottom stays above the hips (the thighs are just below, pelvis frame)
+  carry_low_min_drop_m: 0.04     # lower than this already: kept as it is
+  hold_leg_m: 0.40               # carrying: walk legs of at most this, a look after each (user 2026-11-18: every 30-50 cm)
+  hold_max_looks: 10
+  hold_max_misses: 4             # the target not in view after this many legs: stop
+  hold_last_leg_m: 0.55          # the target's front edge measured at most this much beyond the standoff -> walk it on that measurement
+                                 # (calibrated with a box, 52 cm for 50): up close the box hides the target's near part
+  hold_side_step_m: 0.10         # carrying, after the step back + 90 deg turn: this little side step toward the path (user: a little,
+                                 # not the whole step back; 30 cm + turning to the target put it 63 deg off, 2026-11-18)
+  hold_min_ahead_m: 0.40         # carrying: a destination is at least this far ahead (nearer = beside the robot)...
+  hold_corridor_half_m: 0.25     # ...and reaches into the walking path (|y| <= this)...
+  hold_corridor_min_overlap_m: 0.12   # ...by at least this much (a corner just touching the path is beside it)...
+  hold_source_pad_m: 0.40        # ...and is not within this of the spot the object was lifted from (tracked through the robot's own moves)
+  held_mask_grow_m: 0.05         # holding: depth points within this of the held box are left out of measurements...
+  held_mask_arms_m: 0.12         # ...across (the arms and gloves at its sides) within this
+  hold_over_target_m: 0.03       # before that last leg the box's bottom goes at least this far above the target's top
+  carry_max_lean_deg: 4.0       # pelvis pitch above this while holding: no walking/turning (normal ~2.2, at arm's length ~6)
+  back_before_turn_m: 0.3        # holding: step back this far before a turn (clears the case). Was OFF in the morning of 2026-11-18 (at
+                                 # arm's length the robot leaned ~6 deg and could not step back); with the carry pose it does (24-26 cm
+                                 # for 30, ~14 cm right drift), and the approach aims at a target the step back put to the side
   stand_for_pick: false          # OFF (user 2026-11-03): the robot picks from where it stands; the stance loop moved it 20 cm sideways on bad readings
   stand_rounds: 4                # look-step-look rounds at most
   stand_step_max_m: 0.10
