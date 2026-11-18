@@ -76,7 +76,8 @@ def _walk(params, stop, vx=0.0, vy=0.0, wz=0.0, turn=False):
     rpy0 = g1.imu().get("pelvis_rpy") if limit else None
     tilt = None
     bias = _num(params, "vy_bias_mps", -0.2, 0.2, 0.0)      # a steady sideways push to cancel the gait's drift (+ = left)
-    g1.velocity(vx * v, vy * v + bias, wz * v, d)
+    bias_x = _num(params, "vx_bias_mps", -0.2, 0.2, 0.0)    # ...and forward/back (- = back): holding a box the robot creeps
+    g1.velocity(vx * v + bias_x, vy * v + bias, wz * v, d)  # forward while turning (2026-11-18)
     t_end = time.monotonic() + d
     while time.monotonic() < t_end and not stop.is_set():
         stop.wait(0.05)

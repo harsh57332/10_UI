@@ -53,6 +53,7 @@ _mapper = None              # cuRobo Mapper (depth -> TSDF -> distance field)
 _map = None                 # distance-field VoxelGrid of the last map (torso frame at capture), or None
 _checker = None             # cuRobo collision checker sharing the planner's world and kinematics (held box)
 _batch_ik = None            # IK solver for many goal sets in one GPU solve (ik_batch), sharing the planner's world
+_self_checker = None        # self-collision-only checker at self_clear_m: an arm pose keeps that far from the body
 NAT, PATH = P["natural"], P["path"]
 
 
@@ -61,7 +62,7 @@ _planners = {}             # hand profile -> (MotionPlanner, RobotCollisionCheck
 
 def _load():
     """One planner per hand profile whose model is built (config hands), then the depth mapper."""
-    global _planner, _checker, _batch_ik
+    global _planner, _checker, _batch_ik, _self_checker
     active = config.hands()
     for name, h in CFG["hands"].items():
         if not config.path(h["planner_yml"]).exists():
@@ -73,6 +74,7 @@ def _load():
         log.info("hands '%s': planner model %s", name, h["planner_yml"])
     config.use_hands(active if active in _planners else next(iter(_planners)))
     _planner, _checker, _batch_ik = _planners[config.hands()]
+    _self_checker = _load_self_checker()
     try:                                        # the batched IK's CUDA graphs now, not on the first grasp search (+2 s)
         q = [math.radians(v) for v in NAT["posture_deg"]]
         ik_batch(q, [fk(q)["poses"]], None)
@@ -83,13 +85,14 @@ def _load():
 
 def _select(name):
     """Use the planner of this hand profile (the server sends the robot's detected hands with every request)."""
-    global _planner, _checker, _batch_ik, _attached
+    global _planner, _checker, _batch_ik, _attached, _self_checker
     if not name or name == config.hands():
         return
     if name not in _planners:
         raise RuntimeError(f"no planner model for hands '{name}' (run scripts.build_planner_robot --hands {name})")
     config.use_hands(name)
     _planner, _checker, _batch_ik = _planners[name]
+    _self_checker = _load_self_checker()
     _attached = None                            # that planner's attachment state is its own
     log.info("hands '%s' selected", name)
 
@@ -129,6 +132,24 @@ def _load_planner():
                                       position_tolerance=0.005 * tx, orientation_tolerance=0.05 * tx),
                    planner.scene_collision_checker)
     return planner, checker, bik
+
+
+def _load_self_checker():
+    """Self-collision-only checker of the active hand profile at self_clear_m (self_clear)."""
+    import yaml
+    from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
+    robot = yaml.safe_load(open(config.path(P["robot_yml"])))
+    urdf = config.path(P["urdf"])
+    robot["kinematics"]["urdf_path"], robot["kinematics"]["asset_root_path"] = str(urdf), str(urdf.parent)
+    return RobotCollisionChecker(RobotCollisionCheckerCfg.load_from_config(
+        robot_config=robot, scene_model=None, collision_activation_distance=0.0,
+        self_collision_activation_distance=P["self_clear_m"]))
+
+
+def self_clear(qs):
+    """Per arm pose: do all body parts keep self_clear_m from each other (an arm carrying a box near the chest must not
+    touch the torso: the squeeze pressed an arm into it and every plan 'started in collision', 2026-11-17)?"""
+    return {"ok": _self_checker.validate(_t(qs).view(len(qs), 1, -1))[:, 0].tolist(), "clear_m": P["self_clear_m"]}
 
 
 def _load_mapper():
@@ -570,6 +591,8 @@ def infer(req: Request):
             if req.action == "plan_pose":
                 return envelope.done(req.id, plan_pose(p["start"], p["goals"], p.get("world"), p.get("map"),
                                                        p.get("margin", 0.0)), t0)
+            if req.action == "self_clear":
+                return envelope.done(req.id, self_clear(p["qs"]), t0)
             if req.action == "ik_batch":
                 return envelope.done(req.id, ik_batch(p["start"], p["goal_sets"], p.get("world"), p.get("map"),
                                                       p.get("margin", 0.0)), t0)

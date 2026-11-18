@@ -188,6 +188,11 @@ class ArmMotion:
                                             "goals": goals, "world": world, "attached": attached,
                                             "map": use_map, "margin": margin})
 
+    def self_clear(self, qs):
+        """Per arm configuration ({motor index: rad}): does it keep services.planner.self_clear_m from the body?"""
+        with self.processing("curobo"):
+            return self.planner.call("self_clear", {"qs": [[q[self.idx[n]] for n in self.names] for q in qs]})["ok"]
+
     def ik_batch(self, start, goal_sets, world, attached=None, use_map=None, margin=0.0):
         with self.processing("curobo"):
             return self.planner.call("ik_batch", {"start": [start[self.idx[n]] for n in self.names],

@@ -329,6 +329,27 @@ def _last_resort(ctx):
     return "hands up, back, arms down by the sides (planned around everything), released"
 
 
+def failure_light(ctx, failed):
+    """The head light SOLID red after a failed task (the processing blink is red too, but blinking), the normal colour
+    again when the next task starts."""
+    try:
+        ctx.agent("headlight", {"hex": ctx.cfg["ai"]["failure_color"] if failed else ctx.cfg["headlight"]["default"]})
+    except Exception as e:
+        log.warning("head light: %s", e)
+
+
+def hands_open_still(ctx):
+    """The failure routine after a tilt (a walk or turn stopped because the body tilted): open the hands (no squeeze, no
+    carried weight; the dummy gloves let go of the object) and hold the arms still where they are: no arm move on a
+    robot that just tipped (the user, 2026-11-05)."""
+    try:
+        _grip_force(ctx, squeeze_n=0.0, payload_kg=0.0)
+        if ctx.link.state()["arms"]["engaged"]:
+            _hold_here(ctx)
+    finally:
+        ctx.bb.update(hand="EMPTY", holding=None, grasp=None, grip=None)
+
+
 def rest(ctx):
     """After a task: with empty hands the arms go back to their normal position, released to the walking
     policy (hanging at the sides), which keeps the motors cool. Arms holding or touching something stay held
@@ -354,6 +375,15 @@ def rest(ctx):
             log.warning("rest: no planned way down; released from the ready pose (the arms hang down by the sides)")
     ctx.agent("release_upperbody", {}, timeout=15)
     return True
+
+
+@skill("hand_over", {}, "A person holds the object: stop squeezing so the gloves let go (the arms stay where they are), "
+       "then the arms down by the sides (out to the sides first). Manual use (calibration with a held box).", "internal",
+       hands=("HOLDING", "GRIPPING"))
+def hand_over(ctx):
+    hands_open_still(ctx)
+    time.sleep(0.5)
+    return {"released": rest(ctx)}
 
 
 @skill("arms_down", {}, "Arms back down by the sides: the planned, collision-checked way out to the sides first, then released "
@@ -728,6 +758,9 @@ def _walk_speed(ctx, direction, distance):
     a = ctx.cfg["ai"]
     if ctx.bb.get("fast_walk"):
         return a["speed"]
+    if direction == "backward" and ctx.bb["hand"] == "HOLDING":   # with a box the robot leans forward: at 0.2 m/s backward
+        return a["speed"]                                         # it steps in place and drifts forward (11-03; 11-18 it
+                                                                  # bumped the case): a clear 0.4 m/s step
     return a["speed"] if direction in ("forward", "backward") and abs(distance) >= a["confident_walk_min_m"] else a["speed_slow"]
 
 
@@ -754,6 +787,8 @@ def _walk_bias(ctx, direction, v):
     (tape 2026-11-04/05, empty hands)."""
     a = ctx.cfg["ai"]
     fast = v == a["speed"]
+    if direction == "backward" and ctx.bb["hand"] == "HOLDING":   # holding a box (carry pose): it drifts right (tape 11-18)
+        return a["walk_vy_bias_back_holding_mps"]
     return {("forward", True): a["walk_vy_bias_mps"], ("forward", False): a["walk_vy_bias_slow_mps"],
             ("backward", True): a["walk_vy_bias_back_mps"]}.get((direction, fast), 0.0)
 
@@ -789,6 +824,10 @@ def _walk_raw(ctx, direction, distance_m):
         raise SkillError("walk needs direction forward|backward|left|right and distance_m > 0")
     v = _walk_speed(ctx, direction, float(distance_m))
     t = _walk_time(ctx, float(distance_m), v, direction)
+    if direction == "backward" and ctx.bb["hand"] == "HOLDING":   # holding a box (carry pose) it first steps in place
+        t += ctx.cfg["ai"]["walk_back_holding_start_s"]           # ~0.9 s, then walks back at the normal speed (tape 11-18)
+    if direction == "forward" and ctx.bb["hand"] == "HOLDING":    # holding a box it creeps forward: it goes ~1/3 further
+        t *= ctx.cfg["ai"]["walk_fwd_holding_ratio"]              # than asked (tape 11-18: 66 cm for 50)
     _before_move(ctx)
     if direction == "forward":                  # hit nothing: what is ahead must stay clear of the body after this walk
         A = ctx.cfg["ai"]
@@ -804,6 +843,7 @@ def _walk_raw(ctx, direction, distance_m):
         params["vy_bias_mps"] = bias
     r = ctx.agent(action, params, timeout=t + 10)
     if r and r.get("tilt_deg"):
+        ctx.bb["tilted"] = r["tilt_deg"]        # the failure routine then moves nothing (see failure_routine)
         raise SkillError(f"walk stopped: the body tilted {r['tilt_deg']} deg (roll, pitch); holding still")
     return t
 
@@ -820,13 +860,77 @@ def walk(ctx, direction, distance_m):
 
 
 def _before_move(ctx):
-    """Carrying: hot arm motors -> do not walk or turn; stop, hold still and say so."""
+    """Carrying: hot arm motors -> do not walk or turn; stop, hold still and say so. Then the carry pose (the box in close
+    to the chest, waist straight) and the lean check."""
     if ctx.bb["hand"] == "HOLDING":
         try:
             _check_heat(ctx)
         except SkillError as e:
             speak(ctx, "My arms are too hot to carry this further. I am stopping.")
             raise SkillError(f"not moving while holding: {e}")
+        _carry_pose(ctx)
+
+
+def _carry_pose(ctx):
+    """Holding, before the first walk or turn: the box in close to the chest and centred, then the waist straight
+    (2026-11-18: held at arm's length the robot leaned ~6 deg forward, could not step back and crept 36 cm during a 90 deg
+    turn). The gap to the chest is set by the box's NEAR face (measured directly at the pick), never by its measured depth
+    (a shiny box read 14 cm deep for 27). Pulled straight along the torso's axis first (away from the table), the waist
+    turned only then, with the box close to the body; the arms keep self_clear_m from the body (an arm pressed on the
+    torso blocked every plan, 2026-11-17). Then the forward lean must be small, else no walking."""
+    A, m = ctx.cfg["ai"], ctx.motion
+    h = ctx.bb.get("holding")
+    if not h or h.get("carried") or not m.grip or h.get("near_off") is None:
+        return
+    plan = new_plan(ctx)
+    left, right = plan.palms()
+    mid, yaw = m.object_frame(left, right)
+    mid_z = float(mid[2])
+    dims = h["dims"]
+    c, s_ = math.cos(yaw), math.sin(yaw)                     # the held box in the model (near face where it was measured)
+    along = h["near_off"] + dims[0] / 2
+    plan.attach(cuboid("held", (mid[0] + c * along, mid[1] + s_ * along, mid_z - h["grasp_above_bottom"] + dims[2] / 2),
+                       dims, yaw))
+    w = plan.waist
+    T = ctx.geometry.torso_in_pelvis(m.waist_of(plan.q))
+    mid_t = np.linalg.inv(T) @ np.array([*mid, 1.0])       # the palm midpoint in the torso frame
+    want = A["carry_chest_x_m"] + A["carry_chest_gap_m"] - h["near_off"]   # palm midpoint x (torso) for that gap
+    start = plan.mark()
+    pulled = None
+    if mid_t[0] - want > A["carry_min_pull_m"]:
+        for x_t in np.arange(want, mid_t[0] - A["carry_min_pull_m"], A["carry_step_m"]):
+            plan.restore(start)
+            tgt = T @ np.array([x_t, 0.0, mid_t[2], 1.0])   # straight toward the chest, centred on the torso
+            goals = m.held_goals(m.grip, float(tgt[0]), float(tgt[1]), float(tgt[2]), w[0])
+            try:
+                plan.line("carry pose", goals, [], margin=0.0)
+            except SkillError:
+                try:
+                    plan.to_pose("carry pose", goals, [], margin=0.0)
+                except SkillError as e:
+                    log.debug("carry pose at %.2f m: %s", x_t, e)
+                    continue
+            if not m.self_clear([plan.q])[0]:
+                log.debug("carry pose at %.2f m: an arm within %.0f cm of the body", x_t,
+                          100 * ctx.cfg["services"]["planner"]["self_clear_m"])
+                continue
+            pulled = float(mid_t[0] - x_t)
+            break
+        if pulled is None:
+            plan.restore(start)
+            log.warning("carry pose: no pose closer to the chest plans with the arms clear of the body")
+    if abs(w[0]) > math.radians(1.0):
+        plan.waist_to("waist straight (carrying)", [0.0, w[1], w[2]])
+    if plan.steps:
+        execute(ctx, plan)
+    h["carried"] = True
+    time.sleep(A["carry_settle_s"])
+    pitch = ctx.link.state()["imu"]["pelvis_rpy"][1]
+    log.info("carry pose: box pulled %s toward the chest, waist straight; the body leans %.1f deg forward",
+             "not" if pulled is None else f"{100 * pulled:.0f} cm", pitch)
+    if pitch > A["carry_max_lean_deg"]:
+        raise SkillError(f"leaning {pitch:.1f} deg forward while holding (more than {A['carry_max_lean_deg']}): not walking "
+                         f"or turning (it creeps forward and cannot step back)")
 
 
 def _after_move(ctx):
@@ -858,8 +962,13 @@ def turn(ctx, direction, angle_deg):
         rest = signed - total
         if k and abs(rest) <= A["turn_tolerance_deg"]:
             break
-        ctx.agent("turn_left" if rest > 0 else "turn_right",
-                  {"velocity": A["turn_rad_s"], "duration": round(abs(rest) / A["turn_deg_per_s"], 2)}, timeout=60)
+        params = {"velocity": A["turn_rad_s"], "duration": round(abs(rest) / A["turn_deg_per_s"], 2)}
+        if ctx.bb["hand"] == "HOLDING" and A.get("turn_vx_bias_holding_mps"):   # holding a box it creeps forward while
+            params["vx_bias_mps"] = A["turn_vx_bias_holding_mps"]                # turning: a steady push back cancels it
+        r = ctx.agent("turn_left" if rest > 0 else "turn_right", params, timeout=60)
+        if r and r.get("tilt_deg"):             # the agent stopped the turn: the body tilted
+            ctx.bb["tilted"] = r["tilt_deg"]
+            raise SkillError(f"turn stopped: the body tilted {r['tilt_deg']} deg (roll, pitch); holding still")
         time.sleep(A["turn_settle_s"])
         # the IMU yaw wraps at +-180: measure the error from the target (small) instead of the total turned
         # (2026-11-05: a 180 deg left turn ended at 186, read as -174, and the correction added 354 deg more)
@@ -1352,7 +1461,7 @@ def _grasp_geometry(ctx, object, toward=0.0):
             "mid_l": off["left_mid"], "mid_r": off["right_mid"], "z_above": max(z_above, zg), "clear": M["release_open_m"][-1],
             "note": note,
             "dims": list(b["dims"]), "byaw": byaw, "support_z": b["support_z"], "top_z": b["top_z"],
-            "support_front_x": b.get("support_front_x", b["front_x"] - 0.10),
+            "support_front_x": b.get("support_front_x", b["front_x"] - 0.10), "front_x": b.get("front_x", cx - dx / 2),
             "box": _slot_margin(ctx, cuboid(object, b["center"], b["dims"], byaw), bool(slot)), "others": others,
             "slot": sorted(slot), "toward": toward, "cut": _support_cut(ctx, b),
             "table": _table(ctx, b["support_z"], b.get("support_front_x", b["front_x"] - 0.10), cy),
@@ -1567,7 +1676,8 @@ def lift(ctx, plan):
             "support_z": g["support_z"], "gap_of": lambda: grip["gap"], "pitch": pitch, "clear": g["clear"], "yaw": yaw,
             "shift": g["grip_shift"], "grip": the_grip,           # the object's centre is this far ahead of the palms (along them)
             "from_xy": (g["center"][0], g["center"][1]), "moves": ctx.bb.get("moves", 0),   # where it stood (a place back there)
-            "support_front_x": g["support_front_x"], "others": g["others"]}   # what stood around it (pick frame)
+            "support_front_x": g["support_front_x"], "others": g["others"],   # what stood around it (pick frame)
+            "near_off": (g["front_x"] - g["cx"]) / math.cos(g["byaw"])}   # near face from the palm midpoint, along the object
     _to_state(ctx, plan, "HOLDING", holding=held)
     plan.attach(cuboid("held", (g["center"][0], g["center"][1], cz + g["lift"] + extra_up + M["lift_sag_comp_m"]), g["dims"], g["byaw"]))
     # draw the object toward the chest along the torso's forward axis: shorter lever, less load (carry pose)

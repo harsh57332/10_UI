@@ -29,7 +29,7 @@ from . import skills as skills_mod
 from .scene import TaskScene, parse
 from .services import ServiceError
 from .skills import (SKILLS, TARGET_WORDS, stand_for_pick, SURFACE_WORDS, catalog, check_cool, check_hands, clean_params, execute, new_plan, place_with_prefetch,
-                     recover, rest, run_skill)
+                     failure_light, hands_open_still, recover, rest, run_skill)
 
 log = logging.getLogger("ai")
 
@@ -258,6 +258,7 @@ class MotionPlanning:
             raise SkillError(f"robot is busy ({Busy.owner})")
         Busy.owner = "motion planning"
         ctx = self.ctx
+        failure_light(ctx, False)                  # a new task: the normal light (a red one was the last failure)
         try:
             self.state, self.error, self.plan, self.margin = "generating", None, None, None
             if ctx.scene is not None:               # a new task: the last one's scene is over
@@ -297,6 +298,7 @@ class MotionPlanning:
             return self.status()
         except (SkillError, TypeError, ServiceError) as e:
             self.state, self.error = "failed", str(e)
+            failure_light(ctx, True)                # nothing moved, but the task failed: red until the next task
             if ctx.scene is not None:               # nothing was played: the hands are where they were
                 ctx.scene.note(error=str(e))
                 ctx.scene.forget(ctx)
@@ -355,6 +357,8 @@ class MotionPlanning:
                             ctx.scene = None
                 except Exception as e:
                     log.warning("after the task: %s", e)
+                if self.state == "failed":         # the failure routine: hands opened by the recovery, arms down by
+                    failure_light(ctx, True)       # the sides (rest), head light solid red until the next task
                 self.current, Busy.owner = None, None
                 Busy.lock.release()
         threading.Thread(target=worker, daemon=True, name="plan6").start()
@@ -462,6 +466,10 @@ class AIControl:
 
     # ---------------------------------------------------------------- run
     def _run(self):
+        # the agreed failure routine (the user, 2026-11-05): open the hands, stand straight, head light SOLID red, then
+        # nothing until the user resets robot and scene; after a tilt stop the arms are not moved at all
+        self.ctx.bb.pop("tilted", None)
+        failure_light(self.ctx, False)             # a new task: the normal light (a red one was the last failure)
         try:
             self._safety(None)
             check_cool(self.ctx)
@@ -495,16 +503,26 @@ class AIControl:
                 self.nodes = self.nodes[:failed + 1] + [{**n, "status": "pending"} for n in plan]
                 start = failed + 1
                 self._say(f"re-plan {replans}: {' -> '.join(n['skill'] for n in plan)}")
-        except SkillError as e:
+        except Exception as e:                     # any failure (skill, LLM, planner, vision, sensor) ends in the routine
             self.state, self.error = "failed", str(e)
             self._say(f"stopped: {e}")
-            self._recover()
+            if self.ctx.bb.get("tilted"):
+                self._say("the body tilted: hands opened, holding still")
+                try:
+                    hands_open_still(self.ctx)
+                except Exception as e2:
+                    self._say(f"opening the hands failed: {e2}")
+            else:
+                self._recover()                    # open the hands: set down / put back / retreat for what they hold
         finally:
             try:
-                if rest(self.ctx):                 # arms back to their normal position after every task
+                if not self.ctx.bb.get("tilted") and rest(self.ctx):   # stand straight: arms down by the sides
                     self._say("arms released to their normal position")
             except Exception as e:
                 self._say(f"arms not released: {e}")
+            if self.state == "failed":
+                failure_light(self.ctx, True)
+                self._say("failure: head light red, waiting for the reset (start the next task when ready)")
             self._forget()                         # memory clear for the next task
             Busy.owner = None
             Busy.lock.release()

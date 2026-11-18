@@ -293,6 +293,7 @@ services:
     ik_solutions: 32                             # IK solutions per pose goal; the nearest to the start is used
     ik_batch: 64                                 # goal sets per batched IK solve (ik_batch: the grasp candidate search)
     ik_batch_tolerance_x: 2.0                    # ...a lenient pre-filter: 2x the position/orientation tolerance of the exact IK
+    self_clear_m: 0.03                           # self_clear: arm poses keep this far from the robot's own body (the carry pose)
     ik_tries: 3                                  # ...or the next nearest if no path to it is found
     rng_seed: 0                                  # random numbers re-seeded per request: same scene, same plan
     natural:                                     # deterministic, natural-looking arms: IK seeds and the ranking of solutions
@@ -436,7 +437,8 @@ scene:
                                  # upper box's mask can stop 4 cm above the seam, 2026-10-29)...
   stack_pad_m: 0.03              # ...and the other's points under its footprint (+ this pad)...
   stack_inside: 0.6              # ...for at least this share
-  moved_tol_m: 0.015             # before playing: an object moved more than this since Generate -> Generate again
+  moved_tol_m: 0.03              # before playing: an object moved more than this since Generate -> Generate again (2026-11-18: 1.5 cm
+                                 # tripped on camera noise, a large shiny box near the image top read 1-2.5 cm apart; a box moved by hand: 10 cm)
   align_frames: 5                # place line-up: fine frames per camera measurement of the held object
   align_tol_m: 0.005             # held object's centre over the target's centre within this (camera vs camera)
   align_iters: 2                 # (camera calibrated: one correction is usually enough; each costs ~1 s of holding high)
@@ -712,7 +714,23 @@ ai:
   arrived_max_m: 0.25            # holding a box: the walk guard stopping the last this-much of an approach counts as arrived (the box is at the target)
   speed_slow: 0.2                # turning/side steps/adjusting steps (m/s); 0.4 only for a confident long forward/backward walk
   confident_walk_min_m: 0.60     # forward/backward walks at least this long use the 0.4 m/s speed
-  back_before_turn_m: 0.25       # holding something: step back this far before a turn so the box clears the chair/table in front (user 2026-11-03)
+  walk_back_holding_start_s: 0.85   # holding a box (carry pose) a backward walk first steps in place this long, then goes back at the
+                                    # normal speed: the command is this much longer (tape 2026-11-18: 1.45 s -> 20 cm, 2.12 s -> 46 cm:
+                                    # ~0.93 s in place, then 0.39 m/s)
+  walk_fwd_holding_ratio: 0.76   # holding a box (carry pose) a forward walk is commanded this part of the empty-hands time (tape
+                                 # 2026-11-18: 0.5 m at 0.2 m/s, 3.14 s -> 66 cm forward, 3 cm right)
+  walk_vy_bias_back_holding_mps: 0.05   # ...and pushed left against its right drift (first estimate: 10 cm right in 1.45 s; tune by tape)
+  turn_vx_bias_holding_mps: -0.03   # holding a box, a turn adds this forward speed (- = back): in the carry pose a 90 deg turn still crept
+                                    # ~24 cm forward in ~6 s (2026-11-18 trial 3); first try under-corrects (~0.04 would match), tune by tape
+  carry_chest_x_m: 0.084         # carry pose: the chest front (torso frame x, the torso mesh)...
+  carry_chest_gap_m: 0.04        # ...and the held box's near face this far from it (the box in close: little forward lean)
+  carry_min_pull_m: 0.02         # pulled in only if that is at least this far
+  carry_step_m: 0.02             # candidates from the closest outward in these steps (first with a plan and the arms clear)
+  carry_settle_s: 1.0            # then the body settles before the lean is read
+  carry_max_lean_deg: 4.0        # pelvis pitch above this while holding: no walking/turning (normal ~2.2, at arm's length ~6)
+  back_before_turn_m: 0.0        # holding: step back this far before a turn. OFF (2026-11-18): with a box the robot cannot step back (it
+                                 # leans ~6 deg forward; asked 25 cm back at 0.2 and 0.4 m/s it stepped in place, drifted 3 cm forward and 10 cm
+                                 # right, twice into the case); the box is turned over the case top instead (was 0.25, user 2026-11-03)
   stand_for_pick: false          # OFF (user 2026-11-03): the robot picks from where it stands; the stance loop moved it 20 cm sideways on bad readings
   stand_rounds: 4                # look-step-look rounds at most
   stand_step_max_m: 0.10
@@ -730,6 +748,7 @@ ai:
   object_front_min_m: 0.20       # approaching an object: its front face stays at least this far from the torso origin (a big case: the edge, not the centre)
   approach_max_leg_m: 1.5        # walk at most this far before looking again
   lateral_tolerance_m: 0.06
+  failure_color: "#FF0000"       # a failed task leaves the head light SOLID red until the next task starts (the busy blink is red too)
   section6_blind: false          # section 6 plays without the camera (true) or with the camera line-up and checks (false; the user 2026-11-17)
   margin_check: false            # re-plan with the scene shifted 2 cm / turned 3 deg to report robustness (6 full re-plans, up to
                                  # 150 s; it never changes the plan): off for speed (user 2026-11-17: motion within 15 s)
