@@ -31,6 +31,7 @@ from .tracking import Tracking
 CFG = config.load()
 logging.basicConfig(level=CFG["logging"]["level"], format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)      # one line per request otherwise
+log = logging.getLogger("app")
 STATIC = Path(__file__).parent / "static"
 FFMPEG = str(Path(sys.executable).parent / "ffmpeg")
 
@@ -127,7 +128,8 @@ def status():
         state = link.state()
         sync_hands(ctx, (state.get("end_effector") or {}).get("type"), plan6)   # follow the detected hands
         return {"connected": True, "host": link.host, "state": state, "camera": camera.status(),
-                "tracking": tracking.status(), "plan6": plan6.status(), "ai": ai.status(), "hands": config.hands()}
+                "tracking": tracking.status(), "plan6": plan6.status(), "ai": ai.status(), "hands": config.hands(),
+                "failed": ctx.bb.get("failed")}
     except (httpx.HTTPError, ValueError) as e:
         return {"connected": True, "host": link.host, "state": None, "camera": camera.status(),
                 "tracking": tracking.status(), "error": str(e)}
@@ -240,6 +242,26 @@ def ai_mode(t: Task):
 @app.get("/api/services")
 def services_health():
     return {"vision": vision.health(), "planner": motion.planner.health(), "llm": llm.health() is not None}
+
+
+@app.post("/api/reset")
+def reset_call():
+    """Section 4's Reset after a failure: arms down to their normal position, released, normal head light."""
+    from .ai import Busy
+    from .skills import reset
+    if not Busy.lock.acquire(blocking=False):
+        raise HTTPException(409, f"robot is busy ({Busy.owner})")
+    Busy.owner = "reset"
+    try:
+        r = reset(ctx)
+        log.info("reset: %s", r["done"])
+        return {"ok": not r["arms_held"], **r}
+    except (SkillError, ServiceError) as e:
+        log.warning("reset: %s", e)
+        return {"ok": False, "done": str(e), "arms_held": True}
+    finally:
+        Busy.owner = None
+        Busy.lock.release()
 
 
 class SkillCall(BaseModel):

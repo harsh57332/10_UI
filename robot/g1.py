@@ -49,39 +49,56 @@ class Latest:
 
 
 class Headlight:
-    """Head RGB LED. While any 'processing' source is active it blinks the busy colour."""
+    """Head RGB LED. While any 'processing' source is active it blinks the busy colour (a long bright phase, then off),
+    else it shows the set colour. The colour is re-sent every refresh_s: sent once, the red failure light was not seen
+    (something on the robot sets the light back, the user 2026-11-19)."""
 
     def __init__(self, audio, cfg):
         self.audio, self.cfg = audio, cfg
         self.color = cfg["default"]
         self.sources = set()
         self.lock = threading.Lock()
-        threading.Thread(target=self._blink_loop, daemon=True, name="headlight").start()
+        self._sent, self._sent_t, self._t0 = None, 0.0, 0.0
+        threading.Thread(target=self._loop, daemon=True, name="headlight").start()
 
     def set(self, hex_color):
-        rgb = hex_to_rgb(hex_color)
+        hex_to_rgb(hex_color)                   # a bad colour is refused here, not in the loop
         with self.lock:
             self.color = hex_color.upper()
-            if not self.sources:
-                self.audio.LedControl(*rgb)
+        self._show()
 
     def processing(self, source, on):
         with self.lock:
+            was = bool(self.sources)
             (self.sources.add if on else self.sources.discard)(source)
-            if not self.sources:
-                self.audio.LedControl(*hex_to_rgb(self.color))
+            if bool(self.sources) != was:
+                self._t0 = time.monotonic()      # a blink starts with its bright phase
+        self._show()
 
-    def _blink_loop(self):
-        lit = False
-        busy = hex_to_rgb(self.cfg["busy_color"])
+    def _want(self):
+        if self.sources:
+            on, off = self.cfg["blink_on_s"], self.cfg["blink_off_s"]
+            lit = (time.monotonic() - self._t0) % (on + off) < on
+            return hex_to_rgb(self.cfg["busy_color"]) if lit else (0, 0, 0)
+        return hex_to_rgb(self.color)
+
+    def _show(self):
+        with self.lock:
+            rgb, now = self._want(), time.monotonic()
+            if rgb == self._sent and now - self._sent_t < self.cfg["refresh_s"]:
+                return
+            try:
+                code = self.audio.LedControl(*rgb)
+            except Exception as e:
+                code = str(e)
+            if code != 0 and rgb != self._sent:
+                log.warning("head light %s: LedControl returned %s", rgb, code)
+            self._sent, self._sent_t = rgb, now
+
+    def _loop(self):
         while True:
-            time.sleep(self.cfg["blink_period_s"])
-            with self.lock:
-                if self.sources:
-                    lit = not lit
-                    self.audio.LedControl(*(busy if lit else (0, 0, 0)))
-                else:
-                    lit = False
+            time.sleep(0.05)
+            self._show()
 
 
 class Arms:

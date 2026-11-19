@@ -288,6 +288,10 @@ class TaskScene:
             return False, "on the floor"
         if max(hi - lo) > M["max_object_size_m"]:
             return False, f"{100 * max(hi - lo):.0f} cm across: a surface, not an object"
+        if hi[2] - lo[2] < self.S["min_object_height_m"]:
+            # flat: a mark, a paper, or the visible sliver of something hidden behind (2026-11-19: 0.8 cm of a white bottle
+            # behind the case was a second 'white box' and the pick refused to choose)
+            return False, f"only {100 * (hi[2] - lo[2]):.1f} cm tall: flat, not an object to handle"
         return True, ""
 
     def _vox(self, pts):

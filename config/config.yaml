@@ -123,9 +123,11 @@ audio:
   app_name: g1ui
 
 headlight:
-  default: "#FFFFFF"
-  busy_color: "#FF0000"          # blinks while OWLv2 / cuRobo / LLM are processing
-  blink_period_s: 0.5
+  default: "#0000FF"             # the normal light: blue (after Reset); the failure light is ai.failure_color (solid)
+  busy_color: "#FF0000"          # blinks while OWLv2 / cuRobo / LLM are processing ("thinking")
+  blink_on_s: 0.8                # a long bright phase (0.5/0.5 looked dim, the user 2026-11-19)
+  blink_off_s: 0.4
+  refresh_s: 0.3                 # the colour is re-sent this often: something on the robot set it back (red not seen)
 
 end_effector:
   detect: auto                   # auto: the agent probes the Inspire hands (both answer -> inspire, else dummy);
@@ -183,7 +185,12 @@ hands:
       fingertip_inside_m: 0.01   # ...which end at least this far inside the object's far face, so the fingertips press its side (user 2026-11-17:
                                  # 'hold it slightly behind': on an 18.7 cm box they reached past the far end, no fingertip force, the box swung)
       wrist_curve_to_tcp_m: 0.1165   # wrist yaw axis to the palm frame along the fingers (hand mount 4.15 cm + palm frame 7.5 cm)
-      palm_toe_in_deg: 4.0       # fingertips by the wrist motors (user photo 2026-11-07: wrist curves pressed, fingertips 2-3 cm off the box):
+      fingertip_share: 0.35      # BY FORCE: the fingertips get this share of the squeeze, the wrist curves the rest (user 2026-11-19 photo:
+                                 # 'wrists 60-70 %, fingertips 30-40 %'; the fixed 4 deg below gave the fingertips ~60 %: the hand is a
+                                 # lever about the wrist, the fingertip force is taken from the wrist curve). Turn past contact =
+                                 # share x squeeze x lever / wrist kp (2.3 deg at 20 N), then measured on the wrist yaw torque, corrected once
+      fingertip_force_tol_n: 1.5 # ...corrected if the measured fingertip force is further than this from the wanted
+      palm_toe_in_deg: 4.0       # (used only without fingertip_share) fingertips by the wrist motors (user photo 2026-11-07: wrist curves pressed, fingertips 2-3 cm off the box):
                                  # after the squeeze each wrist yaw turns its hand until the wrist-curve-to-fingertip line lies on the box side
                                  # (measured from the joint angles), + this past it: the wrist spring (kp 30, 17 cm lever) presses ~3 N/deg
       palm_turn_max_deg: 10.0    # ...at most this much (10 deg = 5 Nm on the wrist yaw, under max_push_nm 8)
@@ -431,6 +438,7 @@ scene:
   edge_px: 6                    # a mask this close to the image side is cut off there
   top_edge_px: 2                 # a mask touching the image top runs out of view on its far side
   min_points: 60
+  min_object_height_m: 0.02     # an object stands at least this tall (p2..p98 of its points); flatter is a mark, a paper or a hidden thing's sliver
   voxel_m: 0.015                 # 3D overlap tests between masks
   inside_ratio: 0.6              # a mask this much inside one other = its fragment; holding 2+ others = a group
   fragment_top_tol_m: 0.03       # a mask inside another is its fragment only if its top is not higher than this above
@@ -533,6 +541,8 @@ manipulation:
                                  # torso, 12 Nm on the shoulder roll, with the box 4 cm off centre)
   min_carry_x_m: 0.30
   placed_check_tol_m: 0.03        # the placed object's top seen at least its expected height minus this, or the place failed
+  placed_check_ring_m: 0.06       # the target surface is measured in this band around the placed object's footprint
+  placed_check_support_tol_m: 0.08 # ...only points this close to the target's measured top (not the floor, not the arms)
   place_clear_m: 0.01            # box bottom this far above the surface when released
   max_object_size_m: 0.70        # detections bigger than this (any side) are surfaces, not objects
   min_box_width_m: 0.05          # STANDARDS M4.3
@@ -588,6 +598,9 @@ manipulation:
   release_open_m: [0.05, 0.03, 0.015]  # letting go: each glove straight outward this far (smaller if a glove meets something;
                                        # 5 cm first: the wrist presses the face too, see planner_model.glove.contact_span_x_m)
   retreat_open_m: 0.03           # retreat: gloves open straight out this far before moving up and away
+  release_up_clear_m: 0.05       # THE LET-GO after a place: straight up until the gloves are this far over the object's top...
+  release_out_m: [0.15, 0.10, 0.06]   # ...then straight out sideways by this (first that plans)...
+  release_side_margin_m: 0.05    # ...then the arms out to the sides, planned this far clear of the surface, then down by the sides
   retreat_clear_m: 0.03          # ...and move up until their lowest point is this far above every object top around them
   escape_up_extra_m: [0.0, 0.01, 0.03]   # the last-resort escape: up to the clearance, else this much higher
   escape_back_m: 0.12            # ...then this far back toward the body before going down by the sides
@@ -638,7 +651,8 @@ manipulation:
   unstick_pitch_deg: 2           # ...and raised this much (2026-11-17 by hand: left roll +5, pitch -2 freed it)
   place_side_margin_m: 0.02      # placing after walking up to a surface: the object lined up sideways this far inside its top...
   place_side_shift_max_m: 0.12   # ...by the arms, at most this (more: not placing)
-  place_edge_margins_m: [0.03, 0.02, 0.01, 0.0]   # a place on a surface: the object's front face this far inside its front edge,
+  place_edge_margins_m: [0.03, 0.02, 0.01, 0.0, -0.02, -0.04]   # a place on a surface: the object's front face this far inside its front edge
+                                 # (negative: over it; 2026-11-19 a shiny box read 33 deep for 29 and every spot 0..3 cm in was out of reach),
                                  # first that plans (2026-11-07: a box lifted flush with the case edge could not be put 3 cm in: out of reach)
   place_back_dz_m: 0.03          # robot not moved since the pick and the surface within this of the one it came from: back on that spot first
   place_big_target_m: 0.10       # a place target deeper than the box by this much (a case, a bin): the box goes near its front edge, not its centre
@@ -725,6 +739,7 @@ ai:
   walk_fwd_holding_ratio: 0.76   # holding a box (carry pose) a forward walk is commanded this part of the empty-hands time (tape
                                  # 2026-11-18: 0.5 m at 0.2 m/s, 3.14 s -> 66 cm forward, 3 cm right)
   walk_vy_bias_back_holding_mps: 0.05   # ...and pushed left against its right drift (first estimate: 10 cm right in 1.45 s; tune by tape)
+  turn_holding_ratio: 0.88       # holding: the first turn pass is this much of the empty-hands time (90 -> ~102 deg otherwise)
   turn_vx_bias_holding_mps: -0.03   # holding a box, a turn adds this forward speed (- = back): in the carry pose a 90 deg turn still crept
                                     # ~24 cm forward in ~6 s (2026-11-18 trial 3); first try under-corrects (~0.04 would match), tune by tape
   carry_chest_x_m: 0.084         # carry pose: the chest front (torso frame x, the torso mesh)...
@@ -735,11 +750,18 @@ ai:
   carry_low_top_torso_m: 0.02    # carrying (after the step back from where it was lifted): the box down to the stomach until its top
                                  # is this high in the torso frame (camera 0.43): the camera sees ~0.6-1.15 m ahead at table height
                                  # past it (2026-11-18: in the chest-high carry pose the box filled the whole image; user: carry it low)
-  carry_low_bottom_min_pelvis_m: -0.03   # ...but its bottom stays above the hips (the thighs are just below, pelvis frame)
+  carry_low_bottom_min_pelvis_m: -0.03   # ...but its bottom no lower than this (pelvis frame). As low as the body allows: 2026-11-19 at -0.06
+                                 # (lowered 20 cm) the box's near face reached the hips/thighs and it fell out before the turn
   carry_low_min_drop_m: 0.04     # lower than this already: kept as it is
-  hold_leg_m: 0.40               # carrying: walk legs of at most this, a look after each (user 2026-11-18: every 30-50 cm)
-  hold_max_looks: 10
-  hold_max_misses: 4             # the target not in view after this many legs: stop
+  hold_leg_m: 0.50               # THE WALK LOOP (carrying): legs of at most this, a look after each (user 2026-11-19: 50 cm)...
+  hold_short_leg_m: 0.10         # ...a short step when it was close but not seen this time...
+  hold_top_seen_max_m: 0.90      # ...a look counts for the place only from this close (further the target's top is out of the view)...
+  hold_min_leg_m: 0.10           # ...less free space than this ahead (not the target): blocked...
+  hold_block_wait_s: 5.0         # ...wait this long and look again...
+  hold_block_tries: 3            # ...this many times, then the walk pause (drop, arms down, red light)
+  walk_default_m: 3.0            # the distance to the target when the user gives none (user 2026-11-19)...
+  walk_limit_factor: 2.0         # ...walking more than this times it (counted after the turn): the walk pause
+  hold_max_passes: 30            # looks in one walk loop at most (a backstop; the distance limit comes first)
   hold_last_leg_m: 0.55          # the target's front edge measured at most this much beyond the standoff -> walk it on that measurement
                                  # (calibrated with a box, 52 cm for 50): up close the box hides the target's near part
   hold_side_step_m: 0.10         # carrying, after the step back + 90 deg turn: this little side step toward the path (user: a little,
@@ -747,10 +769,23 @@ ai:
   hold_min_ahead_m: 0.40         # carrying: a destination is at least this far ahead (nearer = beside the robot)...
   hold_corridor_half_m: 0.25     # ...and reaches into the walking path (|y| <= this)...
   hold_corridor_min_overlap_m: 0.12   # ...by at least this much (a corner just touching the path is beside it)...
+  hold_offpath_min_ahead_m: 0.70 # ...or, at least this far ahead, beside the path by at most hold_offpath_max_m (a measured side step
+  hold_offpath_max_m: 0.80       # lines it up; nearer and beside it is the source, 2026-11-19)...
   hold_source_pad_m: 0.40        # ...and is not within this of the spot the object was lifted from (tracked through the robot's own moves)
   held_mask_grow_m: 0.05         # holding: depth points within this of the held box are left out of measurements...
+  held_seen_grow_m: 0.02         # holding (carried low): the camera must see at least held_seen_min_px depth pixels in the held box
+  held_seen_min_px: 400          # grown by this, else it fell out (the squeezing arms barely move without it)
+  held_seen_inset_m: 0.03        # ...counted only this far in from its gloved sides (never the gloves)
   held_mask_arms_m: 0.12         # ...across (the arms and gloves at its sides) within this
+  hold_standoff_m: 0.28          # carrying: the walk loop ends with the target's front edge this far from the pelvis (user 2026-11-19:
+                                 # closer than the 25 cm table standoff; the toes ~7 cm from it)
+  hold_side_tol_m: 0.08          # carrying, in reach: the object needs more than this sideways to fit over the target -> one side step...
+  hold_side_max_m: 0.60          # ...of at most this (measured, user 2026-11-19: a little side step)...
+  hold_side_steps_max: 2         # ...at most this many in one walk loop
   hold_over_target_m: 0.03       # before that last leg the box's bottom goes at least this far above the target's top
+  lean_samples: 5                # the pelvis tilt (IMU) is averaged over this many readings...
+  lean_sample_gap_s: 0.04        # ...this far apart (a place target is measured level while holding, skills._level_R)
+  surface_min_depth_m: 0.06      # a top reaches back at least this far (a band of a front face does not)
   carry_max_lean_deg: 4.0       # pelvis pitch above this while holding: no walking/turning (normal ~2.2, at arm's length ~6)
   back_before_turn_m: 0.3        # holding: step back this far before a turn (clears the case). Was OFF in the morning of 2026-11-18 (at
                                  # arm's length the robot leaned ~6 deg and could not step back); with the carry pose it does (24-26 cm
@@ -772,13 +807,12 @@ ai:
   object_front_min_m: 0.20       # approaching an object: its front face stays at least this far from the torso origin (a big case: the edge, not the centre)
   approach_max_leg_m: 1.5        # walk at most this far before looking again
   lateral_tolerance_m: 0.06
-  failure_color: "#FF0000"       # a failed task leaves the head light SOLID red until the next task starts (the busy blink is red too)
+  failure_color: "#FF0000"       # any failure: head light SOLID bright red until the user's Reset (the busy blink is red too)
   section6_blind: false          # section 6 plays without the camera (true) or with the camera line-up and checks (false; the user 2026-11-17)
   margin_check: false            # re-plan with the scene shifted 2 cm / turned 3 deg to report robustness (6 full re-plans, up to
                                  # 150 s; it never changes the plan): off for speed (user 2026-11-17: motion within 15 s)
   approach_waist_ok_deg: 25      # an object this far to the side is faced with the waist, not the legs (STANDARDS M3.3: picks tested to 25 deg; user 2026-11-07)
   approach_min_step_m: 0.03      # the walk guard allows less than this toward an object: no step, the pick tries from where the robot stands
-  max_replans: 2                 # vision / cuRobo / Cosmos steps are retried; turning and walking never are (ai.py)
   plan_fix_tries: 2               # an invalid LLM plan goes back with the exact problem at most this often
   min_battery_pct: 20
 

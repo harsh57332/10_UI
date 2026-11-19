@@ -215,6 +215,28 @@ function buildManip() {
     if (v !== "" && state) moveJoint(i, state.joints[i].deg + Number(v));
   }));
   $("btn-release").onclick = () => cmd("release_upperbody");
+  $("btn-reset").onclick = resetRobot;
+}
+
+// Reset after a failure (the robot freezes: hands open where they are, head light solid red): arms down, normal light
+async function resetRobot() {
+  const b = $("btn-reset");
+  b.disabled = true;
+  $("reset-stat").textContent = "resetting: arms down…";
+  try {
+    const r = await post("/api/reset");
+    $("reset-stat").textContent = r.ok ? `ready · ${r.done}` : `NOT reset · ${r.done}`;
+  } catch (e) {
+    $("reset-stat").textContent = `reset failed · ${e.message || e}`;
+  } finally {
+    b.disabled = false;
+  }
+}
+
+function showFailed(why) {
+  const b = $("btn-reset");
+  b.classList.toggle("alert", !!why);
+  if (why) $("reset-stat").textContent = `FAILED · ${why} · press Reset`;
 }
 
 function moveJoint(i, target) {
@@ -241,7 +263,9 @@ function updateManip(js) {
 function gate(id, on, why) {
   const sec = $(id);
   sec.classList.toggle("off", !on);
-  sec.querySelectorAll("button, input").forEach((el) => (el.disabled = !on || el.hasAttribute("data-never")));
+  sec.querySelectorAll("button, input").forEach((el) => {
+    if (!el.hasAttribute("data-always")) el.disabled = !on || el.hasAttribute("data-never");
+  });
   $(`${id}-gate`).textContent = on ? "" : why;
 }
 
@@ -330,7 +354,11 @@ function renderAI(a) {
   $("ai-state").textContent = a.state === "idle" ? "" : `${a.state} · ${a.mode}`;
   $("btn-ai-next").disabled = a.state !== "waiting";
   $("btn-ai-abort").disabled = !["planning", "running", "waiting"].includes(a.state);
+  const loopLine = (n) => n.skill !== "approach" ? "" : `<span class="why">⟳ LOOP: look ahead → in reach? → exit (last leg, place)`
+    + ` · else walk ≤50 cm → look again${n.loop ? ` · pass ${n.loop.pass} · walked ${n.loop.walked_m.toFixed(2)} of max ${n.loop.limit_m.toFixed(2)} m`
+    + ` · ${esc(n.loop.last || "")}` : ""}</span>`;
   $("ai-nodes").innerHTML = a.nodes.map((n) => `<li><b>${esc(n.skill)}</b> ${short(n.params)}<span class="st ${n.status}">${n.status}</span>
+    ${loopLine(n)}
     <span class="why">${esc(n.why || "")}${n.review ? ` · review: ${esc(n.review.decision)} (${esc(n.review.reason)})` : ""}</span>
     ${n.error ? `<span class="err">${esc(n.error)}</span>` : ""}</li>`).join("") + (a.error ? `<li><span class="err">${esc(a.error)}</span></li>` : "");
   $("ai-log").innerHTML = a.log.slice().reverse().map((l) => `<li>${esc(l)}</li>`).join("");
@@ -366,6 +394,7 @@ async function poll() {
     renderHands(state.end_effector);
     renderPlan6(s.plan6);
     renderAI(s.ai);
+    showFailed(s.failed);
     const a = state.arms;
     $("arms-stat").textContent = `arms ${a.engaged ? "held by us" : "with policy"}${a.moving ? " · moving" : ""} · ${a.loop_hz} Hz`;
     updateTracked(s.tracking);

@@ -94,3 +94,6 @@ label.inline input[type=radio] { width: auto; }
 .hand { border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); border-radius: 8px; padding: 10px; }
 .hand h3 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
 .legend { font-size: 12px; line-height: 1.45; margin: 4px 0 0; }
+.reset-row { margin-bottom: 10px; }
+button.reset { background: var(--chip); color: var(--text); border-color: var(--line); font-weight: 600; min-width: 96px; }
+button.reset.alert { background: var(--bad); color: #ffffff; border-color: var(--bad); }

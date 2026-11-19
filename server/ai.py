@@ -6,8 +6,9 @@ Section 7: text -> skill plan (temperature 0, checked against the hand-state mac
 fixed behaviours. A stretch of arm skills that picks something up is one node and runs like section 6 (task
 scene, margin check, planned up front, played). Walking is in measured legs; the last leg towards a place target
 is walked while cuRobo already plans the place. Compulsory safety checks run before every node; step mode waits
-for "Next". A failed node triggers a bounded re-plan. Abort stops after the current node; the arms keep holding
-whatever they hold. After the task everything measured is forgotten.
+for "Next". Any failure freezes the robot (skills.freeze: the hands open where they are, solid red light) until the
+user's Reset; no re-plan, no recovery move. Abort stops after the current node; the arms keep holding whatever they
+hold. After the task everything measured is forgotten.
 """
 import re
 import copy
@@ -29,7 +30,7 @@ from . import skills as skills_mod
 from .scene import TaskScene, parse
 from .services import ServiceError
 from .skills import (SKILLS, TARGET_WORDS, stand_for_pick, SURFACE_WORDS, catalog, check_cool, check_hands, clean_params, execute, new_plan, place_with_prefetch,
-                     failure_light, hands_open_still, recover, rest, run_skill)
+                     freeze, rest, run_skill)
 
 log = logging.getLogger("ai")
 
@@ -51,7 +52,7 @@ RULES = (
     "that is gripped but not lifted. Each skill only works in the hand state it lists. Keep the plan short. "
     "To stack object A on object B: find A, find B, pre_grasp A, grasp, lift, place on B (A is the object that "
     "moves; B stays where it is). A turn of N degrees to the left/right is one turn step with angle_deg N. To put a "
-    "held object on something far away: turn if told to, approach it, then place on it. If the user states how far the target is (from the toe tip), pass that number as distance_cm to approach (the camera only sees 50-60 cm: that part is walked blind). Only one object can be held at a time. Do not add ready at the end: the arms "
+    "held object on something away from the robot: turn if told to, approach it, then place on it (approach is the walk loop: look ahead, walk a 50 cm leg, look again, until the target is in reach). While holding never use walk to go to where the object goes: 'walk 120 cm and place it on X' is approach X with distance_cm 120. If the user states how far to walk or how far the target is (in cm), pass that number as distance_cm to approach (holding, more than twice that much walking stops the task; none given = 300 cm). Only one object can be held at a time. Do not add ready at the end: the arms "
     "go back to their normal position by themselves after the task."
 )
 AFTER = {"pre_grasp": "AT_OBJECT", "grasp": "GRIPPING", "lift": "HOLDING", "place": "EMPTY", "put_back": "EMPTY",
@@ -71,6 +72,12 @@ class Busy:
     """Section 6 and 7 never drive the robot at the same time."""
     lock = threading.Lock()
     owner = None
+
+
+def check_reset(ctx):
+    """After a failure the robot stays frozen (red light) until the user presses Reset (section 4)."""
+    if ctx.bb.get("failed"):
+        raise SkillError(f"the last task failed ({ctx.bb['failed']}): press Reset in section 4 first")
 
 
 def llm_plan(ctx, llm, text, kinds, extra=""):
@@ -94,8 +101,13 @@ def llm_plan(ctx, llm, text, kinds, extra=""):
             if n.get("skill") not in SKILLS or SKILLS[n["skill"]]["kind"] not in kinds:
                 raise SkillError(f"the LLM chose a skill that is not allowed here: {n.get('skill')}")
             n["params"] = clean_params(n["skill"], n.get("params"))[0]
+        plan = walks_to_loop(plan, ctx.bb["hand"])
+        hand = ctx.bb["hand"]
         for n in plan:                                 # a distance only counts when the user wrote that number
             d = n["params"].get("distance_cm")
+            holding, hand = hand == "HOLDING", AFTER.get(n["skill"], hand)
+            if d is not None and holding and n["skill"] == "approach" and _number_in_text(d, text):
+                continue                               # carrying: the walk loop's distance (its limit is twice it)
             if d is not None and not any(w in str(n["params"].get("target", "")).lower() for w in TARGET_WORDS):
                 n["params"].pop("distance_cm")                # a distance belongs to a case/table-like target, never to the box
             elif d is not None and not re.search(r"(?<![\d.])%s(?:\.0+)?(?![\d.])" % re.escape(str(d).rstrip("0").rstrip(".") if "." in str(d) else str(d)), text):
@@ -107,6 +119,53 @@ def llm_plan(ctx, llm, text, kinds, extra=""):
         fix = (f"\n\nYour previous plan {[(n['skill'], n['params']) for n in plan]} is invalid: {problem}. "
                f"Return a corrected plan.")
     raise SkillError(f"the LLM could not make a valid plan: {problem}")
+
+
+def walks_to_loop(plan, hand):
+    """Deterministic, whatever the LLM wrote (2026-11-19: it planned 'walk 1.2 m' blind, or no walking at all, to a place
+    target after a turn): holding, the way to where the object goes is always the walk loop (approach). A forward walk
+    followed by a place on X becomes approach X with that distance; a place on X right after a turn gets approach X in
+    between; finds of X before its place are dropped (the loop finds it)."""
+    out, i = [], 0
+    while i < len(plan):
+        n = plan[i]
+        holding = hand == "HOLDING"
+        nxt_place = next((m for m in plan[i + 1:] if m["skill"] == "place" or SKILLS[m["skill"]]["kind"] == "move"), None)
+        target = nxt_place["params"].get("on") if nxt_place is not None and nxt_place["skill"] == "place" else None
+        if holding and target and n["skill"] == "walk" and n["params"].get("direction") == "forward":
+            d = n["params"].get("distance_m")
+            out.append({"skill": "approach", "params": {"target": target, **({"distance_cm": round(float(d) * 100)} if d else {})}})
+            log.info("plan: holding, 'walk forward %s m' to '%s' -> the walk loop (approach)", d, target)
+        elif holding and target and n["skill"] == "turn" and not any(
+                m["skill"] in ("walk", "approach") for m in plan[i + 1:plan.index(nxt_place)]):
+            out.append(n)
+            out.append({"skill": "approach", "params": {"target": target}})
+            log.info("plan: holding, a place on '%s' right after a turn -> the walk loop (approach) in between", target)
+        else:
+            out.append(n)
+        hand = AFTER.get(n["skill"], hand)
+        i += 1
+    # finds of an approach target between the approach and its place are the loop's job
+    res, targets = [], set()
+    for n in out:
+        if n["skill"] == "approach":
+            targets.add(n["params"].get("target"))
+        elif SKILLS[n["skill"]]["kind"] == "move":
+            targets = set()
+        if n["skill"] == "find" and n["params"].get("object") in targets:
+            continue
+        res.append(n)
+    return res
+
+
+def _number_in_text(d, text):
+    """The user wrote this number (500 matches '500 cm', not '1500')."""
+    try:
+        v = float(d)
+    except (TypeError, ValueError):
+        return False
+    num = str(int(v)) if v == int(v) else str(v)
+    return re.search(r"(?<![\d.])%s(?:\.0+)?(?![\d.])" % re.escape(num), text) is not None
 
 
 def check_plan(ctx, plan):
@@ -258,7 +317,12 @@ class MotionPlanning:
             raise SkillError(f"robot is busy ({Busy.owner})")
         Busy.owner = "motion planning"
         ctx = self.ctx
-        failure_light(ctx, False)                  # a new task: the normal light (a red one was the last failure)
+        try:
+            check_reset(ctx)
+        except SkillError:
+            Busy.owner = None
+            Busy.lock.release()
+            raise
         try:
             self.state, self.error, self.plan, self.margin = "generating", None, None, None
             if ctx.scene is not None:               # a new task: the last one's scene is over
@@ -298,7 +362,7 @@ class MotionPlanning:
             return self.status()
         except (SkillError, TypeError, ServiceError) as e:
             self.state, self.error = "failed", str(e)
-            failure_light(ctx, True)                # nothing moved, but the task failed: red until the next task
+            freeze(ctx, str(e))                     # nothing moved, but the task failed: red until the Reset
             if ctx.scene is not None:               # nothing was played: the hands are where they were
                 ctx.scene.note(error=str(e))
                 ctx.scene.forget(ctx)
@@ -314,6 +378,7 @@ class MotionPlanning:
         if not Busy.lock.acquire(blocking=False):
             raise SkillError(f"robot is busy ({Busy.owner})")
         try:
+            check_reset(self.ctx)
             check_cool(self.ctx)
         except SkillError as e:
             self.error = str(e)                 # shown in the UI (a 409 alone was invisible)
@@ -341,11 +406,13 @@ class MotionPlanning:
             except (SkillError, ServiceError) as e:
                 self.state, self.error = "failed", str(e)
                 log.warning("play failed at %s: %s", self.current, e)
+                freeze(ctx, str(e))                # the failure routine: hands open where they are, red, wait for Reset
             finally:
                 ctx.bb.pop("blind", None)
                 released = False
                 try:
-                    released = rest(ctx)           # arms back to their normal position after every task
+                    if self.state != "failed":
+                        released = rest(ctx)       # arms back to their normal position after a task that worked
                 except Exception as e:
                     self.error = f"{self.error or ''} (arms not released: {e})"
                 try:                               # the task is over; once the hands are down, forget its scene
@@ -357,8 +424,6 @@ class MotionPlanning:
                             ctx.scene = None
                 except Exception as e:
                     log.warning("after the task: %s", e)
-                if self.state == "failed":         # the failure routine: hands opened by the recovery, arms down by
-                    failure_light(ctx, True)       # the sides (rest), head light solid red until the next task
                 self.current, Busy.owner = None, None
                 Busy.lock.release()
         threading.Thread(target=worker, daemon=True, name="plan6").start()
@@ -437,6 +502,11 @@ class AIControl:
     def start(self, text, mode):
         if not Busy.lock.acquire(blocking=False):
             raise SkillError(f"robot is busy ({Busy.owner})")
+        try:
+            check_reset(self.ctx)
+        except SkillError:
+            Busy.lock.release()
+            raise
         Busy.owner = "AI control"
         self.state, self.task, self.mode, self.nodes, self.log, self.error = "planning", text, mode, [], [], None
         self._abort.clear()
@@ -457,7 +527,9 @@ class AIControl:
 
     def status(self):
         return {"state": self.state, "task": self.task, "mode": self.mode, "error": self.error,
-                "nodes": [{k: n.get(k) for k in ("skill", "params", "why", "status", "result", "error")}
+                "nodes": [{**{k: n.get(k) for k in ("skill", "params", "why", "status", "result", "error")},
+                           "loop": n.get("loop") or (dict(self.ctx.bb["loop"]) if n["skill"] == "approach" and
+                                                      n.get("status") == "running" and self.ctx.bb.get("loop") else None)}
                           for n in self.nodes],
                 "log": self.log[-30:], "known": self.ctx.summary()}
 
@@ -466,10 +538,10 @@ class AIControl:
 
     # ---------------------------------------------------------------- run
     def _run(self):
-        # the agreed failure routine (the user, 2026-11-05): open the hands, stand straight, head light SOLID red, then
-        # nothing until the user resets robot and scene; after a tilt stop the arms are not moved at all
+        # THE failure routine (the user, 2026-11-19): any failure freezes the robot as it is (a held object dropped: the
+        # hands open where they are; no recovery move, no arms down), head light solid red, until the user's Reset
         self.ctx.bb.pop("tilted", None)
-        failure_light(self.ctx, False)             # a new task: the normal light (a red one was the last failure)
+        self.ctx.bb.pop("paused", None)
         try:
             self._safety(None)
             check_cool(self.ctx)
@@ -477,71 +549,32 @@ class AIControl:
             plan, notes = llm_plan(self.ctx, self.llm, self.task, self.KINDS)
             self.nodes = [{**n, "status": "pending"} for n in plan]
             self._say(f"plan: {' -> '.join(n['skill'] for n in plan)}" + (f" ({notes})" if notes else ""))
-            replans = 0
-            start = 0
-            while True:
-                result = self._tick_tree(start)
-                if result == Status.SUCCESS:
-                    self.state = "done"
-                    self._say("task done")
-                    return
-                if self._abort.is_set():
-                    self.state = "aborted"
-                    self._say("aborted by user; arms keep their current hold")
-                    return
-                failed = next(i for i, n in enumerate(self.nodes) if n["status"] == "failed")
-                if SKILLS[self.nodes[failed]["skill"]]["kind"] == "move":     # turning/walking is not retried or re-planned
-                    raise SkillError(f"step {failed + 1} ({self.nodes[failed]['skill']}) failed: {self.nodes[failed]['error']}")
-                if replans >= self.cfg["ai"]["max_replans"]:
-                    raise SkillError(f"step {failed + 1} failed and the re-plan limit was reached")
-                replans += 1
-                done = [f"{n['skill']} {n['params']} -> ok" for n in self.nodes[:failed]]
-                extra = (f"\n\nAlready done: {done}\nThis step failed: {self.nodes[failed]['skill']} "
-                         f"{self.nodes[failed]['params']}: {self.nodes[failed]['error']}\nPlan only the remaining "
-                         f"steps to finish the task from the current situation.")
-                plan, notes = llm_plan(self.ctx, self.llm, self.task, self.KINDS, extra)
-                self.nodes = self.nodes[:failed + 1] + [{**n, "status": "pending"} for n in plan]
-                start = failed + 1
-                self._say(f"re-plan {replans}: {' -> '.join(n['skill'] for n in plan)}")
+            result = self._tick_tree(0)
+            if result == Status.SUCCESS:
+                self.state = "done"
+                self._say("task done")
+                return
+            if self._abort.is_set():
+                self.state = "aborted"
+                self._say("aborted by user; arms keep their current hold")
+                return
+            failed = next(i for i, n in enumerate(self.nodes) if n["status"] == "failed")
+            raise SkillError(f"step {failed + 1} ({self.nodes[failed]['skill']}) failed: {self.nodes[failed]['error']}")
         except Exception as e:                     # any failure (skill, LLM, planner, vision, sensor) ends in the routine
             self.state, self.error = "failed", str(e)
             self._say(f"stopped: {e}")
-            if self.ctx.bb.get("tilted"):
-                self._say("the body tilted: hands opened, holding still")
-                try:
-                    hands_open_still(self.ctx)
-                except Exception as e2:
-                    self._say(f"opening the hands failed: {e2}")
-            else:
-                self._recover()                    # open the hands: set down / put back / retreat for what they hold
+            self._say(f"frozen: {freeze(self.ctx, str(e))}")
         finally:
             try:
-                if not self.ctx.bb.get("tilted") and rest(self.ctx):   # stand straight: arms down by the sides
+                if self.state != "failed" and rest(self.ctx):   # a task that worked: arms down by the sides
                     self._say("arms released to their normal position")
             except Exception as e:
                 self._say(f"arms not released: {e}")
             if self.state == "failed":
-                failure_light(self.ctx, True)
-                self._say("failure: head light red, waiting for the reset (start the next task when ready)")
+                self._say("waiting for Reset (section 4): arms down, normal head light")
             self._forget()                         # memory clear for the next task
             Busy.owner = None
             Busy.lock.release()
-
-    def _recover(self):
-        """A task that stops while the hands hold or touch something: the recovery for that state (set down / retreat; it
-        ignores the heat gate by design, a held box heats the shoulders). Never when the user aborted: that keeps the hold."""
-        ctx = self.ctx
-        if ctx.bb["hand"] == "EMPTY" or not ctx.link.state()["arms"]["engaged"] or self._abort.is_set():
-            return
-        try:
-            self._say(recover(ctx))
-        except Exception as e:                         # no surface to set it on (lost): drop the object, arms down, stand
-            self._say(f"recovery failed: {e}; releasing the arms (the object drops)")
-            try:
-                ctx.agent("release_upperbody", {}, timeout=15)
-                ctx.bb.update(hand="EMPTY", holding=None)
-            except Exception as e2:
-                self._say(f"release failed: {e2}")
 
     def _forget(self):
         """Forget everything measured, planned or remembered for the task (objects, surfaces, map, scene, prefetched plan)."""
@@ -550,7 +583,7 @@ class AIControl:
             ctx.scene.forget(ctx)
             ctx.scene = None
         ctx.forget_positions()
-        for k in ("prefetch", "place_next", "no_map", "calib", "landed"):
+        for k in ("prefetch", "place_next", "no_map", "calib", "landed", "loop"):
             ctx.bb.pop(k, None)
 
     def _tick_tree(self, start):
@@ -598,17 +631,6 @@ class AIControl:
             for i in seg:
                 if self.nodes[i]["status"] != "done":
                     self.nodes[i]["status"] = "failed" if i == bad else "skipped"
-            n = self.nodes[bad]
-            if n["skill"] in ("place", "put_back") and self.ctx.bb.get("landed") and self.ctx.bb["hand"] == "EMPTY":
-                # the object is down on the target; only letting go needed the recovery (hands away, empty): done, the
-                # LLM is not asked to place a box that already sits there (2026-11-17)
-                n["status"], n["error"] = "done", None
-                n["result"] = {"placed": self.ctx.bb.get("landed"), "note": f"let go by the recovery: {e}"}
-                self._say(f"step {bad + 1} {n['skill']}: the object is down; the hands came away by the recovery ({e})")
-                for i in seg:
-                    if self.nodes[i]["status"] == "skipped":
-                        self.nodes[i]["status"] = "done"
-                return
             self.nodes[bad]["error"] = str(e)
             self._say(f"step {bad + 1} {self.nodes[bad]['skill']} failed: {e}")
             if len(seg) > 1 and self.ctx.scene is not None:
@@ -622,6 +644,8 @@ class AIControl:
             nxt = self.nodes[i + 1] if i + 1 < len(self.nodes) else None
             ctx.bb["place_next"] = n["params"]["target"] if nxt and nxt["skill"] == "place" and \
                 nxt["params"].get("on") == n["params"]["target"] else None
+        if n["skill"] == "approach":
+            ctx.bb.pop("loop", None)
         try:
             if n["skill"] == "place":
                 n["result"] = place_with_prefetch(ctx, n["params"]["on"])
@@ -629,6 +653,8 @@ class AIControl:
                 n["result"] = run_skill(ctx, n["skill"], n["params"])
         finally:
             ctx.bb.pop("place_next", None)
+            if n["skill"] == "approach" and ctx.bb.get("loop"):
+                n["loop"] = dict(ctx.bb["loop"])       # the walk loop's passes, distance and how it ended (the graph)
 
     def _pick(self, seg):
         """Like section 6: scan the scene (SAM 3, side views where needed), plan every step, check it holds when the objects
