@@ -66,6 +66,7 @@ class Cmd(BaseModel):
 
 class Host(BaseModel):
     host: str
+    walker: str = "unitree"                     # walking policy for this connection: unitree | custom
 
 
 class Text(BaseModel):
@@ -108,9 +109,21 @@ def connect(h: Host):
     try:
         health = link.connect(h.host)
         camera.start(h.host)
-        return {"connected": True, "host": h.host, "health": health}
     except httpx.HTTPError as e:
         raise HTTPException(502, f"no agent at {h.host}: {e}")
+    # the walking policy, chosen once per connection (changed only after Terminate and a new connect)
+    out = {"connected": True, "host": h.host, "health": health}
+    try:
+        now = link.state().get("walker", "unitree")
+        if h.walker in ("unitree", "custom") and h.walker != now:
+            r = link.send("set_walker", {"walker": h.walker}, wait=True, wait_timeout_s=30)
+            if not r.get("ok"):
+                out["walker_error"] = r.get("error")
+        out["walker"] = link.state().get("walker", "unitree")
+    except (httpx.HTTPError, ValueError) as e:
+        out["walker_error"] = str(e)
+    log.info("connected to %s: walking %s%s", h.host, out.get("walker"), f" ({out['walker_error']})" if out.get("walker_error") else "")
+    return out
 
 
 @app.post("/api/disconnect")

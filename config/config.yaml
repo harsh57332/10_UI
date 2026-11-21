@@ -54,6 +54,12 @@ modes:
   walk_modes: [locomotion, manipulation]
   arm_modes: [manipulation]
 
+custom_walker:                   # the colleague's walking policy V2 (g1_v2/, robot/custom_walker.py), chosen at connect
+  stand_s: 6.0                   # Stand Up: to the policy's stand pose this slowly (on the crane)
+  stale_s: 0.1                   # no fresh lowstate for this long: damp
+  tilt_max_deg: 40.0             # the body tilted more (falling): damp
+  damp_kd: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]   # damping: soft, slowed only
+
 locomotion:
   speed_max: 0.6                 # m/s (forward/backward/aside)
   speed_default: 0.4
@@ -610,8 +616,15 @@ manipulation:
                                  # J^T F). 15 N lifted the ~0.5 kg test box "slightly"; the user asked for 20% more.
                                  # (A position preload past a mis-detected contact gave no grip with the kp 80 arms)
   wrist_close_deg: 0             # 0 = off: the arms/shoulders alone squeeze (user 2026-10-24); >0 = wrist yaws turn the fingers in
+  place_fingertip_n: 3.5         # ...and the fingertips start the lowering at this (they rise ~5 N while the box goes down: at 7 N
+                                 # they reached 12 N and the box slid off both wrist curves, user's photo 2026-11-21)
+  place_squeeze_n: 25            # the lowering of a place: the shoulders squeeze this hard (fingertips keep ~7 N, the wrist curves
+                                 # the rest; at 20 N the wrist side left the box in the last seconds, user 2026-11-21)
   carry_squeeze_n: 20            # once the test lift holds, squeeze this hard for lifting and turning (12 N passed the
                                  # 2 cm test but the box slid out during the turn, twice on 2026-10-24)
+  regrip_below_n: 5.5            # carrying: after a move a fingertip pressing less than this -> the wrist yaws turn in again toward
+  regrip_max: 3                  # the wanted press (skills._regrip), at most this many times per carry (Test 1 2026-11-20: 6.0/8.3 N
+                                 # at the pick fell to 2.3/4.6 N by the last leg; the box sat lower and caught the target's edge)
   grip_retry_n: 5                # the test lift slips: set it down, squeeze this much harder, retry...
   max_squeeze_n: 30              # ...up to this
   payload_kg: 0.5                # assumed mass of a held object, carried in the feedforward from the test lift on
@@ -651,7 +664,12 @@ manipulation:
   unstick_pitch_deg: 2           # ...and raised this much (2026-11-17 by hand: left roll +5, pitch -2 freed it)
   place_side_margin_m: 0.02      # placing after walking up to a surface: the object lined up sideways this far inside its top...
   place_side_shift_max_m: 0.12   # ...by the arms, at most this (more: not placing)
-  place_edge_margins_m: [0.03, 0.02, 0.01, 0.0, -0.02, -0.04]   # a place on a surface: the object's front face this far inside its front edge
+  place_edge_margins_m: [0.08, 0.06, 0.05, 0.04, 0.03]   # a place on a surface: the object's front face this far inside its front edge
+                                 # (user 2026-11-20: never at the edge, at least the wrist motors inside it while placing; the wrist
+                                 # curve holds the near face, the wrist motor ~6 cm behind it. Was [0.03 .. -0.04]: Test 1 put the box
+                                 # with its near face at the brown box's edge). None plans -> no place (not at the edge).
+                                 # 12/10/8 cm did not plan standing 22 cm from a hip-high top (17:18: the forearms slope down to the
+                                 # elbows, which would pass through its edge); 3 cm planned at 28 cm. Deepest that plans is used.
                                  # (negative: over it; 2026-11-19 a shiny box read 33 deep for 29 and every spot 0..3 cm in was out of reach),
                                  # first that plans (2026-11-07: a box lifted flush with the case edge could not be put 3 cm in: out of reach)
   place_back_dz_m: 0.03          # robot not moved since the pick and the surface within this of the one it came from: back on that spot first
@@ -695,6 +713,10 @@ thermal:
   force_off: ["let go", "stop squeezing", "no squeeze force"]   # ...and both end here
 
 # AI control and skills.
+lidar:                           # head LiDAR odometry (Livox MID-360 + FAST-LIO in ~/lio_ws on the robot, run_lio.sh)
+  pose_port: 8210                # ~/lio_ws/pose_server.py: GET /pose
+  max_age_s: 0.5
+
 ai:
   speed: 0.4                     # fixed commanded walking speed (m/s)
   walk_vy_bias_mps: 0.05         # forward walk at 0.4 m/s: constant push to the left (tape 2026-11-04: 12 cm right in 2.05 s with 0; 3 cm left with 0.06;
@@ -732,6 +754,27 @@ ai:
   approach_tolerance_m: 0.05
   arrived_max_m: 0.25            # holding a box: the walk guard stopping the last this-much of an approach counts as arrived (the box is at the target)
   speed_slow: 0.2                # turning/side steps/adjusting steps (m/s); 0.4 only for a confident long forward/backward walk
+  # CUSTOM WALKER (policy V2, walker 'custom'): tape fits, d = rate x t + offset (m, s; turns deg) at the AI's fixed speeds
+  # (user 2026-11-20: slow 0.2 / fast 0.4 m/s, slow backward 0.3, turns 0.4 rad/s). null = not measured yet: the walk refuses.
+  custom_backward_slow_mps: 0.3  # 0.2 m/s backward barely moved (4.5 cm/s); 0.3 m/s: 36 cm in 4 s, 4 cm drift
+  custom_walk:
+    # tape 2026-11-20, free hands, left toe tip (logs/calibration/2026-11-20_custom_walk.jsonl, 2026-11-19_policy_compare.jsonl)
+    forward:  {"0.2": [0.1625, -0.155], "0.4": [0.373, -0.317]}   # 0.2: 2 s 17, 4 s 50/49 cm; 0.4: 2 s 43, 3.5 s 99 cm (5-7 R)
+    backward: {"0.3": [0.125, -0.14], "0.4": [0.24, -0.29]}      # 0.3: 2 s 11, 4 s 36 cm; 0.4: 2 s 19, 4 s 67 cm (0-6 R)
+    left:     {"0.2": [0.06, -0.04]}                              # 2 s 8, 4 s 20 cm (weak side)
+    right:    {"0.2": [0.16, -0.17]}                              # 2 s 15, 4 s 47 cm
+  custom_turn: {"0.4": {"left": [10.95, 0.03], "right": [9.58, -0.98]}}   # [deg/s, deg offset]: L 2 s 21.9, 5 s 54.8;
+                                                                          # R 2 s 18.2, 5 s 46.9 deg (IMU)
+  custom_holding:                # holding a box (carried low) the custom walker covers this x the free-hands distance/angle: the
+    forward: 0.78                # asked one is divided by it (tape 2026-11-20, white box, one trial each, logs/calibration/
+    backward: 0.67               # 2026-11-20_custom_holding.jsonl): fwd 0.5 m -> 39 cm; back 0.3 m (0.4 m/s) -> 20 cm;
+    left: 0.8                    # left 0.1 -> 8 cm; right 0.1 -> 15 cm; turn L 90 -> 93.4 deg; turn R 90 -> 106.3 deg
+    right: 1.5                   # (and its 16.3 deg correction turned 18.9)
+    turn_left: 1.04
+    turn_right: 1.18
+  lost_back_m: 0.15              # approach (empty hands): a target seen a moment ago and lost close in front -> look again, then this
+                                 # step back (at most what it walked) BEFORE any search turn (2026-11-20: lost at 0.38 m, the search
+                                 # turn beside the case put its corner 12 cm from the body and the arms could not move)
   confident_walk_min_m: 0.60     # forward/backward walks at least this long use the 0.4 m/s speed
   walk_back_holding_start_s: 0.85   # holding a box (carry pose) a backward walk first steps in place this long, then goes back at the
                                     # normal speed: the command is this much longer (tape 2026-11-18: 1.45 s -> 20 cm, 2.12 s -> 46 cm:
@@ -753,6 +796,18 @@ ai:
   carry_low_bottom_min_pelvis_m: -0.03   # ...but its bottom no lower than this (pelvis frame). As low as the body allows: 2026-11-19 at -0.06
                                  # (lowered 20 cm) the box's near face reached the hips/thighs and it fell out before the turn
   carry_low_min_drop_m: 0.04     # lower than this already: kept as it is
+  # before the box goes down to the stomach the camera checks the band just beyond the box's far face (under the box it
+  # cannot see): points there between the lowered bottom and the bottom now = the surface it was lifted from is still under
+  # the box -> no lowering; in a turn's step back, that much further back first (Test 1 2026-11-20: lowered onto the black
+  # case's edge, the grip knocked loose)
+  carry_low_check_gap_m: 0.03    # the band starts this far beyond the far face (the gloves' fingertips wrap its corners)...
+  carry_low_check_reach_m: 0.10  # ...and ends this far beyond it (a case front further than this is in front, not under)
+  carry_low_check_inset_m: 0.06  # ...this far in from the box's sides (the gloves)
+  carry_low_check_below_m: 0.02  # ...from this far below the lowered bottom up to 5 cm above the bottom now
+  carry_low_check_min_pts: 12    # this many points there = blocked
+  carry_low_check_wait_s: 3.0    # wait this long for a camera frame (the preset switch after a pick pauses it); none -> blocked
+  carry_low_more_back: 2         # turn: blocked -> step back carry_low_more_back_m more, at most this many times
+  carry_low_more_back_m: 0.15
   hold_leg_m: 0.50               # THE WALK LOOP (carrying): legs of at most this, a look after each (user 2026-11-19: 50 cm)...
   hold_short_leg_m: 0.10         # ...a short step when it was close but not seen this time...
   hold_top_seen_max_m: 0.90      # ...a look counts for the place only from this close (further the target's top is out of the view)...
@@ -777,17 +832,50 @@ ai:
   held_seen_min_px: 400          # grown by this, else it fell out (the squeezing arms barely move without it)
   held_seen_inset_m: 0.03        # ...counted only this far in from its gloved sides (never the gloves)
   held_mask_arms_m: 0.12         # ...across (the arms and gloves at its sides) within this
-  hold_standoff_m: 0.28          # carrying: the walk loop ends with the target's front edge this far from the pelvis (user 2026-11-19:
+  hold_standoff_m: 0.22          # 2026-11-20 0.28 -> 0.22: the toes ended 30 cm from the brown box, the user: go closer (the deeper
+                                 # place needs the reach). Carrying: the walk loop ends with the target's front edge this far from the pelvis (user 2026-11-19:
                                  # closer than the 25 cm table standoff; the toes ~7 cm from it)
   hold_side_tol_m: 0.08          # carrying, in reach: the object needs more than this sideways to fit over the target -> one side step...
   hold_side_max_m: 0.60          # ...of at most this (measured, user 2026-11-19: a little side step)...
   hold_side_steps_max: 2         # ...at most this many in one walk loop
-  hold_over_target_m: 0.03       # before that last leg the box's bottom goes at least this far above the target's top
+  # after the blind last leg the target's front edge is measured BESIDE the held box (skills._edge_beside): points of its
+  # top (within edge_top_tol_m of its height) left/right of the box and arms; the nearest = the edge. Used for the place if
+  # it is within edge_accept_near_m nearer / edge_accept_far_m further than the dead reckoning (2026-11-20: the last leg
+  # missed by 5-15 cm: once the box went flush with the edge, once no place pose planned)
+  edge_side_clear_m: 0.12
+  edge_top_tol_m: 0.03
+  edge_search_m: 0.35
+  edge_min_pts: 40
+  edge_accept_near_m: 0.10
+  edge_accept_far_m: 0.20
+  edge_face_dx_m: 0.04           # ...valid only with its front face in view just below it (this close in x, from edge_top_tol_m
+  edge_face_depth_m: 0.20        # down to this far below the top): else the 'edge' is the bottom of the camera's view
+  # holding, before the last steps to a place target (skills._choose_stand): the place is PLANNED for the target at each of
+  # these distances (front edge from the pelvis, furthest first) with the object's near face place_wrist_inside_m inside its
+  # edge (the wrist motors over the target, user 2026-11-20; the wrist curve holds the near face, the motor ~6 cm behind);
+  # the first that plans is walked to, in at most hold_close_steps steps re-measured beside the box, to within hold_stand_tol_m
+  hold_stand_candidates_m: [0.34, 0.31, 0.28, 0.25, 0.22]
+  place_wrist_inside_m: 0.08
+  hold_stand_tol_m: 0.03
+  hold_close_steps: 3
+  lidar_walk_tol_m: 0.02          # a walk measured by the head LiDAR (skills._walk_measured) ends this close to the distance...
+  lidar_walk_steps: 4             # ...in at most this many timed steps, each measured after...
+  lidar_walk_settle_s: 0.8        # ...this settling pause
+  hold_step_ratio_min: 0.5        # a closing step is commanded remaining / (share the last step covered), that share at least
+  hold_step_extra_max_m: 0.10     # this, and at most this much more than what remains (never a big overshoot into the target)
+  edge_close_to_m: 0.28          # then walked closer on the measurement until the edge is within edge_close_tol_m of this (the
+  edge_close_tol_m: 0.04         # edge must stay in view to be measured: ~0.28 m is the nearest it shows beside the box)
+  edge_close_max: 2              # at most this many closing steps
+  hold_over_target_m: 0.06       # before that last leg the box's bottom goes at least this far above the target's top
+                                 # (0.03 until 2026-11-20: the box, slid a little lower in the gloves, caught the brown box's edge)
   lean_samples: 5                # the pelvis tilt (IMU) is averaged over this many readings...
   lean_sample_gap_s: 0.04        # ...this far apart (a place target is measured level while holding, skills._level_R)
   surface_min_depth_m: 0.06      # a top reaches back at least this far (a band of a front face does not)
   carry_max_lean_deg: 4.0       # pelvis pitch above this while holding: no walking/turning (normal ~2.2, at arm's length ~6)
-  back_before_turn_m: 0.3        # holding: step back this far before a turn (clears the case). Was OFF in the morning of 2026-11-18 (at
+  custom_carry_max_lean_deg: 5.5  # the same with the custom walker (it walked/turned holding at 2.9-3.9 deg; Test 1 stopped at
+                                 # 4.2 deg on 2026-11-20 before the step back)
+  back_before_turn_m: 0.4        # 2026-11-20 0.3 -> 0.4: the box went down to the stomach close to the black case's edge (user: a
+                                 # slight more). Holding: step back this far before a turn (clears the case). Was OFF in the morning of 2026-11-18 (at
                                  # arm's length the robot leaned ~6 deg and could not step back); with the carry pose it does (24-26 cm
                                  # for 30, ~14 cm right drift), and the approach aims at a target the step back put to the side
   stand_for_pick: false          # OFF (user 2026-11-03): the robot picks from where it stands; the stance loop moved it 20 cm sideways on bad readings
@@ -795,7 +883,8 @@ ai:
   stand_step_max_m: 0.10
   stand_settle_s: 1.5
   stand_side_tol_m: 0.04         # before a pick: the object more than this off-centre -> one side step
-  stand_x_m: [0.32, 0.37]        # ...and outside this distance ahead of the torso -> one forward/backward step to its middle
+  stand_x_m: [0.32, 0.40]        # 0.37 -> 0.40 (2026-11-21: a 5 cm step from 0.394 put the box so close the detector lost it)
+  # was stand_x_m: [0.32, 0.37]        # ...and outside this distance ahead of the torso -> one forward/backward step to its middle
   turn_deg_per_s: 14.9           # held box: timed 90 deg turned +94.8 at 15.7 (2026-11-04); section 3 style turn_left/right
   turn_settle_s: 0.8
   turn_rad_s: 0.4                # turning speed in AI mode (0.4 shook the robot, user 2026-11-03)

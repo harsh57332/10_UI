@@ -194,6 +194,14 @@ def _play_upperbody(params, stop):
     return {"frames": len(parsed), "interrupted": stop.is_set()}
 
 
+def _set_walker(params, stop):
+    """{"walker": "unitree" | "custom"}: the walking controller for this connection (the server asks once at connect)."""
+    try:
+        return g1.set_walker(str(params.get("walker", "")))
+    except RuntimeError as e:
+        raise Rejected(str(e))
+
+
 def _release_upperbody(params, stop):
     g1.arms.release()
     return {"released": True}
@@ -336,6 +344,7 @@ ACTIONS = {
     "set_upperbody": (_set_upperbody, "motion"),
     "play_upperbody": (_play_upperbody, "motion"),
     "release_upperbody": (_release_upperbody, "motion"),
+    "set_walker":   (_set_walker, "motion"),
     "speak":        (_speak, "audio"),
     "play_audio":   (_play_audio, "audio"),
     "stop_audio":   (_stop_audio, "instant"),
@@ -445,6 +454,8 @@ def state():
         "lowstate_age_s": g1.low.age(),
         "mode_machine": low.mode_machine if low else None,
         **mode,
+        "walker": g1.walker,
+        "custom": g1.custom.status() if g1.custom is not None else None,
         "busy": busy,
         "arms": {"engaged": g1.arms.engaged, "moving": g1.arms.moving(), "weight": round(g1.arms.weight, 3),
                  "loop_hz": round(g1.arms.loop_hz, 1), "max_gap_ms": round(g1.arms.max_gap_ms, 1),

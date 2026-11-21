@@ -283,6 +283,21 @@ class ArmMotion:
         kf = [{"t": dt, "q": {str(self.idx[n]): round(math.degrees(v), 3)
                                       for n, v in zip(traj["joint_names"], row)}}
               for row in traj["positions"][1:]]
+        if holding and kf:
+            # the wrist yaws press the fingertips by force (skills._close_wrists/_regrip/_grip_trim turn them a few deg
+            # past contact); a trajectory planned before such a turn starts from the old yaw and played as planned took
+            # the press back off (Test 1 2026-11-21: while placing the wrist side let go). Each wrist yaw keeps the
+            # offset between where it is commanded now and where the trajectory starts.
+            cmd = self.link.state()["arms"].get("q_cmd_deg")
+            names = list(traj["joint_names"])
+            for j in (21, 28):
+                n = joints.NAMES[j] + "_joint"
+                if cmd and n in names:
+                    off = float(cmd[j - 12]) - math.degrees(traj["positions"][0][names.index(n)])
+                    if 0.05 < abs(off) <= 15.0:
+                        for k in kf:
+                            k["q"][str(j)] = round(k["q"][str(j)] + off, 3)
+                        log.info("holding: wrist yaw %d keeps its press offset %+.1f deg through this move", j, off)
         n = len(kf) if stop is None else max(1, int(a["chunk_s"] / dt))
         for i in range(0, len(kf), n):
             r = self.link.send("play_upperbody", {"keyframes": kf[i:i + n], "interp": "linear",

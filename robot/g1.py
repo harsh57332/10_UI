@@ -138,6 +138,7 @@ class Arms:
         self.warning = None       # motors above warn_motor_temp_c while engaged (the server backs off)
         self._push_since = None   # when an arm joint started pushing hard against its command
         self.recover_until = 0.0  # a recovery move runs until then (no over-temperature hold meanwhile)
+        self.custom_out = None    # custom walker: (weight, q17, kp17, kd17, tau17 already x weight) for its loop; None = home
         threading.Thread(target=self._loop, daemon=True, name="arm_sdk").start()
 
     @property
@@ -338,6 +339,7 @@ class Arms:
                 self._blocked_check(now)
             with self.lock:
                 if self.weight == 0.0 and self.weight_target == 0.0:
+                    self.custom_out = None
                     continue
                 step = self.weight_rate * min(gap, 2 * self.dt)
                 self.weight = float(np.clip(self.weight + np.clip(self.weight_target - self.weight, -step, step), 0, 1))
@@ -349,6 +351,12 @@ class Arms:
                     s = u * u * (3 - 2 * u) if smooth else u
                     self.q = qa + (qb - qa) * s
                 tau = self._feedforward()
+                if self.g1.custom_active():        # the custom walker's loop drives the motors: hand it the command
+                    ub = joints.UPPER_BODY
+                    self.custom_out = (self.weight, self.q.copy(), self.kp[ub].copy(), self.kd[ub].copy(),
+                                       np.array([tau.get(j, 0.0) for j in ub]))
+                    continue
+                self.custom_out = None
                 for k, j in enumerate(joints.UPPER_BODY):
                     m = self.cmd.motor_cmd[j]
                     m.q, m.dq, m.kp, m.kd = float(self.q[k]), 0.0, float(self.kp[j]), float(self.kd[j])
@@ -382,7 +390,50 @@ class G1:
         self.audio.Init()
 
         self.headlight = Headlight(self.audio, cfg["headlight"])
+        self.walker, self.custom, self._participant = "unitree", None, participant
         self.arms = Arms(self, cfg["arms"])
+        self._restore_unitree()
+
+    # ---------- walking controller: Unitree's (default) or the custom policy (chosen at connect) ----------
+    def custom_active(self):
+        return self.walker == "custom" and self.custom is not None and self.custom.active
+
+    def _restore_unitree(self):
+        """At start: an agent that stopped while the custom walker drove the robot left Unitree's controller released;
+        give it back so the robot is in its normal state again."""
+        try:
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+            msc = MotionSwitcherClient()
+            msc.SetTimeout(5.0)
+            msc.Init()
+            code, res = msc.CheckMode()
+            if code == 0 and not (res or {}).get("name"):
+                log.warning("Unitree's controller was released (a custom-walker session ended): selecting 'ai' again")
+                msc.SelectMode("ai")
+        except Exception as e:
+            log.warning("could not check Unitree's controller: %s", e)
+
+    def set_walker(self, name):
+        """'unitree' or 'custom'. Only on the crane in damping (the controller changes under the robot)."""
+        if name == self.walker:
+            return {"walker": name, "changed": False}
+        if self.arms.engaged:
+            raise RuntimeError("release the arms first")
+        if name == "custom":
+            cur = self.fsm_id()
+            if cur not in (0, 1):
+                raise RuntimeError("put the robot in Damping (hanging on the crane) before switching to the custom walker")
+            if self.custom is None:
+                from .custom_walker import CustomWalker
+                self.custom = CustomWalker(self, self._participant, self.cfg["custom_walker"])
+            self.custom.activate()
+            self.walker = "custom"
+        elif name == "unitree":
+            self.custom.deactivate()
+            self.walker = "unitree"
+        else:
+            raise ValueError(f"unknown walker '{name}' (unitree | custom)")
+        return {"walker": self.walker, "changed": True}
 
     # ---------- state ----------
     def lowstate(self, wait_s=1.0):
@@ -406,6 +457,8 @@ class G1:
         return float(m.imu_state.rpy[2])
 
     def fsm_id(self):
+        if self.custom_active():
+            return self.custom.fsm_id()
         code, data = self.loco.GetFsmId()
         if code != 0:
             raise RuntimeError(f"GetFsmId failed (code {code})")
@@ -443,16 +496,22 @@ class G1:
 
     # ---------- motion ----------
     def set_fsm(self, fsm_id):
+        if self.custom_active():
+            return self.custom.set_fsm(fsm_id)
         code = self.loco.SetFsmId(fsm_id)
         if code != 0:
             raise RuntimeError(f"SetFsmId({fsm_id}) failed (code {code})")
 
     def velocity(self, vx, vy, wz, duration):
+        if self.custom_active():
+            return self.custom.velocity(vx, vy, wz, duration)
         code = self.loco.SetVelocity(vx, vy, wz, duration)
         if code != 0:
             raise RuntimeError(f"SetVelocity failed (code {code})")
 
     def stop_move(self):
+        if self.custom_active():
+            return self.custom.stop_move()
         self.loco.SetVelocity(0.0, 0.0, 0.0, 1.0)
 
     # ---------- audio ----------

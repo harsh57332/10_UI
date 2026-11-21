@@ -26,6 +26,12 @@
       <button id="btn-discover">Discover robot</button>
       <button id="btn-terminate" class="ghost">Terminate connection</button>
     </div>
+    <div class="row walker-row">
+      <span class="muted">Walking policy for this connection:</span>
+      <label class="inline"><input type="radio" name="walker" value="unitree" checked> Unitree G1</label>
+      <label class="inline"><input type="radio" name="walker" value="custom"> Custom (V2)</label>
+      <span id="walker-stat" class="muted"></span>
+    </div>
     <ul id="found" class="found"></ul>
   </section>
 

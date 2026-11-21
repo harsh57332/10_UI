@@ -148,6 +148,10 @@ def execute(ctx, plan, on_step=None):
         raise SkillError(f"{e} -> {freeze(ctx, str(e))}")
 
 
+CARRY_LOW_BLOCKED_TEXT = "not lowering the box"
+KEEP_HOLDING_ON = ("cannot bring the box above", "cannot place on", CARRY_LOW_BLOCKED_TEXT)   # failures where the arms did not move: the box is not dropped
+
+
 def freeze(ctx, why=""):
     """THE failure routine (the user, 2026-11-19): keep the robot as it is. A held object is dropped (the hands open
     where they are: no squeeze, the arm command set to where the arms are), no recovery move, no arms down, the head
@@ -158,7 +162,11 @@ def freeze(ctx, why=""):
         failure_light(ctx, True)                # first: the user sees at once that it stopped
         ctx.bb["failed"] = ctx.bb.get("failed") or why or "failed"   # the first failure is the one shown
         held = ctx.bb["hand"] != "EMPTY" or ctx.bb.get("holding")
-        if ctx.link.state()["arms"]["engaged"]:
+        if held and any(w in (why or "") for w in KEEP_HOLDING_ON):
+            # nothing moved (no pose planned): opening the hands there drops the box off the target's edge (2026-11-20,
+            # twice; the user: 'a very silly bug'). The box stays held; the user takes it, then Reset.
+            done.append("box still held (nothing moved): take it from the hands, then press Reset")
+        elif ctx.link.state()["arms"]["engaged"]:
             ctx.motion.recovery = True          # the hold below is sent even after the agent's own hold in place
             try:
                 hands_open_still(ctx)
@@ -985,7 +993,26 @@ def _walk_speed(ctx, direction, distance):
     if direction == "backward" and ctx.bb["hand"] == "HOLDING":   # with a box the robot leans forward: at 0.2 m/s backward
         return a["speed"]                                         # it steps in place and drifts forward (11-03; 11-18 it
                                                                   # bumped the case): a clear 0.4 m/s step
-    return a["speed"] if direction in ("forward", "backward") and abs(distance) >= a["confident_walk_min_m"] else a["speed_slow"]
+    v = a["speed"] if direction in ("forward", "backward") and abs(distance) >= a["confident_walk_min_m"] else a["speed_slow"]
+    if direction == "backward" and v == a["speed_slow"] and _custom(ctx):
+        return a["custom_backward_slow_mps"]                     # custom policy: 0.2 m/s backward barely moves
+    return v
+
+
+def _custom(ctx):
+    """The robot walks with the custom policy V2 (chosen at connect), not Unitree's."""
+    return ctx.link.state().get("walker") == "custom"
+
+
+def _custom_fit(ctx, kind, direction, v):
+    """The tape fit [rate, offset] of the custom walker for this motion at this commanded speed, or a SkillError."""
+    a = ctx.cfg["ai"]
+    table = a["custom_turn"] if kind == "turn" else a["custom_walk"]
+    fit = (table.get(f"{v:.1f}") or {}).get(direction) if kind == "turn" else (table.get(direction) or {}).get(f"{v:.1f}")
+    if not fit:
+        raise SkillError(f"the custom walking policy is not calibrated for {kind} {direction} at {v:.1f} "
+                         f"{'rad/s' if kind == 'turn' else 'm/s'} yet (tape calibration needed)")
+    return fit
 
 
 def _walk_time(ctx, distance, v=None, direction="forward"):
@@ -995,6 +1022,9 @@ def _walk_time(ctx, distance, v=None, direction="forward"):
     a = ctx.cfg["ai"]
     v = a["speed"] if v is None else v
     cap = ctx.cfg["locomotion"]["duration_max_s"]
+    if _custom(ctx):                                 # custom policy V2: d = rate x t + offset (tape 2026-11-20)
+        rate, off = _custom_fit(ctx, "walk", direction, v)
+        return min(max(0.5, (abs(distance) - off) / rate), cap)
     if v == a["speed"] and a.get("walk_step_m"):     # 0.4 m/s: the gait moves in whole steps (tape 2026-11-04: 0.3 s 8 cm, 0.5 s 17, 0.7 s 20, 1 s 30, 2 s 65)
         step = a["walk_step_back_m"] if direction == "backward" else a["walk_step_m"]
         n = max(1, round(abs(distance) / step))
@@ -1050,11 +1080,18 @@ def _walk_raw(ctx, direction, distance_m):
     action = {"forward": "forward", "backward": "backward", "left": "left_aside", "right": "right_aside"}.get(direction)
     if action is None or float(distance_m) <= 0:
         raise SkillError("walk needs direction forward|backward|left|right and distance_m > 0")
+    # the carry pose first: the guard below then sees past the box (2026-11-20: a forward walk right after the lift was
+    # refused, the lifted box itself 0.45 m ahead counted as an obstacle)
+    _before_move(ctx, low=direction != "backward")     # stepping back from where it was lifted: the box stays up
     v = _walk_speed(ctx, direction, float(distance_m))
-    t = _walk_time(ctx, float(distance_m), v, direction)
-    if direction == "backward" and ctx.bb["hand"] == "HOLDING":   # holding a box (carry pose) it first steps in place
+    custom = _custom(ctx)                              # the corrections below are Unitree's walking (tape 11-18)
+    d_cmd = float(distance_m)
+    if custom and ctx.bb["hand"] == "HOLDING":         # custom policy carrying a box: it covers k x the free-hands distance
+        d_cmd /= ctx.cfg["ai"]["custom_holding"][direction]
+    t = _walk_time(ctx, d_cmd, v, direction)
+    if direction == "backward" and ctx.bb["hand"] == "HOLDING" and not custom:   # holding a box (carry pose) it first steps in place
         t += ctx.cfg["ai"]["walk_back_holding_start_s"]           # ~0.9 s, then walks back at the normal speed (tape 11-18)
-    if direction == "forward" and ctx.bb["hand"] == "HOLDING" and not (ctx.bb.get("holding") or {}).get("low"):
+    if direction == "forward" and ctx.bb["hand"] == "HOLDING" and not (ctx.bb.get("holding") or {}).get("low") and not custom:
         t *= ctx.cfg["ai"]["walk_fwd_holding_ratio"]              # chest-high it creeps forward ~1/3 further (tape 11-18: 66 for 50);
                                                                   # carried low (lean ~1.9 like empty hands) it walked ~13 cm short with it
     if direction == "forward" and not ctx.bb.get("guard_done"):   # hit nothing: what is ahead must stay clear of the body
@@ -1064,10 +1101,9 @@ def _walk_raw(ctx, direction, distance_m):
         if c is not None and c - float(distance_m) < ahead_need:
             raise SkillError(f"not walking {float(distance_m):.2f} m: the nearest thing ahead is {c:.2f} m from the pelvis "
                              f"and {ahead_need:.2f} m must stay free")
-    _before_move(ctx, low=direction != "backward")     # stepping back from where it was lifted: the box stays up
     params = {"velocity": v, "duration": round(t, 2)}
     ctx.bb["moves"] = ctx.bb.get("moves", 0) + 1       # the place knows whether the robot stood still since the pick
-    bias = _walk_bias(ctx, direction, v)                # forward (both speeds) and fast backward slide to the right
+    bias = 0.0 if custom else _walk_bias(ctx, direction, v)   # Unitree: forward and fast backward slide to the right
     if bias:
         params["vy_bias_mps"] = bias
     r = ctx.agent(action, params, timeout=t + 10)
@@ -1149,6 +1185,43 @@ def _held_move(ctx, plan, label, w, T, x_t, y_t, z_t):
     return bool(m.self_clear([plan.q])[0])
 
 
+CARRY_LOW_BLOCKED = CARRY_LOW_BLOCKED_TEXT
+
+
+def _below_box_blocked(ctx, drop):
+    """Before the box goes down `drop` m to the stomach: is anything (the surface it was lifted from) where it would go down?
+    Under the box the camera cannot see, so the band just beyond its far face is checked: a table or case still under the
+    box reaches past it (2026-11-20 Test 1: the step back came up short, the box went down onto the black case's edge and
+    the grip was knocked loose). Points there between the lowered bottom and the box's bottom now -> a description, else ''."""
+    A = ctx.cfg["ai"]
+    box = _held_corners(ctx)
+    if box is None:
+        return ""
+    # right after the pick the camera switches from the fine to the coarse preset and sends nothing for a moment (Test 1
+    # 2026-11-20 17:06: no frame, the check was skipped): wait for one; none at all -> not lowering blind
+    frame, t_end = ctx.camera.coarse(), time.time() + A["carry_low_check_wait_s"]
+    while frame is None and time.time() < t_end:
+        time.sleep(0.1)
+        frame = ctx.camera.coarse()
+    if frame is None:
+        return "the camera sent no frame to check below the box"
+    T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(ctx.motion.q_now(commanded=False)))
+    pts = ctx.geometry.points(frame, step=2, T=T)
+    far, (y_lo, y_hi) = float(box[:, 0].max()), (float(box[:, 1].min()), float(box[:, 1].max()))
+    bottom = float(box[:, 2].min())
+    inset = A["carry_low_check_inset_m"]        # the gloves' fingertips wrap the far corners: the inner part only
+    keep = ((pts[:, 0] > far + A["carry_low_check_gap_m"]) & (pts[:, 0] < far + A["carry_low_check_reach_m"])
+            & (pts[:, 1] > y_lo + inset) & (pts[:, 1] < y_hi - inset)
+            & (pts[:, 2] > bottom - drop - A["carry_low_check_below_m"]) & (pts[:, 2] < bottom + 0.05))
+    n = int(keep.sum())
+    log.info("carry low check: %d points beyond the box (x %.2f..%.2f) between its lowered bottom %.2f and %.2f", n,
+             far + A["carry_low_check_gap_m"], far + A["carry_low_check_reach_m"], bottom - drop, bottom + 0.05)
+    if n < A["carry_low_check_min_pts"]:
+        return ""
+    z = pts[keep][:, 2]
+    return f"{n} depth points just beyond the box at {float(np.median(z)):.2f} m (the surface it was lifted from is still under it)"
+
+
 def _carry_low(ctx):
     """Holding in the carry pose the box fills the whole camera image (2026-11-18: after the turn 'brown box' was not
     visible, the image was all box lid). User 2026-11-18: carry it low, at the stomach, while walking: straight down
@@ -1179,6 +1252,9 @@ def _carry_low(ctx):
     if low is None:
         log.warning("carry low: no lower pose plans with the arms clear; the camera cannot see past the box")
         return
+    blocked = _below_box_blocked(ctx, mid_t[2] - low)
+    if blocked:
+        raise SkillError(f"{CARRY_LOW_BLOCKED}: {blocked}")
     execute(ctx, plan)
     h["low"] = True
     time.sleep(A["carry_settle_s"])
@@ -1186,9 +1262,17 @@ def _carry_low(ctx):
     pitch = ctx.link.state()["imu"]["pelvis_rpy"][1]
     log.info("carry low: box lowered %.0f cm to the stomach (its top %.2f m in the torso frame, camera 0.43); the body "
              "leans %.1f deg forward", 100 * (mid_t[2] - low), low + dz - above, pitch)
-    if pitch > A["carry_max_lean_deg"]:
-        raise SkillError(f"leaning {pitch:.1f} deg forward while holding (more than {A['carry_max_lean_deg']}): not walking "
+    if pitch > _lean_max(ctx):
+        raise SkillError(f"leaning {pitch:.1f} deg forward while holding (more than {_lean_max(ctx)}): not walking "
                          f"or turning (it creeps forward and cannot step back)")
+
+
+def _lean_max(ctx):
+    """The forward lean (pelvis pitch, deg) above which a robot holding a box does not walk or turn. Unitree's walking crept
+    forward and could not step back beyond carry_max_lean_deg; the custom policy walked and turned holding at 2.9-3.9 deg
+    (2026-11-20) and stopped Test 1 at 4.2: its own limit."""
+    A = ctx.cfg["ai"]
+    return A["custom_carry_max_lean_deg"] if _custom(ctx) else A["carry_max_lean_deg"]
 
 
 def _carry_pose(ctx):
@@ -1237,8 +1321,8 @@ def _carry_pose(ctx):
     pitch = ctx.link.state()["imu"]["pelvis_rpy"][1]
     log.info("carry pose: box pulled %s toward the chest, waist straight; the body leans %.1f deg forward",
              "not" if pulled is None else f"{100 * pulled:.0f} cm", pitch)
-    if pitch > A["carry_max_lean_deg"]:
-        raise SkillError(f"leaning {pitch:.1f} deg forward while holding (more than {A['carry_max_lean_deg']}): not walking "
+    if pitch > _lean_max(ctx):
+        raise SkillError(f"leaning {pitch:.1f} deg forward while holding (more than {_lean_max(ctx)}): not walking "
                          f"or turning (it creeps forward and cannot step back)")
 
 
@@ -1248,6 +1332,76 @@ def _after_move(ctx):
         h = ctx.bb.get("holding") or {}
         if h.get("low"):                        # carried low the camera sees it: is it still there
             check_held_seen(ctx)
+        _regrip(ctx)
+
+
+def _grip_trim(ctx, where, want=None):
+    """Placing: the fingertips back to their share of the squeeze, BOTH ways (the regrip only adds). The hand is a lever
+    about the wrist yaw: a fingertip pressing too hard takes the force off the wrist curve and the box hangs from the
+    fingertips; too little and the wrist curves hold it alone (Test 1 2026-11-21: while placing the wrist side let go and
+    the box hung). One correction from the measured wrist yaw torque toward fingertip_share x carry_squeeze_n."""
+    M = ctx.cfg["manipulation"]
+    share = M.get("fingertip_share")
+    if share is None or ctx.bb.get("hand") != "HOLDING":
+        return
+    got = _fingertip_forces(ctx)
+    cmd = ctx.link.state()["arms"].get("q_cmd_deg")
+    want = share * M["carry_squeeze_n"] if want is None else float(want)
+    if not cmd or all(abs(want - got[sd]) <= M["fingertip_force_tol_n"] for sd in ("left", "right")):
+        log.info("grip trim (%s): fingertips left %.1f / right %.1f N (wanted %.1f): kept", where, got["left"], got["right"], want)
+        return
+    kp = ctx.cfg["arms"]["gains"]["wrist"]["kp"]
+    line = M.get("palm_line") or {}
+    q = {str(15 + k): round(v, 2) for k, v in enumerate(cmd[3:17])}
+    for side, joint, sign in (("left", "21", -1.0), ("right", "28", 1.0)):
+        err = want - got[side]
+        if abs(err) <= M["fingertip_force_tol_n"]:
+            continue
+        ln = line.get(side, line)
+        lever = float(np.linalg.norm(np.array(ln["tip"]) - np.array(ln["heel"]))) if ln else 0.17
+        turn = math.degrees(err * lever / kp)
+        q[joint] = round(q[joint] + sign * max(-M["palm_turn_max_deg"], min(M["palm_turn_max_deg"], turn)), 2)
+    ctx.agent("play_upperbody", {"keyframes": [{"t": 0.4, "q": q}], "interp": "linear",
+                                 "recovery": ctx.motion.recovery}, timeout=15)
+    time.sleep(M["press_settle_s"])
+    now = _fingertip_forces(ctx)
+    log.info("grip trim (%s): fingertips left %.1f / right %.1f N -> %.1f / %.1f N (wanted %.1f; the wrist curves the rest "
+             "of %.0f N)", where, got["left"], got["right"], now["left"], now["right"], want, M["carry_squeeze_n"])
+
+
+def _regrip(ctx):
+    """Carrying: the fingertip press drops while walking (Test 1 2026-11-20, custom walker: 6.0/8.3 N at the pick, 4.7/6.3
+    after the turn, 2.3/4.6 after the last leg; the box sat lower in the gloves and caught the target's top edge). Below
+    regrip_below_n the wrist yaws turn in again toward the wanted press: one correction from the measured torque, at most
+    palm_turn_max_deg each, at most regrip_max times per carry."""
+    M = ctx.cfg["manipulation"]
+    share, below, h = M.get("fingertip_share"), M.get("regrip_below_n"), ctx.bb.get("holding")
+    if share is None or not below or not h or h.get("regrips", 0) >= M["regrip_max"]:
+        return
+    got = _fingertip_forces(ctx)
+    if min(got.values()) >= below:
+        return
+    cmd = ctx.link.state()["arms"].get("q_cmd_deg")
+    if not cmd:
+        return
+    want = share * M["carry_squeeze_n"]
+    kp = ctx.cfg["arms"]["gains"]["wrist"]["kp"]
+    line = M.get("palm_line") or {}
+    q = {str(15 + k): round(v, 2) for k, v in enumerate(cmd[3:17])}
+    for side, joint, sign in (("left", "21", -1.0), ("right", "28", 1.0)):
+        err = want - got[side]
+        if err <= M["fingertip_force_tol_n"]:
+            continue
+        ln = line.get(side, line)
+        lever = float(np.linalg.norm(np.array(ln["tip"]) - np.array(ln["heel"]))) if ln else 0.17
+        q[joint] = round(q[joint] + sign * min(math.degrees(err * lever / kp), M["palm_turn_max_deg"]), 2)
+    h["regrips"] = h.get("regrips", 0) + 1
+    ctx.agent("play_upperbody", {"keyframes": [{"t": 0.4, "q": q}], "interp": "linear",
+                                 "recovery": ctx.motion.recovery}, timeout=15)
+    time.sleep(M["press_settle_s"])
+    now = _fingertip_forces(ctx)
+    log.info("regrip %d: fingertips left %.1f / right %.1f N -> %.1f / %.1f N (wanted %.1f)", h["regrips"],
+             got["left"], got["right"], now["left"], now["right"], want)
 
 
 @skill("turn", {"direction": "left | right", "angle_deg": "positive degrees (0..180)"},
@@ -1266,20 +1420,33 @@ def turn(ctx, direction, angle_deg):
         finally:
             ctx.bb["fast_walk"] = False
         ctx.bb["backed"] = {"m": back, "turn": direction, "deg": float(angle_deg)}
-    _before_move(ctx)                                 # away from where it was lifted: the box down to the stomach, then turn
+    # holding: the box stays up in the carry pose while turning and goes down to the stomach after the turn, away from the
+    # surface it was lifted from (user 2026-11-21: pick up, step back, turn, lower the box; 2026-11-20 it went down right
+    # after the step back, close to the case's edge)
+    low_after = ctx.bb["hand"] == "HOLDING"
+    _before_move(ctx, low=not low_after)
     A = ctx.cfg["ai"]
     yaw = lambda: ctx.link.state()["imu"]["pelvis_rpy"][2]
     yaw0, total = yaw(), 0.0
     ctx.bb["moves"] = ctx.bb.get("moves", 0) + 1
+    custom = _custom(ctx)
     for k in range(1 + A["turn_corrections"]):         # the same timed command as section 3 (turn_left / turn_right), then one IMU check
         rest = signed - total
         if k and abs(rest) <= A["turn_tolerance_deg"]:
             break
-        dur = abs(rest) / A["turn_deg_per_s"]
-        if k == 0 and ctx.bb["hand"] == "HOLDING":   # holding, the first timed pass overshot every time (99.5-105.5 for 90,
+        if custom:                                     # custom policy V2: deg = rate x t + offset (tape)
+            side = "left" if rest > 0 else "right"
+            rate, off = _custom_fit(ctx, "turn", side, A["turn_rad_s"])
+            want = abs(rest)
+            if ctx.bb["hand"] == "HOLDING":            # carrying a box it turns k x the free-hands angle (every pass)
+                want /= A["custom_holding"][f"turn_{side}"]
+            dur = max(0.3, (want - off) / rate)
+        else:
+            dur = abs(rest) / A["turn_deg_per_s"]
+        if k == 0 and ctx.bb["hand"] == "HOLDING" and not custom:   # holding, the first timed pass overshot every time (99.5-105.5 for 90,
             dur *= A["turn_holding_ratio"]           # ~102 average, 2026-11-18/19) and the turn back drifted it: shorter
         params = {"velocity": A["turn_rad_s"], "duration": round(dur, 2)}
-        if ctx.bb["hand"] == "HOLDING" and A.get("turn_vx_bias_holding_mps"):   # holding a box it creeps forward while
+        if ctx.bb["hand"] == "HOLDING" and A.get("turn_vx_bias_holding_mps") and not custom:   # holding a box it creeps forward while
             params["vx_bias_mps"] = A["turn_vx_bias_holding_mps"]                # turning: a steady push back cancels it
         r = ctx.agent("turn_left" if rest > 0 else "turn_right", params, timeout=60)
         if r and r.get("tilt_deg"):             # the agent stopped the turn: the body tilted
@@ -1295,6 +1462,8 @@ def turn(ctx, direction, angle_deg):
     ctx.bb["last_turn"] = direction
     log.info("turn %s %s deg: turned %.1f deg", direction, angle_deg, total)
     ctx.forget_positions()
+    if low_after:
+        _before_move(ctx)                             # now the box down to the stomach (checked: nothing beyond it)
     _after_move(ctx)
     return r
 
@@ -1334,16 +1503,36 @@ def approach(ctx, target, distance_cm=None, same_surface=None):
                      "up to what the camera sees" if c is not None else "nothing in view")
     surface = any(w in target.lower() for w in TARGET_WORDS)
     ref = float(standoff_m) if standoff_m is not None else (a["table_standoff_m"] if surface else a["box_reach_x_m"])
-    walked = 0.0
+    walked, seen = 0.0, False
     for _ in range(6):
-        for k in range(a["search_turns"] + 1):         # not in view after a turn: look around, a few small turns toward the last turn
+        # seen a moment ago (it walked toward it): lost close in front is a missed look, not a target to the side: look
+        # again, then a step back, before any search turn (2026-11-20: lost at 0.38 m, the search turn beside the case put
+        # its corner 12 cm from the body and the arms could not move)
+        k, retry = 0, (2 if seen else 0)
+        while True:
             try:
                 find(ctx, target, precision="coarse")
+                seen = True
                 break
             except SkillError as e:
-                if "not visible" not in str(e) or k == a["search_turns"]:
+                if "not visible" not in str(e):
                     raise
-                log.info("approach: '%s' not in view, search turn %d/%d", target, k + 1, a["search_turns"])
+                if retry:
+                    retry -= 1
+                    back = min(a["lost_back_m"], walked)
+                    if retry == 0 and back >= 0.05:
+                        log.info("approach: '%s' lost close in front: %.2f m back to see it again", target, back)
+                        walk(ctx, "backward", back)
+                        walked -= back
+                    else:
+                        log.info("approach: '%s' lost close in front: looking again", target)
+                    continue
+                if seen:                        # still lost after the step back: no search turn next to what it walked up to
+                    raise SkillError(f"lost '{target}' close in front (seen before, not after looking again and a step back)")
+                if k == a["search_turns"]:
+                    raise
+                k += 1
+                log.info("approach: '%s' not in view, search turn %d/%d", target, k, a["search_turns"])
                 turn(ctx, ctx.bb.get("last_turn", "left"), a["search_turn_deg"])
         if surface:
             dist, lateral = ctx.bb["surfaces"][target]["front_x"] - ref, 0.0
@@ -1547,6 +1736,140 @@ def _approach_holding(ctx, target, same_surface=False, distance_cm=None):
     _walk_pause(ctx, f"'{target}' not reached after {a['hold_max_passes']} looks")
 
 
+def _edge_beside(ctx, s):
+    """After the blind last leg: the target's front edge (pelvis x) measured BESIDE the held box (the box hides its middle,
+    the edge shows left and right of the arms), or None. The last leg is dead-reckoned and missed by 5-15 cm (2026-11-20:
+    the box put flush with the edge once, no place pose planned the next time); the place plans with this instead.
+    Points of the target's top (within edge_top_tol_m of its height) beyond the held box and arms; the nearest of them."""
+    A = ctx.cfg["ai"]
+    frame, t_end = ctx.camera.coarse(), time.time() + A["carry_low_check_wait_s"]
+    while frame is None and time.time() < t_end:
+        time.sleep(0.1)
+        frame = ctx.camera.coarse()
+    box = _held_corners(ctx)
+    if frame is None or box is None:
+        return None
+    T = ctx.geometry.torso_in_pelvis(ctx.motion.waist_of(ctx.motion.q_now(commanded=False)))
+    inside = _held_pixels(ctx, frame, T, A["held_mask_grow_m"], A["held_mask_arms_m"])
+    if inside is not None:                      # the held box and the arms at its sides left out
+        out = object.__new__(type(frame))
+        for a in type(frame).__slots__:
+            setattr(out, a, getattr(frame, a))
+        out.depth = frame.depth.copy()
+        out.depth[inside] = 0
+        frame = out
+    pts = ctx.geometry.points(frame, step=2, T=T)
+    lean = _lean(ctx)
+    z_top = _pelvis_z(s["top_z"], s["front_x"] + 0.10, 0.0, lean) if s.get("level") else s["top_z"]
+    yr = s.get("y_range") or (-0.6, 0.6)
+    side = A["edge_side_clear_m"]
+    y_lo, y_hi = float(box[:, 1].min()) - side, float(box[:, 1].max()) + side
+    sel = ((np.abs(pts[:, 2] - z_top) < A["edge_top_tol_m"]) & (pts[:, 0] > s["front_x"] - A["edge_accept_near_m"])
+           & (pts[:, 0] < s["front_x"] + A["edge_search_m"])
+           & (pts[:, 1] > yr[0]) & (pts[:, 1] < yr[1]) & ((pts[:, 1] < y_lo) | (pts[:, 1] > y_hi)))
+    n = int(sel.sum())
+    if n < A["edge_min_pts"]:
+        log.info("edge beside the box: only %d points of the top at %.2f beside it (|y| outside %.2f..%.2f): dead reckoning",
+                 n, z_top, y_lo, y_hi)
+        return None
+    edge = float(np.percentile(pts[sel, 0], 2))
+    # a real edge has its front face below it in view; the nearest top point at the bottom of the camera's view is not an edge
+    face = ((np.abs(pts[:, 0] - edge) < A["edge_face_dx_m"]) & (pts[:, 2] < z_top - A["edge_top_tol_m"])
+            & (pts[:, 2] > z_top - A["edge_face_depth_m"]) & (pts[:, 1] > yr[0]) & (pts[:, 1] < yr[1])
+            & ((pts[:, 1] < y_lo) | (pts[:, 1] > y_hi)))
+    nf = int(face.sum())
+    if nf < A["edge_min_pts"]:
+        log.info("edge beside the box: top from %.3f m but only %d points of its front face below it: the edge is not in view "
+                 "(dead reckoning %.3f)", edge, nf, s["front_x"])
+        return None
+    log.info("edge beside the box: %d points of the top at %.2f, %d of the face below: front edge %.3f m (dead reckoning %.3f)",
+             n, z_top, nf, edge, s["front_x"])
+    return edge
+
+
+def _lidar(ctx):
+    """The head LiDAR odometry (server/lidar_odom.py), or None when it is not running on the robot."""
+    if getattr(ctx, "lidar", None) is None:
+        from .lidar_odom import LidarOdom
+        ctx.lidar = LidarOdom(ctx.link.host)
+    return ctx.lidar if ctx.lidar.available() else None
+
+
+def _walk_measured(ctx, direction, distance):
+    """Forward/backward by `distance` m MEASURED with the head LiDAR (pelvis, lean-corrected): a timed step, the LiDAR
+    says how far it really went, the rest walked the same way (sized by how much of its command the last step covered)
+    until within lidar_walk_tol_m. Steps with the box raised covered 50-65 % of their command, free-hand 75-110 %
+    (2026-11-20/21), so timing alone stopped 5-20 cm off. Never walks back after an overshoot. Returns the distance
+    covered (m) or None without the LiDAR (the caller then walks timed)."""
+    a = ctx.cfg["ai"]
+    lo = _lidar(ctx)
+    if lo is None or direction not in ("forward", "backward") or distance <= 0:
+        return None
+    sign = 1.0 if direction == "forward" else -1.0
+    s0 = lo.snapshot(ctx.link.state())
+    covered, ratio = 0.0, 1.0
+    for k in range(a["lidar_walk_steps"]):
+        remain = distance - covered
+        if remain <= a["lidar_walk_tol_m"]:
+            break
+        cmd = min(remain / ratio, remain + a["hold_step_extra_max_m"])
+        walk(ctx, direction, cmd)
+        time.sleep(a["lidar_walk_settle_s"])
+        f, left, yaw = lo.displacement(s0, lo.snapshot(ctx.link.state()), "pelvis")
+        now = sign * f
+        step = now - covered
+        ratio = min(max(step / cmd, 0.4), 1.3) if step > 0.005 else ratio
+        log.info("walk measured (lidar): step %d %s %.3f m commanded, %.3f covered; %.3f of %.3f m so far (left %+.3f, "
+                 "turned %+.1f deg)", k + 1, direction, cmd, step, now, distance, left, yaw)
+        covered = now
+    return covered
+
+
+@skill("walk_exact", {"direction": "forward | backward", "distance_m": "metres (> 0)"},
+       "Walk forward/backward by a distance measured with the head LiDAR (testing).", "internal",
+       hands=("EMPTY", "HOLDING"))
+def walk_exact(ctx, direction, distance_m):
+    got = _walk_measured(ctx, direction, float(distance_m))
+    if got is None:
+        raise SkillError("the head LiDAR odometry is not running on the robot")
+    return {"direction": direction, "asked_m": float(distance_m), "covered_m": round(got, 3)}
+
+
+def _choose_stand(ctx, target, s):
+    """The stand-off (target's front edge from the pelvis) to walk to: the furthest of hold_stand_candidates_m from which
+    the place plans with the object's near face place_wrist_inside_m inside the edge (the wrist motors over the target,
+    user 2026-11-20). Planned only (nothing moves): the place is planned for the target moved to each distance."""
+    a, M = ctx.cfg["ai"], ctx.cfg["manipulation"]
+    keep_surf, keep_m = ctx.bb["surfaces"].get(target), M["place_edge_margins_m"]
+    M["place_edge_margins_m"] = [a["place_wrist_inside_m"]]
+    tried = []
+    try:
+        for stand in a["hold_stand_candidates_m"]:
+            t = copy.deepcopy(s)
+            for key in ("front_x", "back_x", "support_front_x"):
+                if key in t:
+                    t[key] += stand - s["front_x"]
+            t["t"], t["walk_loop"] = time.time(), True
+            ctx.bb["surfaces"][target] = t
+            try:
+                SKILLS["place"]["fn"](ctx, new_plan(ctx), on=target)
+            except Exception as e:                      # SkillError, or the planner service's error
+                tried.append(f"{stand:.2f}: {str(e)[:60]}")
+                log.info("stand-off probe %.2f m: the place does not plan (%s)", stand, e)
+                continue
+            log.info("stand-off probe %.2f m: the place plans with the object %.0f cm inside the edge: standing there", stand,
+                     100 * a["place_wrist_inside_m"])
+            return stand
+    finally:
+        M["place_edge_margins_m"] = keep_m
+        if keep_surf is None:
+            ctx.bb["surfaces"].pop(target, None)
+        else:
+            ctx.bb["surfaces"][target] = keep_surf
+    raise SkillError(f"cannot place on '{target}' with the wrists inside its edge from any stand-off ({'; '.join(tried)}): "
+                     f"not walking closer")
+
+
 def _last_leg_holding(ctx, target, dist, walked):
     """Holding, the place target measured at most hold_last_leg_m beyond the standoff: walk that (calibrated with a box,
     52 cm for 50) on this measurement (up close the box hides the target's near part). Nothing may be nearer than the
@@ -1573,17 +1896,75 @@ def _last_leg_holding(ctx, target, dist, walked):
         log.info("approach (holding): box up %.0f cm to pass over the top of '%s' (top %.2f)", 100 * up, target, top)
     if s.get("level"):
         s["lean_place"] = _lean(ctx)            # standing, the box as it will be placed: the lean the place converts with
-    if dist > a["approach_tolerance_m"]:
-        ctx.bb["guard_done"] = True             # looked at just above with the box low
+    # WHERE TO STAND, decided before walking in (user 2026-11-21: know its height, plan, then approach): the place is
+    # planned now for the target at each candidate distance, the wrists inside its edge; the furthest that plans is used
+    stand = _choose_stand(ctx, target, s)
+    # then closer in steps, each on a fresh measurement of the edge beside the held box while it shows (the walks with the
+    # box raised came up 5-16 cm short, 2026-11-20; up close the edge leaves the view and the last step is dead-reckoned)
+    # a step's measured result: walking forward never makes the edge further than it was before the step (the fixed
+    # +20 cm window threw away a true 0.421 m after a 0.42 m step that covered 0.22, and the box went onto the edge,
+    # 2026-11-21 15:34); the share of the command a step covered sizes the next one (the box raised: 52-65 %)
+    ratio, before, cmd = 1.0, None, None
+    if s.get("level") and _lidar(ctx) is not None:
+        # the edge measured once here (in view), then the rest walked MEASURED by the head LiDAR (user 2026-11-21: know
+        # where the edge is, then how far to go, deterministically)
+        edge = _edge_beside(ctx, s)
+        if edge is not None and s["front_x"] - a["edge_accept_near_m"] <= edge <= s["front_x"] + a["edge_accept_far_m"]:
+            for key in ("back_x", "support_front_x"):
+                if key in s:
+                    s[key] += edge - s["front_x"]
+            s["front_x"], s["edge_measured"] = edge, True
+        more = s["front_x"] - stand
+        if more > a["hold_stand_tol_m"]:
+            log.info("approach (holding): edge %.3f m (%s), stand-off %.2f: %.3f m closer, measured by the lidar",
+                     s["front_x"], "measured" if s.get("edge_measured") else "estimate", stand, more)
+            ctx.bb["guard_done"] = True
+            try:
+                got = _walk_measured(ctx, "forward", more)
+            finally:
+                ctx.bb.pop("guard_done", None)
+            walked += got
+            for key in ("front_x", "back_x", "support_front_x"):
+                if key in s:
+                    s[key] -= got
+            s["lidar_walked_m"] = round(got, 3)
+            check = _edge_beside(ctx, s) if s.get("level") else None
+            log.info("approach (holding): walked %.3f of %.3f m (lidar): edge now %.3f m by the lidar%s", got, more,
+                     s["front_x"], f", {check:.3f} m by the camera" if check is not None else " (out of the camera's view)")
+    for k in range(0 if s.get("lidar_walked_m") is not None else a["hold_close_steps"] + 1):
+        if s.get("level"):
+            edge = _edge_beside(ctx, s)
+            hi = before + 0.05 if before is not None else s["front_x"] + a["edge_accept_far_m"]
+            if edge is not None and s["front_x"] - a["edge_accept_near_m"] <= edge <= hi:
+                if before is not None and cmd:
+                    ratio = min(max((before - edge) / cmd, a["hold_step_ratio_min"]), 1.2)
+                    log.info("approach (holding): that step covered %.2f m of %.2f commanded (%.0f %%)", before - edge, cmd,
+                             100 * (before - edge) / cmd)
+                for key in ("back_x", "support_front_x"):
+                    if key in s:
+                        s[key] += edge - s["front_x"]
+                s["front_x"], s["edge_measured"] = edge, True
+            elif edge is not None:
+                log.warning("edge beside the box at %.3f m is outside %.3f..%.3f: not used", edge,
+                            s["front_x"] - a["edge_accept_near_m"], hi)
+        more = s["front_x"] - stand
+        if more <= a["hold_stand_tol_m"] or k == a["hold_close_steps"]:
+            break
+        cmd = min(more / ratio, more + a["hold_step_extra_max_m"])
+        log.info("approach (holding): edge %.3f m (%s), stand-off %.2f: %.2f m closer (commanded %.2f, steps cover %.0f %%)",
+                 s["front_x"], "measured" if s.get("edge_measured") else "dead reckoning", stand, more, cmd, 100 * ratio)
+        ctx.bb["guard_done"] = True             # what is ahead was looked at (the target itself)
         try:
-            walk(ctx, "forward", dist)
+            walk(ctx, "forward", cmd)
         finally:
             ctx.bb.pop("guard_done", None)
-        walked += dist
+        walked += more
+        before = s["front_x"]
         for key in ("front_x", "back_x", "support_front_x"):
             if key in s:
-                s[key] -= dist
-        s["dead_reckoned_m"] = round(dist, 3)
+                s[key] -= cmd * ratio
+        s["edge_measured"], s["dead_reckoned_m"] = False, round(cmd * ratio, 3)
+    dist = walked
     s["t"], s["walk_loop"] = time.time(), True      # reached by the walk loop: the place lines up and plans without a map
     ctx.bb["surfaces"][target] = s
     log.info("approach (holding): walked the last %.2f m to '%s' on its measurement: front edge now %.2f m, top %.2f",
@@ -2512,6 +2893,20 @@ def _grip_force(ctx, squeeze_n=None, payload_kg=None):
     return r
 
 
+def _log_grip(ctx, where):
+    """The grip now, for the log: fingertip force each hand (wrist yaw torque / lever), the agent's squeeze and payload,
+    and the palms' gap (the wrist curves leaving the box show as the gap growing)."""
+    try:
+        f = _fingertip_forces(ctx)
+        ff = ctx.link.state()["arms"].get("ff", {})
+        lm, rm = ctx.motion.palms(ctx.motion.q_now(commanded=False))
+        log.info("grip (%s): fingertips left %.1f / right %.1f N, squeeze %.0f N, payload %.2f kg, palms %.1f cm apart",
+                 where, f["left"], f["right"], ff.get("squeeze_n", 0.0), ff.get("payload_kg", 0.0),
+                 100 * float(np.linalg.norm(lm - rm)))
+    except Exception as e:
+        log.debug("grip log: %s", e)
+
+
 def _hold_here(ctx):
     """Move the arm position command to where the arms are: the position spring stops pushing, so only the
     feedforward (gravity, payload, squeeze) acts."""
@@ -2833,7 +3228,7 @@ def _lower_until_contact(ctx, xy_fn, z_floor, goals_at, world, fast=True, proven
         time.sleep(M["close_settle_s"])
         base = _zlag(ctx)
         if m.execute(proven, holding=True, slowdown=M["lower_slowdown"],
-                     stop=lambda: _zlag(ctx) - base >= M["land_lag_m"]):
+                     stop=lambda: (_log_grip(ctx, "lowering"), _zlag(ctx) - base >= M["land_lag_m"])[1]):
             _hold_here(ctx)
             return {"landed_lag_m": round(_zlag(ctx) - base, 4), "path": "planned"}
         return None                             # at the planned height without touching: the rest slowly
@@ -3338,6 +3733,7 @@ def place(ctx, plan, on):
         live_xy = lambda: (hx, hy)
     lower = plan.steps.pop()                    # the proven straight lowering: played live below
     lower["dry"] = True
+    plan.call("grip trim above the target", lambda: _grip_trim(ctx, "above the target"))
     plan.call("check grip before lowering", lambda: _check_gap(ctx, h["gap_of"](), f"'{h['object']}' slipped while moving"))
     corr = {"xy": np.zeros(2)}                  # commanded - measured palm midpoint (tracking error under load)
     def line_up():
@@ -3351,6 +3747,14 @@ def place(ctx, plan, on):
                  100 * r["error_m"], [round(100 * v, 1) for v in r["correction_m"]])
         return r
     plan.call("line up over the target", line_up)
+    # before lowering the fingertips go LOWER than their carrying share: while the box goes down their force rises ~5 N
+    # (2026-11-21 16:40: 7.2 -> 12.0 N in 1 s) and the box slid off the wrist curves (the user's photo, Media 6)
+    plan.call("grip trim before lowering", lambda: _grip_trim(ctx, "before lowering", M["place_fingertip_n"]))
+    # the shoulders squeeze harder for the lowering (user 2026-11-21: the wrist side left the box in the last seconds of
+    # the place; the wrist curves' force must come from the shoulders): the fingertips keep their ~7 N, the wrist curves
+    # get the rest of place_squeeze_n
+    plan.call("squeeze for the lowering", lambda: (_grip_force(ctx, squeeze_n=M["place_squeeze_n"]),
+                                                   _log_grip(ctx, "lowering starts")))
     z_touch = z_s + h["grasp_above_bottom"]     # hands' height once the object sits on the target
     below = [w for w in world if w["name"] != on]   # the object comes down onto the target
     # ...and onto the surface slab: the touch-checked lowering may go land_overrun_m below its measured top (it stops on

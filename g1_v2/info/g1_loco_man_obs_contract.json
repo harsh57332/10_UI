@@ -1,0 +1,151 @@
+{
+  "terms": [
+    {
+      "name": "base_ang_vel",
+      "start": 0,
+      "dim": 3,
+      "scale": null,
+      "clip": null,
+      "func": "builtin_sensor"
+    },
+    {
+      "name": "projected_gravity",
+      "start": 3,
+      "dim": 3,
+      "scale": null,
+      "clip": null,
+      "func": "projected_gravity"
+    },
+    {
+      "name": "command",
+      "start": 6,
+      "dim": 3,
+      "scale": null,
+      "clip": null,
+      "func": "generated_commands"
+    },
+    {
+      "name": "phase",
+      "start": 9,
+      "dim": 2,
+      "scale": null,
+      "clip": null,
+      "func": "phase"
+    },
+    {
+      "name": "joint_pos",
+      "start": 11,
+      "dim": 29,
+      "scale": null,
+      "clip": null,
+      "func": "joint_pos_rel"
+    },
+    {
+      "name": "joint_vel",
+      "start": 40,
+      "dim": 29,
+      "scale": null,
+      "clip": null,
+      "func": "joint_vel_rel"
+    },
+    {
+      "name": "actions",
+      "start": 69,
+      "dim": 12,
+      "scale": null,
+      "clip": null,
+      "func": "last_action"
+    },
+    {
+      "name": "arm_cmd_vel",
+      "start": 81,
+      "dim": 17,
+      "scale": null,
+      "clip": null,
+      "func": "held_command_velocity"
+    },
+    {
+      "name": "upper_body_com_pos",
+      "start": 98,
+      "dim": 3,
+      "scale": null,
+      "clip": null,
+      "func": "upper_body_com_pos"
+    },
+    {
+      "name": "upper_body_com_vel",
+      "start": 101,
+      "dim": 3,
+      "scale": null,
+      "clip": null,
+      "func": "upper_body_com_vel"
+    }
+  ],
+  "actor_dim": 104,
+  "action_joints": [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint"
+  ],
+  "upper_joints": [
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint"
+  ],
+  "joint_names": [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint"
+  ],
+  "phase_period": 0.6,
+  "extra": {}
+}

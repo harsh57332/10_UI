@@ -1,0 +1,12 @@
+{
+ "kp": 1.0,
+ "ki": 0.2,
+ "i_max": 1.0,
+ "k_y": 1.0,
+ "vy_max": 0.15,
+ "deadzone": 0.1,
+ "walk_thresh": 0.05,
+ "_calibrated_on": "logs/rsl_rl/g1_velocity_loco_man/2026-10-01_18-40-38/model_10000.pt",
+ "_seed_set": "selection",
+ "_estimator": "fk"
+}

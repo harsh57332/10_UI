@@ -44,6 +44,7 @@ $("btn-discover").onclick = async () => {
   $("found").innerHTML = found.length ? "" : "<li>No robot found</li>";
   for (const f of found) {
     const li = document.createElement("li");
+    li.dataset.host = f.host;
     li.innerHTML = `<span><b>${f.host}</b> <span class="muted">${f.robot} · mode_machine ${f.mode_machine}</span></span>`;
     const b = document.createElement("button");
     b.textContent = "Connect";
@@ -54,9 +55,14 @@ $("btn-discover").onclick = async () => {
 };
 
 async function connect(host) {
+  // the walking policy is chosen once per connection; it changes only after Terminate connection and a new connect
+  const walker = (document.querySelector('input[name="walker"]:checked') || {}).value || "unitree";
+  if (walker === "custom" && !confirm("Custom walking policy (V2): the robot must hang on the crane in Damping. "
+      + "Stand Up then goes to the stand pose on the crane. Continue?")) return;
   try {
-    await api("/api/connect", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host }) });
-    log(`connected to ${host}`, "ok");
+    const r = await api("/api/connect", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, walker }) });
+    log(`connected to ${host} · walking: ${r.walker}${r.walker_error ? ` (not switched: ${r.walker_error})` : ""}`,
+        r.walker_error ? "bad" : "ok");
     const v = await cmd("get_volume");
     if (v && v.ok) { $("vol").value = v.result.volume; $("vol-val").textContent = v.result.volume; }
   } catch (e) { log(`connect failed: ${e.message}`, "bad"); }
@@ -367,11 +373,35 @@ function renderAI(a) {
 // ------------------------------------------------------------------ polling
 function pill(id, text, cls = "") { const p = $(id); p.textContent = text; p.className = `pill ${cls}`; }
 
+function showConnected(host) {
+  // connected: no second connect (the walking policy is locked to this connection) until Terminate connection
+  $("btn-discover").disabled = !!host;
+  $("found").querySelectorAll("li").forEach((li) => {
+    const b = li.querySelector("button");
+    if (!b) return;
+    const here = host && li.dataset.host === host;
+    b.disabled = !!host;
+    b.textContent = here ? "Connected" : "Connect";
+  });
+}
+
+function showWalker(walker, custom) {
+  // locked while connected: the radios show the active walker and cannot change until Terminate connection
+  document.querySelectorAll('input[name="walker"]').forEach((r) => {
+    if (walker) r.checked = r.value === walker;
+    r.disabled = !!walker;
+  });
+  $("walker-stat").textContent = walker ? `· active: ${walker === "custom" ? "Custom (V2)" : "Unitree G1"} (locked until Terminate)`
+    + (custom && custom.error ? ` · ${custom.error}` : "") : "";
+}
+
 async function poll() {
   try {
     const s = await api("/api/status");
     if (!s.connected || !s.state) {
       state = null;
+      showWalker(null);
+      showConnected(s.connected ? s.host : null);
       pill("pill-conn", s.connected ? `${s.host} · no response` : "offline", "bad");
       updateModes(null);
       for (const id of ["s3", "s4", "s6", "s7"]) gate(id, false, "· not connected");
@@ -379,6 +409,8 @@ async function poll() {
     }
     state = s.state;
     pill("pill-conn", `${s.host}${state.connected_dds ? "" : " · no DDS"}`, state.connected_dds ? "ok" : "warn");
+    showWalker(state.walker, state.custom);
+    showConnected(s.host);
     pill("pill-mode", `${MODE_LABEL[state.mode] || state.mode} (${state.fsm_id})`);
     const b = state.battery;
     pill("pill-batt", b ? `battery ${b.soc}%` : "battery —", b && b.soc < 20 ? "bad" : b && b.soc < 35 ? "warn" : "ok");
