@@ -716,6 +716,12 @@ thermal:
 lidar:                           # head LiDAR odometry (Livox MID-360 + FAST-LIO in ~/lio_ws on the robot, run_lio.sh)
   pose_port: 8210                # ~/lio_ws/pose_server.py: GET /pose
   max_age_s: 0.5
+  auto_start: true               # the server starts it once the robot stands still in a walking mode (server/lidar_odom.LidarAuto)
+  still_s: 4.0                   # ...body and leg joints still for this long
+  still_deg: 1.0                 # ...moving less than this
+  start_timeout_s: 35
+  retry_s: 30                    # after a failed start
+  max_drift_m: 0.03              # the position must hold within this over 2 s after starting
 
 ai:
   speed: 0.4                     # fixed commanded walking speed (m/s)

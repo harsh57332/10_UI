@@ -17,9 +17,10 @@ from pydantic import BaseModel
 
 from common import config, joints
 
-from .ai import AIControl, MotionPlanning, sync_hands
+from .ai import AIControl, Busy, MotionPlanning, sync_hands
 from .geometry import Geometry
 from .image_client import ImageClient
+from .lidar_odom import LidarAuto
 from .llm import LLM
 from .motion import ArmMotion, SkillError
 from .robot_link import AgentLink
@@ -56,6 +57,7 @@ ctx = Ctx(link, camera, vision, Geometry(), motion, tracking.processing)
 ctx.view = RobotView(ctx.geometry)      # camera panel 3: what the robot looked at last and made of it
 plan6 = MotionPlanning(ctx, llm)
 ai = AIControl(ctx, llm)
+lidar_auto = LidarAuto(link, lambda: Busy.owner)
 
 
 class Cmd(BaseModel):
@@ -142,7 +144,7 @@ def status():
         sync_hands(ctx, (state.get("end_effector") or {}).get("type"), plan6)   # follow the detected hands
         return {"connected": True, "host": link.host, "state": state, "camera": camera.status(),
                 "tracking": tracking.status(), "plan6": plan6.status(), "ai": ai.status(), "hands": config.hands(),
-                "failed": ctx.bb.get("failed")}
+                "failed": ctx.bb.get("failed"), "lidar": lidar_auto.status()}
     except (httpx.HTTPError, ValueError) as e:
         return {"connected": True, "host": link.host, "state": None, "camera": camera.status(),
                 "tracking": tracking.status(), "error": str(e)}

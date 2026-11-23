@@ -403,6 +403,7 @@ async function poll() {
       showWalker(null);
       showConnected(s.connected ? s.host : null);
       pill("pill-conn", s.connected ? `${s.host} · no response` : "offline", "bad");
+      pill("pill-lidar", "LiDAR —");
       updateModes(null);
       for (const id of ["s3", "s4", "s6", "s7"]) gate(id, false, "· not connected");
       return;
@@ -414,6 +415,7 @@ async function poll() {
     pill("pill-mode", `${MODE_LABEL[state.mode] || state.mode} (${state.fsm_id})`);
     const b = state.battery;
     pill("pill-batt", b ? `battery ${b.soc}%` : "battery —", b && b.soc < 20 ? "bad" : b && b.soc < 35 ? "warn" : "ok");
+    pill("pill-lidar", `LiDAR ${s.lidar ? s.lidar.text : "—"}`, s.lidar ? s.lidar.level : "");
     const busy = [state.busy.motion, state.busy.audio].filter(Boolean);
     pill("pill-busy", busy.length ? busy.map((x) => `${x.action} ${x.for_s}s`).join(", ") : "idle", busy.length ? "warn" : "");
     updateModes(state.mode);
