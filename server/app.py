@@ -268,6 +268,8 @@ def reset_call():
     try:
         r = reset(ctx)
         log.info("reset: %s", r["done"])
+        if not r["arms_held"]:
+            ai.forget()                         # section 7 starts clean: the failed plan is gone
         return {"ok": not r["arms_held"], **r}
     except (SkillError, ServiceError) as e:
         log.warning("reset: %s", e)

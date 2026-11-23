@@ -504,7 +504,9 @@ class AIControl:
             raise SkillError(f"robot is busy ({Busy.owner})")
         try:
             check_reset(self.ctx)
-        except SkillError:
+        except SkillError as e:                 # not started: the old plan must not stay on screen as if it were this task
+            self.forget()
+            self.state, self.task, self.mode, self.error = "not started", text, mode, str(e)
             Busy.lock.release()
             raise
         Busy.owner = "AI control"
@@ -512,6 +514,11 @@ class AIControl:
         self._abort.clear()
         threading.Thread(target=self._run, daemon=True, name="ai").start()
         return self.status()
+
+    def forget(self):
+        """Section 7 shows nothing of the previous task any more (after Reset, or when a new one is refused)."""
+        if self.state not in ("planning", "running", "waiting"):
+            self.state, self.task, self.nodes, self.log, self.error = "idle", None, [], [], None
 
     def next(self):
         self._gate.set()

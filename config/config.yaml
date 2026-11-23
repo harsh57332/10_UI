@@ -835,6 +835,9 @@ ai:
   hold_standoff_m: 0.22          # 2026-11-20 0.28 -> 0.22: the toes ended 30 cm from the brown box, the user: go closer (the deeper
                                  # place needs the reach). Carrying: the walk loop ends with the target's front edge this far from the pelvis (user 2026-11-19:
                                  # closer than the 25 cm table standoff; the toes ~7 cm from it)
+  hold_line_tol_m: 0.05          # carrying, destination not measured yet: off the walk's line by this -> a side step back after the leg
+  hold_line_max_step_m: 0.15     # ...of at most this
+  hold_line_drift_m_per_m: 0.12  # ...without the LiDAR: assumed drift to the right per metre (tape ~0.10; user ~0.11-0.14 on 2.8 m)
   hold_side_tol_m: 0.08          # carrying, in reach: the object needs more than this sideways to fit over the target -> one side step...
   hold_side_max_m: 0.60          # ...of at most this (measured, user 2026-11-19: a little side step)...
   hold_side_steps_max: 2         # ...at most this many in one walk loop
@@ -854,7 +857,11 @@ ai:
   # these distances (front edge from the pelvis, furthest first) with the object's near face place_wrist_inside_m inside its
   # edge (the wrist motors over the target, user 2026-11-20; the wrist curve holds the near face, the motor ~6 cm behind);
   # the first that plans is walked to, in at most hold_close_steps steps re-measured beside the box, to within hold_stand_tol_m
-  hold_stand_candidates_m: [0.34, 0.31, 0.28, 0.25, 0.22]
+  hold_stand_candidates_m: [0.22, 0.25, 0.28, 0.31, 0.34]   # closest first (user 2026-11-23: stand closer)
+  hold_square_tol_deg: 3         # destination measured: turned more than this from its front edge -> a turn in place to square up
+  hold_square_max: 2             # ...at most this many turns
+  hold_square_max_deg: 30        # ...of at most this
+  hold_square_min_span_m: 0.25   # ...only from a straight edge seen over at least this width
   place_wrist_inside_m: 0.08
   hold_stand_tol_m: 0.03
   hold_close_steps: 3
